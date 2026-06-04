@@ -1,6 +1,13 @@
 import type { WasmArch } from './arch.ts';
 import { targetTriple, toolPrefix } from './arch.ts';
 
+export const DEFAULT_EXECUTABLE_STACK_SIZE = 8 * 1024 * 1024;
+export const STACK_GLOBAL_BASE_GAP = 64 * 1024;
+
+export function globalBaseForStackSize(stackSize: number): number {
+  return stackSize + STACK_GLOBAL_BASE_GAP;
+}
+
 export function compileFlags(arch: WasmArch): string[] {
   return [
     `--target=${targetTriple(arch)}`,
@@ -20,7 +27,15 @@ export function compileFlags(arch: WasmArch): string[] {
   ];
 }
 
-export function linkFlags(arch: WasmArch): string[] {
+export interface LinkFlagOptions {
+  stackSize?: number;
+  globalBase?: number;
+}
+
+export function linkFlags(arch: WasmArch, options: LinkFlagOptions = {}): string[] {
+  const stackSize = options.stackSize ?? DEFAULT_EXECUTABLE_STACK_SIZE;
+  const globalBase = options.globalBase ?? globalBaseForStackSize(stackSize);
+
   return [
     '-nostdlib',
     '-Wl,--entry=_start',
@@ -30,7 +45,8 @@ export function linkFlags(arch: WasmArch): string[] {
     '-Wl,--shared-memory',
     '-Wl,--max-memory=1073741824',
     '-Wl,--allow-undefined',
-    '-Wl,--global-base=1114112',
+    `-Wl,--global-base=${globalBase}`,
+    `-Wl,-z,stack-size=${stackSize}`,
     '-Wl,--table-base=3',
     '-Wl,--export-table',
     '-Wl,--growable-table',
@@ -85,6 +101,50 @@ function isEquivalentWasmTarget(value: string, arch: WasmArch): boolean {
   return value === targetTriple(arch) ||
     value === `${arch}-unknown-linux-musl` ||
     value === `${arch}-linux-musl`;
+}
+
+function parsePositiveInteger(value: string): number | null {
+  if (!/^[0-9]+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function wasmLinkerParts(arg: string): string[] | null {
+  if (!arg.startsWith('-Wl,')) return null;
+  return arg.substring('-Wl,'.length).split(',');
+}
+
+export function requestedWasmStackSize(args: string[]): number | null {
+  let result: number | null = null;
+  for (const arg of args) {
+    const parts = wasmLinkerParts(arg);
+    if (!parts) continue;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === '-z' && parts[i + 1]?.startsWith('stack-size=')) {
+        result = parsePositiveInteger(parts[i + 1].substring('stack-size='.length));
+        i++;
+      }
+    }
+  }
+  return result;
+}
+
+export function requestedWasmGlobalBase(args: string[]): number | null {
+  let result: number | null = null;
+  for (const arg of args) {
+    const parts = wasmLinkerParts(arg);
+    if (!parts) continue;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.startsWith('--global-base=')) {
+        result = parsePositiveInteger(part.substring('--global-base='.length));
+      } else if (part === '--global-base' && parts[i + 1]) {
+        result = parsePositiveInteger(parts[i + 1]);
+        i++;
+      }
+    }
+  }
+  return result;
 }
 
 export interface FilterResult {

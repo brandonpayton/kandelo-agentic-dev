@@ -1,5 +1,6 @@
 extern crate alloc;
 use alloc::vec::Vec;
+use wasm_posix_shared::Errno;
 
 /// Tracks a single mmap'd region.
 #[derive(Debug, Clone)]
@@ -224,48 +225,62 @@ impl MemoryManager {
     /// - Back trim: unmapping the end of a mapping shrinks it
     /// - Split: unmapping the middle of a mapping splits it into two
     /// Returns true if any overlap was found and handled.
-    pub fn munmap(&mut self, addr: usize, len: usize) -> bool {
+    pub fn munmap(&mut self, addr: usize, len: usize) -> Result<bool, Errno> {
         if len == 0 {
-            return false;
+            return Ok(false);
         }
-        let unmap_end = addr.saturating_add(len);
+        let aligned_len = Self::align_len(len).ok_or(Errno::EINVAL)?;
+        let unmap_end = addr.checked_add(aligned_len).ok_or(Errno::EINVAL)?;
         let mut found = false;
-        let mut new_mappings: Vec<MappedRegion> = Vec::new();
 
-        for m in self.mappings.drain(..) {
+        let mut i = 0;
+        while i < self.mappings.len() {
+            let m = self.mappings[i].clone();
             let m_end = m.addr.saturating_add(m.len);
 
-            // No overlap — keep as is
-            if m_end <= addr || m.addr >= unmap_end {
-                new_mappings.push(m);
+            if m_end <= addr {
+                i += 1;
                 continue;
+            }
+            if m.addr >= unmap_end {
+                break;
             }
 
             found = true;
+            let keep_left = m.addr < addr;
+            let keep_right = m_end > unmap_end;
 
-            // Left remnant: mapping starts before unmap region
-            if m.addr < addr {
-                new_mappings.push(MappedRegion {
-                    addr: m.addr,
-                    len: addr - m.addr,
-                    prot: m.prot,
-                    flags: m.flags,
-                });
-            }
-
-            // Right remnant: mapping extends past unmap region
-            if m_end > unmap_end {
-                new_mappings.push(MappedRegion {
-                    addr: unmap_end,
-                    len: m_end - unmap_end,
-                    prot: m.prot,
-                    flags: m.flags,
-                });
+            match (keep_left, keep_right) {
+                (false, false) => {
+                    self.mappings.remove(i);
+                }
+                (true, false) => {
+                    self.mappings[i].len = addr - m.addr;
+                    i += 1;
+                }
+                (false, true) => {
+                    self.mappings[i].addr = unmap_end;
+                    self.mappings[i].len = m_end - unmap_end;
+                    break;
+                }
+                (true, true) => {
+                    self.mappings.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                    self.mappings[i].len = addr - m.addr;
+                    self.mappings.insert(
+                        i + 1,
+                        MappedRegion {
+                            addr: unmap_end,
+                            len: m_end - unmap_end,
+                            prot: m.prot,
+                            flags: m.flags,
+                        },
+                    );
+                    break;
+                }
             }
         }
 
-        self.mappings = new_mappings;
-        found
+        Ok(found)
     }
 
     /// Get the current program break.
@@ -415,6 +430,10 @@ impl MemoryManager {
         addr.saturating_add(0xFFFF) & !0xFFFF
     }
 
+    fn align_len(len: usize) -> Option<usize> {
+        len.checked_add(0xFFFF).map(|v| v & !0xFFFF)
+    }
+
     /// Extend an existing mapping at `addr` from `old_len` to `new_len`.
     /// The caller must ensure the space is free (via `can_grow_at`).
     pub fn extend_mapping(&mut self, addr: usize, old_len: usize, new_len: usize) {
@@ -462,14 +481,14 @@ mod tests {
         let addr = mm.mmap_anonymous(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
         assert!(mm.is_mapped(addr));
         // munmap with the aligned length
-        assert!(mm.munmap(addr, 0x10000));
+        assert!(mm.munmap(addr, 0x10000).unwrap());
         assert!(!mm.is_mapped(addr));
     }
 
     #[test]
     fn test_munmap_nonexistent() {
         let mut mm = MemoryManager::new();
-        assert!(!mm.munmap(0xDEAD0000, 4096));
+        assert!(!mm.munmap(0xDEAD0000, 4096).unwrap());
     }
 
     #[test]
@@ -484,7 +503,7 @@ mod tests {
         );
         assert_ne!(addr, MAP_FAILED);
         // Unmap the first page
-        assert!(mm.munmap(addr, 0x10000));
+        assert!(mm.munmap(addr, 0x10000).unwrap());
         // First page should no longer be mapped
         assert!(!mm.is_mapped(addr));
         // Remaining two pages should still be mapped
@@ -503,7 +522,7 @@ mod tests {
         );
         assert_ne!(addr, MAP_FAILED);
         // Unmap the last page
-        assert!(mm.munmap(addr + 0x20000, 0x10000));
+        assert!(mm.munmap(addr + 0x20000, 0x10000).unwrap());
         assert!(mm.is_mapped(addr));
         assert!(mm.is_mapped(addr + 0x10000));
         assert!(!mm.is_mapped(addr + 0x20000));
@@ -520,10 +539,52 @@ mod tests {
         );
         assert_ne!(addr, MAP_FAILED);
         // Unmap the middle page — splits into two
-        assert!(mm.munmap(addr + 0x10000, 0x10000));
+        assert!(mm.munmap(addr + 0x10000, 0x10000).unwrap());
         assert!(mm.is_mapped(addr));
         assert!(!mm.is_mapped(addr + 0x10000));
         assert!(mm.is_mapped(addr + 0x20000));
+    }
+
+    #[test]
+    fn test_munmap_exact_remove_reuses_mapping_storage() {
+        let mut mm = MemoryManager::new();
+        let rw = PROT_READ | PROT_WRITE;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        mm.mappings = Vec::with_capacity(8);
+        let base = MemoryManager::MMAP_BASE;
+
+        for i in 0..4 {
+            mm.mappings.push(MappedRegion {
+                addr: base + i * 0x10000,
+                len: 0x10000,
+                prot: rw,
+                flags: anon,
+            });
+        }
+
+        let capacity = mm.mappings.capacity();
+        assert!(mm.munmap(base + 0x10000, 0x10000).unwrap());
+
+        assert_eq!(mm.mappings.capacity(), capacity);
+        assert_eq!(mm.mappings.len(), 3);
+        assert!(mm.is_mapped(base));
+        assert!(!mm.is_mapped(base + 0x10000));
+        assert!(mm.is_mapped(base + 0x20000));
+        assert!(mm.is_mapped(base + 0x30000));
+    }
+
+    #[test]
+    fn test_munmap_overflow_fails_without_changing_mappings() {
+        let mut mm = MemoryManager::new();
+        let addr = mm.mmap_anonymous(
+            0,
+            0x10000,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        );
+
+        assert_eq!(mm.munmap(usize::MAX - 1, 4), Err(Errno::EINVAL));
+        assert!(mm.is_mapped(addr));
     }
 
     #[test]
@@ -537,7 +598,7 @@ mod tests {
             MAP_PRIVATE | MAP_ANONYMOUS,
         );
         // Unmap 2 middle pages
-        mm.munmap(addr + 0x10000, 0x20000);
+        mm.munmap(addr + 0x10000, 0x20000).unwrap();
         // New 2-page mmap should fill the gap
         let addr2 = mm.mmap_anonymous(
             0,
@@ -546,6 +607,28 @@ mod tests {
             MAP_PRIVATE | MAP_ANONYMOUS,
         );
         assert_eq!(addr2, addr + 0x10000);
+    }
+
+    #[test]
+    fn test_munmap_rounds_length_up_to_page() {
+        let mut mm = MemoryManager::new();
+        let rw = PROT_READ | PROT_WRITE;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+
+        // SQLite sysfault.test allocates this size and later munmaps a
+        // different, still page-rounded length. Both must cover the same
+        // kernel mapping, otherwise a tiny tail fragment prevents reuse.
+        let requested_len = 0x1ea102e;
+        let munmap_len = 0x1ea2000;
+
+        let addr = mm.mmap_anonymous(0, requested_len, rw, anon);
+        assert_ne!(addr, MAP_FAILED);
+        assert!(mm.munmap(addr, munmap_len).unwrap());
+        assert!(!mm.is_mapped(addr));
+        assert!(!mm.is_mapped(addr + munmap_len));
+
+        let reused = mm.mmap_anonymous(0, requested_len, rw, anon);
+        assert_eq!(reused, addr);
     }
 
     #[test]
@@ -806,14 +889,14 @@ mod tests {
         // 2MB alloc then free
         let a = mm.mmap_anonymous(0, 0x200000, rw, anon);
         assert_eq!(a, b + 0x10000);
-        mm.munmap(b + 0x10000, 0x200000);
+        mm.munmap(b + 0x10000, 0x200000).unwrap();
         assert_no_overlaps(&mm);
 
         // 4MB alloc then partial unmaps (musl pattern)
         let a = mm.mmap_anonymous(0, 0x3ff000, rw, anon);
         assert_eq!(a, b + 0x10000);
-        mm.munmap(b + 0x10000, 0x1f0000); // front trim
-        mm.munmap(b + 0x400000, 0xf000); // back trim
+        mm.munmap(b + 0x10000, 0x1f0000).unwrap(); // front trim
+        mm.munmap(b + 0x400000, 0xf000).unwrap(); // back trim
         assert_no_overlaps(&mm);
 
         // Fill in gap allocations
@@ -853,10 +936,10 @@ mod tests {
         assert_no_overlaps(&mm);
 
         // munmap/mmap cycle
-        mm.munmap(b + 0x170000, 0x10000);
+        mm.munmap(b + 0x170000, 0x10000).unwrap();
         let a = mm.mmap_anonymous(0, 0x10000, rw, anon);
         assert_eq!(a, b + 0x170000);
-        mm.munmap(b + 0x170000, 0x10000);
+        mm.munmap(b + 0x170000, 0x10000).unwrap();
         let a = mm.mmap_anonymous(0, 0x10000, rw, anon);
         assert_eq!(a, b + 0x170000);
         assert_no_overlaps(&mm);
@@ -870,7 +953,7 @@ mod tests {
         assert_eq!(a, b + 0x1b0000);
 
         // munmap then reallocate
-        mm.munmap(b + 0x150000, 0x10000);
+        mm.munmap(b + 0x150000, 0x10000).unwrap();
         let a = mm.mmap_anonymous(0, 0x10000, rw, anon);
         assert_eq!(a, b + 0x150000);
         assert_no_overlaps(&mm);
@@ -885,9 +968,9 @@ mod tests {
 
         // WPS:110 — another musl mmap pattern
         let a = mm.mmap_anonymous(0, 0x200000, rw, anon);
-        mm.munmap(a, 0x200000);
+        mm.munmap(a, 0x200000).unwrap();
         let a2 = mm.mmap_anonymous(0, 0x3f0000, rw, anon);
-        mm.munmap(a2, 0x1f0000);
+        mm.munmap(a2, 0x1f0000).unwrap();
         let _a3 = mm.mmap_anonymous(0, 0x200000, rw, anon);
         assert_no_overlaps(&mm);
 
@@ -898,7 +981,7 @@ mod tests {
 
         // After SHORTINIT — another musl pattern
         let a6 = mm.mmap_anonymous(0, 0x200000, rw, anon);
-        mm.munmap(a6, 0x200000);
+        mm.munmap(a6, 0x200000).unwrap();
         assert_no_overlaps(&mm);
 
         // THE PROBLEMATIC MMAP — should NOT return MMAP_BASE

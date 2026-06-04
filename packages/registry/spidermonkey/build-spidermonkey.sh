@@ -29,14 +29,14 @@ OBJ_DIR="$SCRIPT_DIR/obj-wasm32"
 MOZCONFIG_PATH="$SCRIPT_DIR/mozconfig-wasm32"
 HOST_OS="$(uname -s)"
 MACOS_SDK_DIR="${WASM_POSIX_MACOS_SDK_DIR:-}"
+MACOS_DEVELOPER_DIR="${DEVELOPER_DIR:-}"
 
 if [ "$HOST_OS" = "Darwin" ] && [ -z "$MACOS_SDK_DIR" ] && command -v xcrun >/dev/null 2>&1; then
     SYSTEM_DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
     if [ -d "$SYSTEM_DEVELOPER_DIR" ]; then
         MACOS_SDK_DIR="$(DEVELOPER_DIR="$SYSTEM_DEVELOPER_DIR" xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
         if [ -n "$MACOS_SDK_DIR" ]; then
-            export DEVELOPER_DIR="$SYSTEM_DEVELOPER_DIR"
-            export SDKROOT="$MACOS_SDK_DIR"
+            MACOS_DEVELOPER_DIR="$SYSTEM_DEVELOPER_DIR"
         fi
     else
         MACOS_SDK_DIR="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
@@ -63,7 +63,10 @@ done
 HOST_TARGET="$(rustc -vV | awk '/^host/ {print $2}')"
 resolve_dep() {
     local name="$1"
-    (cd "$REPO_ROOT" && cargo run -p xtask --target "$HOST_TARGET" --quiet -- build-deps resolve "$name")
+    (
+        cd "$REPO_ROOT"
+        cargo --config "build.target=\"$HOST_TARGET\"" run -p xtask --quiet -- build-deps resolve "$name"
+    )
 }
 
 LIBCXX_PREFIX="${WASM_POSIX_DEP_LIBCXX_DIR:-}"
@@ -274,6 +277,10 @@ mk_add_options MOZ_OBJDIR=$OBJ_DIR
 EOF
 if [ -n "$MACOS_SDK_DIR" ]; then
     echo "ac_add_options --with-macos-sdk=$MACOS_SDK_DIR" >> "$MOZCONFIG_PATH"
+    export SDKROOT="$MACOS_SDK_DIR"
+    if [ -n "$MACOS_DEVELOPER_DIR" ]; then
+        export DEVELOPER_DIR="$MACOS_DEVELOPER_DIR"
+    fi
 fi
 
 export MOZCONFIG="$MOZCONFIG_PATH"
@@ -359,6 +366,7 @@ echo "==> SpiderMonkey Node-compatible runtime staged: $BIN_DIR/node.wasm ($NODE
 
 # shellcheck source=/dev/null
 source "$REPO_ROOT/scripts/install-local-binary.sh"
-WASM_POSIX_INSTALL_FORK_INSTRUMENTATION=disabled install_local_binary spidermonkey "$BIN_DIR/js.wasm"
-WASM_POSIX_INSTALL_FORK_INSTRUMENTATION=disabled install_local_binary spidermonkey-node "$BIN_DIR/node.wasm"
-WASM_POSIX_INSTALL_FORK_INSTRUMENTATION=disabled install_local_binary node "$BIN_DIR/node.wasm"
+export WASM_POSIX_INSTALL_FORK_INSTRUMENTATION=disabled
+install_local_binary spidermonkey "$BIN_DIR/js.wasm"
+install_local_binary spidermonkey-node "$BIN_DIR/node.wasm"
+install_local_binary node "$BIN_DIR/node.wasm"

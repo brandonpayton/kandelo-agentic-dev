@@ -252,6 +252,7 @@ run_test() {
     local test_file="$1"
     local output
 
+    set +e
     output=$(timeout "$TEST_TIMEOUT" bash -c '
         TCL_LIBRARY="'"$TCL_INSTALL"'/lib/tcl8.6" \
         KERNEL_CWD="'"$SQLITE_FULL"'" \
@@ -259,8 +260,24 @@ run_test() {
         node --experimental-wasm-exnref --import tsx/esm \
             '"$REPO_ROOT"'/examples/run-example.ts \
             '"$TESTFIXTURE"' test/'"$test_file"' 2>&1
-    ' 2>&1) || true
+    ' 2>&1)
     local exit_code=$?
+    set -e
+
+    local counts=""
+    local case_errors=""
+    local case_total=""
+    counts=$(printf '%s\n' "$output" | sed -nE 's/.*([0-9]+) errors out of ([0-9]+) tests.*/\1|\2/p' | tail -n 1)
+    if [ -n "$counts" ]; then
+        case_errors="${counts%%|*}"
+        case_total="${counts##*|}"
+    else
+        case_total=$(printf '%s\n' "$output" | grep -c '\.\.\. Ok' || true)
+    fi
+
+    emit_result() {
+        echo "$1|$case_errors|$case_total"
+    }
 
     # Detection strategy:
     # 1. "0 errors out of" — explicit pass from finalize_testing
@@ -269,15 +286,15 @@ run_test() {
     # 4. Crash/runtime error detection
 
     if echo "$output" | grep -q "0 errors out of"; then
-        echo "PASS"
+        emit_result "PASS"
     elif echo "$output" | grep -qiE 'Skipping tests|cannot run because|not available'; then
         # Test self-skipped — no test cases ran
         local err_count
         err_count=$(echo "$output" | grep -cE '! |Expected:|wrong # args|Error in ' || true)
         if [ "$err_count" -eq 0 ]; then
-            echo "SKIP"
+            emit_result "SKIP"
         else
-            echo "FAIL"
+            emit_result "FAIL"
         fi
     elif [ "$exit_code" -eq 124 ]; then
         # timeout(1) returns 124 when it kills the process
@@ -287,9 +304,9 @@ run_test() {
         err_count=$(echo "$output" | grep -cE '! |Expected:|wrong # args|Error in ' || true)
         if [ "$ok_count" -gt 0 ] && [ "$err_count" -eq 0 ]; then
             # All tests passed but finalization timed out — count as PASS
-            echo "PASS"
+            emit_result "PASS"
         else
-            echo "TIME"
+            emit_result "TIME"
         fi
     elif echo "$output" | grep -q "Process timed out"; then
         local ok_count
@@ -297,25 +314,25 @@ run_test() {
         local err_count
         err_count=$(echo "$output" | grep -cE '! |Expected:|wrong # args|Error in ' || true)
         if [ "$ok_count" -gt 0 ] && [ "$err_count" -eq 0 ]; then
-            echo "PASS"
+            emit_result "PASS"
         else
-            echo "TIME"
+            emit_result "TIME"
         fi
     elif echo "$output" | grep -qE '[0-9]+ errors out of [0-9]+ tests'; then
-        echo "FAIL"
+        emit_result "FAIL"
     elif echo "$output" | grep -qE 'Unimplemented import:|Centralized worker failed:'; then
-        echo "FAIL"
+        emit_result "FAIL"
     else
         local ok_count
         ok_count=$(echo "$output" | grep -c '\.\.\. Ok' || true)
         local err_count
         err_count=$(echo "$output" | grep -cE '! |Expected:|wrong # args|Error in ' || true)
         if [ "$ok_count" -gt 0 ] && [ "$err_count" -eq 0 ]; then
-            echo "PASS"
+            emit_result "PASS"
         elif [ "$ok_count" -eq 0 ]; then
-            echo "FAIL"
+            emit_result "FAIL"
         else
-            echo "FAIL"
+            emit_result "FAIL"
         fi
     fi
 }
@@ -337,6 +354,8 @@ XFAIL_COUNT=0
 XPASS=0
 TIME=0
 SKIP=0
+CASE_TOTAL=0
+CASE_ERRORS=0
 RESULTS=()
 FAIL_LIST=()
 XPASS_LIST=()
@@ -355,7 +374,15 @@ for i in "${!TESTS[@]}"; do
     printf "[%4d/%4d] %-40s " "$n" "$TOTAL" "$test_file"
 
     result_line=$(run_test "$test_file" 2>/dev/null)
-    result="$(echo "$result_line" | head -1)"
+    IFS='|' read -r result case_errors case_total <<< "$(echo "$result_line" | head -1)"
+    case_errors="${case_errors:-0}"
+    case_total="${case_total:-0}"
+    if [[ "$case_errors" =~ ^[0-9]+$ ]]; then
+        CASE_ERRORS=$((CASE_ERRORS + case_errors))
+    fi
+    if [[ "$case_total" =~ ^[0-9]+$ ]]; then
+        CASE_TOTAL=$((CASE_TOTAL + case_total))
+    fi
 
     case "$result" in
         PASS)
@@ -425,6 +452,8 @@ echo "  XPASS: $XPASS"
 echo "  SKIP:  $SKIP"
 echo "  TIME:  $TIME"
 echo "  TOTAL: $TOTAL"
+echo "  CASES: $CASE_TOTAL"
+echo "  CASE ERRORS: $CASE_ERRORS"
 echo ""
 
 if [ ${#UNEXPECTED_FAILS[@]} -gt 0 ]; then
@@ -465,6 +494,8 @@ Platform: wasm32-posix-kernel
 | SKIP   | $SKIP |
 | TIME   | $TIME |
 | **Total** | **$TOTAL** |
+| SQLite test cases reported by scripts | $CASE_TOTAL |
+| SQLite case errors reported by scripts | $CASE_ERRORS |
 
 ## Detailed Results
 

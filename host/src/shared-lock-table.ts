@@ -64,7 +64,7 @@ export class SharedLockTable {
     this.view = new Int32Array(sab);
   }
 
-  static create(capacity: number = 256): SharedLockTable {
+  static create(capacity: number = 4096): SharedLockTable {
     const byteLen = HEADER_BYTES + capacity * ENTRY_INTS * 4;
     const sab = new SharedArrayBuffer(byteLen);
     const table = new SharedLockTable(sab);
@@ -81,6 +81,33 @@ export class SharedLockTable {
 
   getBuffer(): SharedArrayBuffer {
     return this.sab;
+  }
+
+  private growUnsafe(minCapacity: number): void {
+    const oldView = this.view;
+    const oldCount = oldView[COUNT];
+    const oldCapacity = oldView[CAPACITY];
+    const nextCapacity = Math.max(minCapacity, oldCapacity * 2, 1);
+    const nextSab = new SharedArrayBuffer(HEADER_BYTES + nextCapacity * ENTRY_INTS * 4);
+    const nextView = new Int32Array(nextSab);
+
+    // Keep the table locked in the replacement buffer. The caller already
+    // holds the old spinlock and will release the new one in its finally block.
+    nextView[SPINLOCK] = 1;
+    nextView[COUNT] = oldCount;
+    nextView[CAPACITY] = nextCapacity;
+    nextView[WAKE_COUNTER] = oldView[WAKE_COUNTER];
+
+    const entryInts = oldCount * ENTRY_INTS;
+    nextView.set(
+      oldView.subarray(HEADER_INTS, HEADER_INTS + entryInts),
+      HEADER_INTS,
+    );
+
+    Atomics.store(oldView, SPINLOCK, 0);
+    Atomics.notify(oldView, SPINLOCK);
+    this.sab = nextSab;
+    this.view = nextView;
   }
 
   // --- Spinlock ---
@@ -298,10 +325,11 @@ export class SharedLockTable {
     }
 
     // Add new lock entry
-    const count = this.view[COUNT];
+    let count = this.view[COUNT];
     const capacity = this.view[CAPACITY];
     if (count >= capacity) {
-      return false; // table full — treat as EAGAIN
+      this.growUnsafe(capacity + 1);
+      count = this.view[COUNT];
     }
     this.writeEntry(count, { pathHash, pid, lockType, start, len });
     this.view[COUNT] = count + 1;

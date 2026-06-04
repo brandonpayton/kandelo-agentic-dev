@@ -8,4 +8,5 @@ name = "kandelo_kernel"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+dlmalloc = "0.2.14"
 wasm-posix-shared = { path = "../shared" }

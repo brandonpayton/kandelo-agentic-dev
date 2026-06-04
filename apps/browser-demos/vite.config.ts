@@ -52,19 +52,11 @@ function resolveKernelArtifactsAlias(): Plugin {
         );
       }
       if (pathPart === ROOTFS) {
-        const candidates = [
-          path.resolve(repoRoot, "host/wasm/rootfs.vfs"),
-          path.resolve(repoRoot, "local-binaries/rootfs.vfs"),
-          path.resolve(repoRoot, "binaries/rootfs.vfs"),
-          path.resolve(repoRoot, "local-binaries/programs/wasm32/rootfs.vfs"),
-          path.resolve(repoRoot, "binaries/programs/wasm32/rootfs.vfs"),
-        ];
-        for (const file of candidates) {
-          if (fs.existsSync(file)) return file + query;
-        }
+        const file = path.resolve(repoRoot, "host/wasm/rootfs.vfs");
+        if (fs.existsSync(file)) return file + query;
         this.error(
-          "rootfs.vfs not found. Run `bash build.sh` from the repo root, or fetch/build the rootfs package.\n" +
-          candidates.map((file) => `  Looked at: ${file}`).join("\n")
+          "rootfs.vfs not found. Run `bash build.sh` from the repo root.\n" +
+          `  Looked at: ${file}`
         );
       }
       return null;
@@ -141,7 +133,7 @@ function rewriteNavLinks(): Plugin {
       if (base === "/") return html;
       // Rewrite href="/..." links to href="${base}..." but skip links that
       // Vite has already prefixed with the base path (e.g. asset preloads)
-      const baseRest = base.slice(1); // "kandelo/"
+      const baseRest = base.slice(1); // "wasm-posix-kernel/"
       const escaped = baseRest.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const re = new RegExp(`href="\\/(?!${escaped})(?!\\/)`, "g");
       return html.replace(re, `href="${base}`);
@@ -173,7 +165,7 @@ function injectGitRevision(): Plugin {
         const match = remoteUrl.match(
           /github\.com[:/](.+?)(?:\.git)?$/
         );
-        const repoPath = match ? match[1] : "brandonpayton/kandelo";
+        const repoPath = match ? match[1] : "brandonpayton/wasm-posix-kernel";
         const fullRev = execSync("git rev-parse HEAD", {
           cwd: repoRoot,
           encoding: "utf-8",
@@ -259,7 +251,7 @@ function attachCorsProxyMiddleware(
         forwardHeaders[name] = value as string | string[];
       }
       if (!forwardHeaders["user-agent"]) {
-        forwardHeaders["user-agent"] = "kandelo-proxy";
+        forwardHeaders["user-agent"] = "wasm-posix-kernel-proxy";
       }
       // The wasm-side fetch can't decompress gzip/br — force identity so
       // the client sees raw JSON/SSE instead of UTF-8 replacement chars.
@@ -367,6 +359,52 @@ function injectCorsProxyUrl(): Plugin {
   };
 }
 
+const demoInputs = {
+  main: path.resolve(__dirname, "index.html"),
+  nginx: path.resolve(__dirname, "pages/nginx/index.html"),
+  php: path.resolve(__dirname, "pages/php/index.html"),
+  "nginx-php": path.resolve(__dirname, "pages/nginx-php/index.html"),
+  mariadb: path.resolve(__dirname, "pages/mariadb/index.html"),
+  wordpress: path.resolve(__dirname, "pages/wordpress/index.html"),
+  lamp: path.resolve(__dirname, "pages/lamp/index.html"),
+  shell: path.resolve(__dirname, "pages/shell/index.html"),
+  node: path.resolve(__dirname, "pages/node/index.html"),
+  "test-runner": path.resolve(__dirname, "pages/test-runner/index.html"),
+  "sqlite-test": path.resolve(__dirname, "pages/sqlite-test/index.html"),
+  "php-test": path.resolve(__dirname, "pages/php-test/index.html"),
+  "spidermonkey-test": path.resolve(__dirname, "pages/spidermonkey-test/index.html"),
+  "nodejs-test": path.resolve(__dirname, "pages/nodejs-test/index.html"),
+  "git-test": path.resolve(__dirname, "pages/git-test/index.html"),
+  "mariadb-test": path.resolve(__dirname, "pages/mariadb-test/index.html"),
+  benchmark: path.resolve(__dirname, "pages/benchmark/index.html"),
+  doom: path.resolve(__dirname, "pages/doom/index.html"),
+  kandelo: path.resolve(__dirname, "pages/kandelo/index.html"),
+  // The perl, python, ruby, erlang, texlive, and redis pages
+  // are not part of this static build while their slow builds
+  // live in kandelo-software. The root gallery fetches that
+  // repo's gallery.json and index.toml at runtime to expose
+  // available third-party VFS builds without adding page inputs.
+};
+
+function selectedDemoInputs(): typeof demoInputs | Record<string, string> {
+  const requested = process.env.KANDELO_BROWSER_DEMO_INPUTS
+    ?.split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  if (!requested || requested.length === 0) return demoInputs;
+
+  const selected: Record<string, string> = {};
+  for (const name of requested) {
+    if (!(name in demoInputs)) {
+      throw new Error(`Unknown KANDELO_BROWSER_DEMO_INPUTS entry: ${name}`);
+    }
+    selected[name] = demoInputs[name as keyof typeof demoInputs];
+  }
+  return selected;
+}
+
+const disableBrowserTestHmr = process.env.KANDELO_BROWSER_TEST_NO_HMR === "1";
+
 export default defineConfig({
   base: process.env.VITE_BASE || "/",
   resolve: {
@@ -386,6 +424,13 @@ export default defineConfig({
   ],
   server: {
     headers: crossOriginIsolationHeaders,
+    hmr: disableBrowserTestHmr ? false : undefined,
+    watch: disableBrowserTestHmr ? {
+      ignored: [
+        "**/test-runs/**",
+        "**/host/dist/**",
+      ],
+    } : undefined,
     fs: {
       allow: [repoRoot],
     },
@@ -401,29 +446,7 @@ export default defineConfig({
     // (Firefox).
     minify: "terser",
     rollupOptions: {
-      input: {
-        main: path.resolve(__dirname, "index.html"),
-        nginx: path.resolve(__dirname, "pages/nginx/index.html"),
-        php: path.resolve(__dirname, "pages/php/index.html"),
-        "nginx-php": path.resolve(__dirname, "pages/nginx-php/index.html"),
-        mariadb: path.resolve(__dirname, "pages/mariadb/index.html"),
-        wordpress: path.resolve(__dirname, "pages/wordpress/index.html"),
-        lamp: path.resolve(__dirname, "pages/lamp/index.html"),
-        shell: path.resolve(__dirname, "pages/shell/index.html"),
-        node: path.resolve(__dirname, "pages/node/index.html"),
-        "test-runner": path.resolve(__dirname, "pages/test-runner/index.html"),
-        "git-test": path.resolve(__dirname, "pages/git-test/index.html"),
-        "mariadb-test": path.resolve(__dirname, "pages/mariadb-test/index.html"),
-        benchmark: path.resolve(__dirname, "pages/benchmark/index.html"),
-        doom: path.resolve(__dirname, "pages/doom/index.html"),
-        kandelo: path.resolve(__dirname, "pages/kandelo/index.html"),
-        network: path.resolve(__dirname, "pages/network/index.html"),
-        // The perl, python, ruby, erlang, texlive, and redis pages
-        // are not part of this static build while their slow builds
-        // live in kandelo-software. The root gallery fetches that
-        // repo's gallery.json and index.toml at runtime to expose
-        // available third-party VFS builds without adding page inputs.
-      },
+      input: selectedDemoInputs(),
     },
   },
   worker: {

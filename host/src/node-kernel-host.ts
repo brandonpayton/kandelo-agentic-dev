@@ -112,6 +112,7 @@ export class NodeKernelHost {
   private worker!: NodeThreadWorker;
   private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   private exitResolvers = new Map<number, (status: number) => void>();
+  private pendingExitStatuses = new Map<number, number>();
   private _nextRequestId = 1;
   private options: NodeKernelHostOptions;
 
@@ -212,9 +213,7 @@ export class NodeKernelHost {
       maxAddr: options?.maxAddr,
     }) as number;
 
-    const exitPromise = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exitPromise = this.createExitPromise(pid);
 
     this.options.onProcessEvent?.({ kind: "spawn", pid });
 
@@ -224,6 +223,17 @@ export class NodeKernelHost {
     }
 
     return exitPromise;
+  }
+
+  private createExitPromise(pid: number): Promise<number> {
+    if (this.pendingExitStatuses.has(pid)) {
+      const status = this.pendingExitStatuses.get(pid)!;
+      this.pendingExitStatuses.delete(pid);
+      return Promise.resolve(status);
+    }
+    return new Promise<number>((resolve) => {
+      this.exitResolvers.set(pid, resolve);
+    });
   }
 
   /** Append data to a process's stdin buffer (process sees more data, no EOF) */
@@ -403,6 +413,7 @@ export class NodeKernelHost {
     }
     await this.worker.terminate();
     this.exitResolvers.clear();
+    this.pendingExitStatuses.clear();
     this.pendingRequests.clear();
   }
 
@@ -438,6 +449,8 @@ export class NodeKernelHost {
         if (resolver) {
           this.exitResolvers.delete(msg.pid);
           resolver(msg.status);
+        } else {
+          this.pendingExitStatuses.set(msg.pid, msg.status);
         }
         this.options.onProcessEvent?.({ kind: "exit", pid: msg.pid, exitStatus: msg.status });
         break;

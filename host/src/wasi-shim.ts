@@ -533,7 +533,7 @@ export class WasiShim {
   }
 
   /**
-   * Read the kernel's WasmStat (88 bytes) from a data area offset and
+   * Read the kernel's WasmStat (104 bytes) from a data area offset and
    * write WASI filestat (64 bytes) to the module's memory.
    */
   private translateStat(statDataOffset: number, filestatPtr: number): void {

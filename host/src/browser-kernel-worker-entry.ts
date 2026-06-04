@@ -63,6 +63,7 @@ if (typeof globalThis.setImmediate === "undefined") {
 import { CentralizedKernelWorker } from "./kernel-worker";
 import type {
   ForkFromThreadContext,
+  ProcessExitInfo,
   ResolvedSpawnProgram,
 } from "./kernel-worker";
 import { BrowserWorkerAdapter } from "./worker-adapter-browser";
@@ -108,6 +109,9 @@ let io: VirtualPlatformIO;
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
 let defaultEnv: string[] = [];
+const THREAD_TRACE = typeof process !== "undefined" && !!process.env?.KERNEL_THREAD_TRACE;
+const MAX_POOLED_PROCESS_MEMORIES = 8;
+const CHANNEL_ERROR_TRAP_EXPORT = "__wasm_posix_channel_error_traps";
 
 // Process tracking
 interface ProcessInfo {
@@ -119,8 +123,26 @@ interface ProcessInfo {
   ptrWidth: 4 | 8;
   layout: ProcessMemoryLayout;
   threadAllocator: ThreadPageAllocator;
+  channelErrorTraps: boolean;
 }
 const processes = new Map<number, ProcessInfo>();
+
+function moduleSupportsChannelErrorTrap(module: WebAssembly.Module): boolean {
+  return WebAssembly.Module.exports(module).some((entry) =>
+    entry.kind === "function" && entry.name === CHANNEL_ERROR_TRAP_EXPORT,
+  );
+}
+
+function programSupportsChannelErrorTrap(
+  programBytes: ArrayBuffer,
+  module?: WebAssembly.Module,
+): boolean {
+  try {
+    return moduleSupportsChannelErrorTrap(module ?? new WebAssembly.Module(programBytes));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Workers we deliberately terminated — exec, exit, top-level destroy. The
@@ -174,8 +196,195 @@ const threadWorkers = new Map<number, Array<{
   worker: ReturnType<BrowserWorkerAdapter["createWorker"]>;
   channelOffset: number;
   tid: number;
+  basePage: number;
 }>>();
 const ptyByPid = new Map<number, number>();
+const processMemoryPool = new Map<string, WebAssembly.Memory[]>();
+let processMemoryPoolSize = 0;
+const quiescedProcessWorkers = new WeakSet<object>();
+const retiredProcessWorkers = new Map<object, { pid: number; info: ProcessInfo }>();
+
+function processMemoryPages(memory: WebAssembly.Memory): number {
+  return Math.ceil(memory.buffer.byteLength / PAGE_SIZE);
+}
+
+function processMemoryPoolKey(
+  ptrWidth: 4 | 8,
+  maximumPages: number,
+  currentPages: number,
+  layoutKey: string,
+): string {
+  return `${ptrWidth}:${maximumPages}:${currentPages}:${layoutKey}`;
+}
+
+function zeroProcessMemory(memory: WebAssembly.Memory): void {
+  new Uint8Array(memory.buffer).fill(0);
+}
+
+function processMemoryLayoutPoolKey(layout: ProcessMemoryLayout): string {
+  return [
+    layout.channelOffset,
+    layout.brkBase,
+    layout.threadArenaEndPage,
+    layout.threadSlotCount,
+  ].join(":");
+}
+
+function processMemoryPoolSummary(): string {
+  const entries = [...processMemoryPool.entries()]
+    .map(([key, pool]) => `${key}x${pool.length}`);
+  return entries.length > 0 ? `total=${processMemoryPoolSize} ${entries.join(",")}` : "empty";
+}
+
+function pooledProcessMemoryPagesFromKey(key: string): number {
+  return Number(key.split(":")[2]) || 0;
+}
+
+function evictLargestPooledProcessMemory(): boolean {
+  let evictKey: string | undefined;
+  let evictPages = -1;
+  for (const [key, pool] of processMemoryPool) {
+    if (pool.length === 0) continue;
+    const pages = pooledProcessMemoryPagesFromKey(key);
+    if (pages > evictPages) {
+      evictKey = key;
+      evictPages = pages;
+    }
+  }
+  if (!evictKey) return false;
+  const pool = processMemoryPool.get(evictKey);
+  pool?.pop();
+  if (pool && pool.length === 0) processMemoryPool.delete(evictKey);
+  processMemoryPoolSize = Math.max(0, processMemoryPoolSize - 1);
+  return true;
+}
+
+function clearProcessMemoryPool(): void {
+  processMemoryPool.clear();
+  processMemoryPoolSize = 0;
+}
+
+function takePooledProcessMemory(
+  ptrWidth: 4 | 8,
+  maximumPages: number,
+  initialPages: number,
+  layoutKey: string,
+): WebAssembly.Memory | null {
+  const key = processMemoryPoolKey(ptrWidth, maximumPages, initialPages, layoutKey);
+  const pool = processMemoryPool.get(key);
+  const memory = pool?.pop() ?? null;
+  if (pool && pool.length === 0) processMemoryPool.delete(key);
+  if (memory) {
+    processMemoryPoolSize = Math.max(0, processMemoryPoolSize - 1);
+    zeroProcessMemory(memory);
+  }
+  return memory;
+}
+
+function recycleProcessMemory(
+  ptrWidth: 4 | 8,
+  maximumPages: number,
+  memory: WebAssembly.Memory,
+  layoutKey: string,
+): void {
+  const currentPages = processMemoryPages(memory);
+  const key = processMemoryPoolKey(ptrWidth, maximumPages, currentPages, layoutKey);
+  let pool = processMemoryPool.get(key);
+  if (!pool) {
+    pool = [];
+    processMemoryPool.set(key, pool);
+  }
+  while (processMemoryPoolSize >= MAX_POOLED_PROCESS_MEMORIES) {
+    if (!evictLargestPooledProcessMemory()) break;
+  }
+  if (processMemoryPoolSize < MAX_POOLED_PROCESS_MEMORIES) {
+    pool.push(memory);
+    processMemoryPoolSize++;
+  }
+}
+
+function recycleProcessInfoMemory(info: ProcessInfo | undefined): void {
+  if (!info) return;
+  recycleProcessMemory(
+    info.ptrWidth,
+    info.layout.maximumPages,
+    info.memory,
+    processMemoryLayoutPoolKey(info.layout),
+  );
+}
+
+function canRecycleQuiescedProcess(
+  pid: number,
+  exitStatus: number,
+  info?: ProcessExitInfo,
+  workerAlreadyQuiesced = false,
+): boolean {
+  if (exitStatus < 0 && !info?.workerWillQuiesce && !workerAlreadyQuiesced) return false;
+  if (exitStatus >= 128 && !info?.workerWillQuiesce && !workerAlreadyQuiesced) return false;
+  return (threadWorkers.get(pid)?.length ?? 0) === 0;
+}
+
+function markProcessWorkerQuiesced(
+  worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
+): void {
+  quiescedProcessWorkers.add(worker as object);
+}
+
+function finishRetiredProcessWorker(
+  worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
+): boolean {
+  const retired = retiredProcessWorkers.get(worker as object);
+  if (!retired) return false;
+  retiredProcessWorkers.delete(worker as object);
+  recycleProcessInfoMemory(retired.info);
+  void terminateTrackedWorker(retired.info.worker);
+  return true;
+}
+
+async function terminateTrackedWorker(
+  worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
+): Promise<void> {
+  intentionallyTerminated.add(worker as object);
+  await worker.terminate().catch(() => {});
+}
+
+async function terminateThreadWorkers(pid: number): Promise<void> {
+  const threads = threadWorkers.get(pid);
+  if (!threads) return;
+  threadWorkers.delete(pid);
+  for (const t of threads) {
+    await terminateTrackedWorker(t.worker);
+  }
+}
+
+function reclaimExitedThreadWorker(pid: number, tid: number, channelOffset: number): void {
+  const threads = threadWorkers.get(pid);
+  if (!threads) {
+    if (THREAD_TRACE) console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no thread list`);
+    return;
+  }
+  const idx = threads.findIndex((entry) =>
+    entry.channelOffset === channelOffset || (tid > 0 && entry.tid === tid),
+  );
+  if (idx < 0) {
+    if (THREAD_TRACE) console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no entry`);
+    return;
+  }
+
+  const [entry] = threads.splice(idx, 1);
+  if (threads.length === 0) threadWorkers.delete(pid);
+
+  const processInfo = processes.get(pid);
+  if (processInfo) {
+    processInfo.threadAllocator.free(entry.basePage);
+  } else if (THREAD_TRACE) {
+    console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no process`);
+  }
+  if (THREAD_TRACE) {
+    console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} base=${entry.basePage} remaining=${threads.length}`);
+  }
+  void terminateTrackedWorker(entry.worker);
+}
 
 // Kernel wasm exports cache
 let kernelInstance: WebAssembly.Instance | null = null;
@@ -208,20 +417,49 @@ function createSharedProcessMemory(
   ptrWidth: 4 | 8,
   initialPages: number,
   maximumPages: number,
+  layoutKey: string,
 ): WebAssembly.Memory {
-  if (ptrWidth === 8) {
+  const pooled = takePooledProcessMemory(ptrWidth, maximumPages, initialPages, layoutKey);
+  if (pooled) return pooled;
+  const allocate = () => {
+    if (ptrWidth === 8) {
+      return new WebAssembly.Memory({
+        initial: BigInt(initialPages),
+        maximum: BigInt(maximumPages),
+        shared: true,
+        address: "i64",
+      } as unknown as WebAssembly.MemoryDescriptor);
+    }
     return new WebAssembly.Memory({
-      initial: BigInt(initialPages),
-      maximum: BigInt(maximumPages),
+      initial: initialPages,
+      maximum: maximumPages,
       shared: true,
-      address: "i64",
-    } as unknown as WebAssembly.MemoryDescriptor);
+    });
+  };
+  try {
+    return allocate();
+  } catch (err) {
+    if (processMemoryPoolSize > 0) {
+      clearProcessMemoryPool();
+      return allocate();
+    }
+    throw err;
   }
-  return new WebAssembly.Memory({
-    initial: initialPages,
-    maximum: maximumPages,
-    shared: true,
-  });
+}
+
+function createProcessMemoryWithPressureRetry(
+  ptrWidth: 4 | 8,
+  layout: ProcessMemoryLayout,
+): WebAssembly.Memory {
+  try {
+    return createProcessMemory(ptrWidth, layout);
+  } catch (err) {
+    if (processMemoryPoolSize > 0) {
+      clearProcessMemoryPool();
+      return createProcessMemory(ptrWidth, layout);
+    }
+    throw err;
+  }
 }
 
 function threadAllocatorForLayout(
@@ -253,7 +491,18 @@ function createFreshProcessMemory(
     programBytes,
     heapBase,
   });
-  const memory = createProcessMemory(ptrWidth, layout);
+  const layoutKey = processMemoryLayoutPoolKey(layout);
+  let memory = takePooledProcessMemory(
+    ptrWidth,
+    layout.maximumPages,
+    layout.initialPages,
+    layoutKey,
+  );
+  if (memory) {
+    zeroProcessMemory(memory);
+  } else {
+    memory = createProcessMemoryWithPressureRetry(ptrWidth, layout);
+  }
   new Uint8Array(memory.buffer, layout.channelOffset, CH_TOTAL_SIZE).fill(0);
   return {
     memory,
@@ -452,18 +701,15 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       onSpawn: handlePosixSpawn,
       onClone: (pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, memory) =>
         handleClone(pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, memory),
-      onExit: (pid, exitStatus) => handleExit(pid, exitStatus),
+      onThreadExit: handleThreadExit,
+      onExit: (pid, exitStatus, info) => handleExit(pid, exitStatus, info),
     },
   );
 
-  // In a dedicated worker, use Atomics.waitAsync directly — no V8 microtask
-  // chain freeze bug (that's main-thread-only).
-  kernelWorker.usePolling = false;
-  // Process a small batch of syscalls via microtask before yielding to the
-  // event loop via setImmediate. Batch size 8 is a good balance: it gives
-  // ~8x throughput vs batch-1 while still yielding frequently enough for
-  // pump timers, message handlers, and rendering to interleave.
-  (kernelWorker as any).relistenBatchSize = 8;
+  // Use the polling scheduler in the dedicated browser worker too. Long,
+  // multi-threaded workloads can otherwise livelock in V8 waitAsync promise
+  // continuations while guest threads are asleep and no channel makes progress.
+  kernelWorker.usePolling = true;
 
   // Inject stdout/stderr/listen callbacks
   const kw = kernelWorker as any;
@@ -570,6 +816,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
     const pid = msg.pid ?? kernelWorker.allocatePid();
     const pages = msg.maxPages ?? maxPages;
     const ptrWidth = detectPtrWidth(programBytes);
+    const channelErrorTraps = programSupportsChannelErrorTrap(programBytes);
     const {
       memory,
       layout,
@@ -583,6 +830,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       brkBase: layout.brkBase,
       mmapBase: layout.mmapBase,
       maxAddr: layout.maxAddr,
+      channelErrorTraps,
     });
 
     if (msg.cwd) {
@@ -627,6 +875,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       ptrWidth,
       layout,
       threadAllocator,
+      channelErrorTraps,
     });
 
     installProcessWorkerListeners(worker, pid);
@@ -702,6 +951,8 @@ function installProcessWorkerListeners(
   worker.on("message", (msg: unknown) => {
     const m = msg as { type?: string; message?: string; pid?: number; status?: number };
     if (m.type === "error") {
+      markProcessWorkerQuiesced(worker);
+      if (finishRetiredProcessWorker(worker)) return;
       console.error(`[kernel-worker] Process error pid=${pid}:`, m.message);
       // Forward to host stderr so the demo log shows the actual failure
       // ("Centralized worker failed: …" with the wasm trap or
@@ -715,6 +966,8 @@ function installProcessWorkerListeners(
       post({ type: "stderr", pid, data: errBytes });
       finalize(-1, "worker-main error message");
     } else if (m.type === "exit") {
+      markProcessWorkerQuiesced(worker);
+      if (finishRetiredProcessWorker(worker)) return;
       finalize(m.status ?? 0, "worker-main exit message");
     }
   });
@@ -739,12 +992,21 @@ async function handleFork(
   const parentBuf = new Uint8Array(parentMemory.buffer);
   const parentPages = Math.ceil(parentBuf.byteLength / PAGE_SIZE);
   const ptrWidth = parentInfo.ptrWidth;
+  const channelErrorTraps = parentInfo.channelErrorTraps;
   const childLayout = parentInfo.layout;
-  const childMemory = createSharedProcessMemory(
-    ptrWidth,
-    parentPages,
-    childLayout.maximumPages,
-  );
+  let childMemory: WebAssembly.Memory;
+  try {
+    childMemory = createSharedProcessMemory(
+      ptrWidth,
+      parentPages,
+      childLayout.maximumPages,
+      processMemoryLayoutPoolKey(childLayout),
+    );
+  } catch (err) {
+    throw new Error(
+      `create child process memory failed parent=${parentPid} child=${childPid} ptrWidth=${ptrWidth} initialPages=${parentPages} maximumPages=${childLayout.maximumPages} pool=${processMemoryPoolSummary()}: ${formatError(err)}`,
+    );
+  }
   new Uint8Array(childMemory.buffer).set(parentBuf);
 
   const childChannelOffset = childLayout.channelOffset;
@@ -755,6 +1017,7 @@ async function handleFork(
     ptrWidth,
     maxAddr: childLayout.maxAddr,
     mmapBase: childLayout.mmapBase,
+    channelErrorTraps,
   });
 
   const forkBufAddr = threadFork
@@ -786,6 +1049,7 @@ async function handleFork(
     ptrWidth,
     layout: childLayout,
     threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth),
+    channelErrorTraps,
   });
 
   installProcessWorkerListeners(childWorker, childPid);
@@ -815,9 +1079,16 @@ async function handleExec(
   // crash detector and tear down the kernel's view of the still-alive
   // (post-exec) process.
   const oldInfo = processes.get(pid);
-  if (oldInfo?.worker) {
-    intentionallyTerminated.add(oldInfo.worker as object);
-    await oldInfo.worker.terminate().catch(() => {});
+  const oldThreadWorkerCount = threadWorkers.get(pid)?.length ?? 0;
+  const canRetireOldProcessWorker =
+    !!oldInfo?.worker &&
+    oldInfo.channelErrorTraps &&
+    oldThreadWorkerCount === 0;
+  if (!canRetireOldProcessWorker) {
+    await terminateThreadWorkers(pid);
+    if (oldInfo?.worker) {
+      await terminateTrackedWorker(oldInfo.worker);
+    }
   }
 
   // DIAGNOSTIC: track pid → exec path so the sysprof dump can name
@@ -830,11 +1101,16 @@ async function handleExec(
   // Create fresh memory sized for the new binary's arch (exec across
   // wasm32↔wasm64 replaces the process image — memory type must match).
   const ptrWidth = detectPtrWidth(bytes);
+  const channelErrorTraps = programSupportsChannelErrorTrap(bytes);
   const {
     memory: newMemory,
     layout: newLayout,
     threadAllocator: newThreadAllocator,
-  } = createFreshProcessMemory(bytes, ptrWidth);
+  } = createFreshProcessMemory(
+    bytes,
+    ptrWidth,
+    maxPages,
+  );
   const newChannelOffset = newLayout.channelOffset;
 
   kernelWorker.registerProcess(pid, newMemory, [newChannelOffset], {
@@ -843,6 +1119,7 @@ async function handleExec(
     brkBase: newLayout.brkBase,
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
+    channelErrorTraps,
     // Refresh the kernel's Process.argv so /proc/<pid>/cmdline and
     // host-side enumeration (Kandelo Inspector → Procs) show the new
     // program's argv after exec, not the parent's pre-exec argv.
@@ -874,6 +1151,7 @@ async function handleExec(
     ptrWidth,
     layout: newLayout,
     threadAllocator: newThreadAllocator,
+    channelErrorTraps,
   });
 
   // Wire post-exec error/exit handling. The handleFork listener (on the
@@ -882,6 +1160,9 @@ async function handleExec(
   // request, sed inside wp-config-init, etc.) leaves the kernel believing
   // the process is alive and the parent's waitpid blocks forever.
   installProcessWorkerListeners(newWorker, pid);
+  if (canRetireOldProcessWorker && oldInfo?.worker) {
+    retiredProcessWorkers.set(oldInfo.worker as object, { pid, info: oldInfo });
+  }
 
   return 0;
 }
@@ -932,6 +1213,7 @@ async function handlePosixSpawn(
   post({ type: "proc_event", kind: "spawn", pid: childPid });
 
   const ptrWidth = detectPtrWidth(programBytes);
+  const channelErrorTraps = programSupportsChannelErrorTrap(programBytes);
   const {
     memory: newMemory,
     layout: newLayout,
@@ -946,6 +1228,7 @@ async function handlePosixSpawn(
     brkBase: newLayout.brkBase,
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
+    channelErrorTraps,
   });
 
   const initData: CentralizedWorkerInitMessage = {
@@ -973,6 +1256,7 @@ async function handlePosixSpawn(
     ptrWidth,
     layout: newLayout,
     threadAllocator,
+    channelErrorTraps,
   });
 
   return 0;
@@ -1044,20 +1328,25 @@ async function handleClone(
   const threadEntry = { worker: threadWorker, channelOffset: alloc.channelOffset, tid, basePage: alloc.slotStartPage };
   threadWorkers.get(pid)!.push(threadEntry);
 
+  let reclaimed = false;
   const reclaimThread = () => {
-    processInfo.threadAllocator.free(alloc.basePage);
+    if (reclaimed) return;
     const threads = threadWorkers.get(pid);
-    if (threads) {
-      const idx = threads.indexOf(threadEntry);
-      if (idx >= 0) threads.splice(idx, 1);
+    const idx = threads?.indexOf(threadEntry) ?? -1;
+    if (idx < 0) {
+      reclaimed = true;
+      return;
     }
+    reclaimed = true;
+    processInfo.threadAllocator.free(alloc.basePage);
+    threads!.splice(idx, 1);
+    if (threads!.length === 0) threadWorkers.delete(pid);
   };
 
   threadWorker.on("message", (msg: unknown) => {
     const m = msg as WorkerToHostMessage;
     if (m.type === "thread_exit") {
-      intentionallyTerminated.add(threadWorker as object);
-      threadWorker.terminate().catch(() => {});
+      void terminateTrackedWorker(threadWorker);
       reclaimThread();
     } else if ((m as { type?: string }).type === "error") {
       // worker-main posted {type:"error"} — instantiation failure, top-level
@@ -1068,8 +1357,7 @@ async function handleClone(
       );
       kernelWorker.notifyThreadExit(pid, tid);
       kernelWorker.removeChannel(pid, alloc.channelOffset);
-      intentionallyTerminated.add(threadWorker as object);
-      threadWorker.terminate().catch(() => {});
+      void terminateTrackedWorker(threadWorker);
       reclaimThread();
     }
   });
@@ -1083,8 +1371,31 @@ async function handleClone(
   return tid;
 }
 
-function handleExit(pid: number, exitStatus: number): void {
+function handleThreadExit(pid: number, tid: number, channelOffset: number): void {
+  // Kernel-side SYS_EXIT is the point at which the guest thread is gone and
+  // CLONE_CHILD_CLEARTID has been performed. Reclaim the reserved slot here
+  // and terminate the finished JS Worker so rapid pthread create/join loops do
+  // not exhaust slots while worker messages wait behind more clone syscalls.
+  reclaimExitedThreadWorker(pid, tid, channelOffset);
+}
+
+function handleExit(pid: number, exitStatus: number, info?: ProcessExitInfo): void {
+  void finishProcessExit(pid, exitStatus, info);
+}
+
+async function finishProcessExit(
+  pid: number,
+  exitStatus: number,
+  exitInfo?: ProcessExitInfo,
+): Promise<void> {
   const info = processes.get(pid);
+  const workerAlreadyQuiesced = !!info && quiescedProcessWorkers.has(info.worker as object);
+  const canRecycle = !!info && canRecycleQuiescedProcess(
+    pid,
+    exitStatus,
+    exitInfo,
+    workerAlreadyQuiesced,
+  );
 
   // Synthesize a SIGSEGV-style reap *before* `deactivateProcess` in
   // case the worker died without sending SYS_EXIT_GROUP (uncaught
@@ -1100,31 +1411,37 @@ function handleExit(pid: number, exitStatus: number): void {
   // For now, always deactivate — the main thread tracks exit promises
   kernelWorker.deactivateProcess(pid);
 
-  if (info?.worker) {
-    intentionallyTerminated.add(info.worker as object);
-    info.worker.terminate().catch(() => {});
-  }
-
-  // Terminate any surviving thread workers for this process; the main
-  // process worker exiting means their shared state (memory, fd table,
-  // signal mask) is gone. Mirrors handleExit in Node-side
-  // node-kernel-worker-entry.ts; without this, threads of an exited
-  // process leak Web Workers indefinitely.
-  const threads = threadWorkers.get(pid);
-  if (threads) {
-    for (const t of threads) {
-      intentionallyTerminated.add(t.worker as object);
-      t.worker.terminate().catch(() => {});
-    }
-    threadWorkers.delete(pid);
-  }
-
   processes.delete(pid);
   threadModuleCache.delete(pid);
   ptyByPid.delete(pid);
 
   // Notify main thread
   post({ type: "exit", pid, status: exitStatus });
+
+  if (!canRecycle) {
+    await terminateThreadWorkers(pid);
+  }
+  if (!info?.worker) {
+    return;
+  }
+
+  const workerKey = info.worker as object;
+  if (!canRecycle) {
+    await terminateTrackedWorker(info.worker);
+    return;
+  }
+
+  if (quiescedProcessWorkers.has(workerKey)) {
+    await terminateTrackedWorker(info.worker);
+    recycleProcessInfoMemory(info);
+  } else {
+    // The kernel-side exit syscall has completed the channel, but the browser
+    // process worker may not have resumed from Atomics.wait and returned from
+    // worker-main yet. Recycle only after worker-main posts its exit message;
+    // otherwise a pooled SharedArrayBuffer can wake stale waiters in a later
+    // process that reuses the same channel offset.
+    retiredProcessWorkers.set(workerKey, { pid, info });
+  }
 }
 
 // ── Terminate ──
@@ -1133,24 +1450,12 @@ async function handleTerminateProcess(msg: Extract<MainToKernelMessage, { type: 
   const pid = msg.pid;
 
   // Terminate thread workers
-  const threads = threadWorkers.get(pid);
-  if (threads) {
-    for (const t of threads) {
-      intentionallyTerminated.add(t.worker as object);
-      await t.worker.terminate().catch(() => {});
-      try {
-        kernelWorker.notifyThreadExit(pid, t.tid);
-        kernelWorker.removeChannel(pid, t.channelOffset);
-      } catch {}
-    }
-    threadWorkers.delete(pid);
-  }
+  await terminateThreadWorkers(pid);
 
   // Terminate main process worker
   const info = processes.get(pid);
   if (info?.worker) {
-    intentionallyTerminated.add(info.worker as object);
-    await info.worker.terminate().catch(() => {});
+    await terminateTrackedWorker(info.worker);
   }
 
   try {
@@ -1290,21 +1595,24 @@ function handleDestroy(msg: Extract<MainToKernelMessage, { type: "destroy" }>) {
   // populated across kernel rebuilds (e.g. iframe reload) and leak.
   for (const [pid, info] of processes) {
     if (info.worker) {
-      intentionallyTerminated.add(info.worker as object);
-      info.worker.terminate().catch(() => {});
+      void terminateTrackedWorker(info.worker);
     }
     try { kernelWorker.unregisterProcess(pid); } catch {}
   }
   for (const threads of threadWorkers.values()) {
     for (const t of threads) {
-      intentionallyTerminated.add(t.worker as object);
-      t.worker.terminate().catch(() => {});
+      void terminateTrackedWorker(t.worker);
     }
+  }
+  for (const retired of retiredProcessWorkers.values()) {
+    void terminateTrackedWorker(retired.info.worker);
   }
   processes.clear();
   threadModuleCache.clear();
   threadWorkers.clear();
   ptyByPid.clear();
+  retiredProcessWorkers.clear();
+  processMemoryPool.clear();
   respond(msg.requestId, true);
 }
 
