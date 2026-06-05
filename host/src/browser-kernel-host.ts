@@ -312,8 +312,9 @@ export class BrowserKernel {
       this.handleWorkerMessage(e.data as KernelToMainMessage);
     };
     this.kernelWorkerHandle.onerror = (e: ErrorEvent) => {
-      console.error("[BrowserKernel] Kernel worker error:", e.message);
-      const err = new Error(`Kernel worker error: ${e.message}`);
+      const detail = e.message || e.error?.message || [e.filename, e.lineno, e.colno].filter(Boolean).join(":") || "unknown";
+      console.error("[BrowserKernel] Kernel worker error:", detail, e.error ?? "");
+      const err = new Error(`Kernel worker error: ${detail}`);
       for (const [, { reject }] of this.pendingRequests) {
         reject(err);
       }
@@ -347,7 +348,8 @@ export class BrowserKernel {
         }
       };
       const errorHandler = (e: ErrorEvent) => {
-        settleReject(new Error(`Kernel worker error during init: ${e.message}`));
+        const detail = e.message || e.error?.message || [e.filename, e.lineno, e.colno].filter(Boolean).join(":") || "unknown";
+        settleReject(new Error(`Kernel worker error during init: ${detail}`));
       };
       const messageErrorHandler = () => {
         settleReject(new Error("Kernel worker failed to deserialize an init message"));

@@ -278,7 +278,7 @@ function evictLargestPooledProcessMemory(): boolean {
 }
 
 function clearProcessMemoryPool(): void {
-  clearProcessMemoryPool();
+  processMemoryPool.clear();
   processMemoryPoolSize = 0;
 }
 
@@ -357,22 +357,6 @@ function finishRetiredProcessWorker(
   recycleProcessInfoMemory(retired.info);
   void terminateTrackedWorker(retired.info.worker);
   return true;
-}
-
-async function terminateTrackedWorker(
-  worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
-): Promise<void> {
-  intentionallyTerminated.add(worker as object);
-  await worker.terminate().catch(() => {});
-}
-
-async function terminateThreadWorkers(pid: number): Promise<void> {
-  const threads = threadWorkers.get(pid);
-  if (!threads) return;
-  threadWorkers.delete(pid);
-  for (const t of threads) {
-    await terminateTrackedWorker(t.worker);
-  }
 }
 
 function reclaimExitedThreadWorker(pid: number, tid: number, channelOffset: number): void {

@@ -53,6 +53,8 @@ const OUT_FILE = process.env.MARIADB_TEST_VFS_OUT
   ?? join(REPO_ROOT, "apps/browser-demos/public/mariadb-test.vfs.zst");
 
 const includeAll = process.argv.includes("--all");
+const MYSQL_UID = 101;
+const MYSQL_GID = 101;
 
 const COREUTILS_SYMLINK_NAMES = [
   "ls", "cat", "cp", "mv", "rm", "echo", "mkdir", "rmdir", "touch", "pwd",
@@ -226,6 +228,10 @@ async function main() {
     ensureDir(fs, dir);
   }
   fs.chmod("/tmp", 0o777);
+  for (const dir of ["/data", "/data/mysql", "/data/tmp", "/data/test"]) {
+    fs.chown(dir, MYSQL_UID, MYSQL_GID);
+    fs.chmod(dir, 0o775);
+  }
 
   // dash + coreutils for the bootstrap wrapper script (sh, sleep, kill).
   if (existsSync(DASH_PATH)) {

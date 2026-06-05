@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 const REPO_ROOT = resolve(new URL(".", import.meta.url).pathname, "..");
 const BROWSER_DIR = resolve(REPO_ROOT, "apps/browser-demos");
+const VITE_BIN = resolve(REPO_ROOT, "node_modules/vite/bin/vite.js");
 const VITE_HOST = "127.0.0.1";
 const VITE_PORT = Number(process.env.MARIADB_TEST_VITE_PORT ?? 5198); // Different from test-runner's 5199
 const DEFAULT_TIMEOUT = 60_000;
@@ -36,9 +37,9 @@ async function startViteServer(): Promise<ChildProcess> {
       outputTail = `${outputTail}${prefix}${data.toString()}`.slice(-8000);
     };
     const proc = spawn(
-      "npx",
+      process.execPath,
       [
-        "vite",
+        VITE_BIN,
         "--config", resolve(BROWSER_DIR, "vite.config.ts"),
         "--host", VITE_HOST,
         "--port", String(VITE_PORT),
@@ -141,6 +142,17 @@ async function runTest(page: Page, testName: string, testTimeout: number): Promi
       time_ms: Math.round(performance.now() - start),
       error: err.message || String(err),
     };
+  }
+}
+
+async function isMariadbReady(page: Page, timeoutMs = 5_000): Promise<boolean> {
+  try {
+    return await Promise.race([
+      page.evaluate(() => (window as any).__mariadbTestReady === true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+    ]);
+  } catch {
+    return false;
   }
 }
 
@@ -255,18 +267,15 @@ async function main() {
         );
       }
 
-      // Detect timeout/hang — reload immediately
+      // Detect timeout/hang — reload immediately, but only when there are
+      // more tests to run. A post-test readiness probe can itself block if
+      // the just-finished mysqltest left the browser worker busy; probing
+      // after the last test only delays process teardown.
+      const hasMoreTests = i + 1 < testNames.length;
       const isTimeout = result.error === "TIMEOUT" || result.time_ms > testTimeout * 1.3;
-      let needsReload = isTimeout;
-
-      if (!needsReload) {
-        try {
-          const ready = await page.evaluate(() => (window as any).__mariadbTestReady);
-          if (!ready) needsReload = true;
-        } catch {
-          needsReload = true;
-        }
-      }
+      const needsReload = hasMoreTests && (
+        isTimeout || !(await isMariadbReady(page))
+      );
 
       if (needsReload) {
         if (!jsonOutput) {
