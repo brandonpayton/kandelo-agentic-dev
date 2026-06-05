@@ -401,7 +401,8 @@ trap 'rm -f "$RESULTS_FILE" "$STDERR_FILE"' EXIT
 export SKIP_RESULT="${SKIP_RESULT:-1}"
 
 set +e
-NODE_OPTS="--experimental-wasm-exnref --expose-gc --max-old-space-size=16384 --import tsx/esm"
+NODE_MAX_OLD_SPACE_SIZE="${NODE_MAX_OLD_SPACE_SIZE:-4096}"
+NODE_OPTS="--experimental-wasm-exnref --expose-gc --max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE} --import tsx/esm"
 if $ALL_MODE; then
     node $NODE_OPTS "$HARNESS" > "$RESULTS_FILE" 2>"$STDERR_FILE"
 else

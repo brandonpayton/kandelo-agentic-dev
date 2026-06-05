@@ -31,6 +31,10 @@ let viteAlive = false;
 
 async function startViteServer(): Promise<ChildProcess> {
   return new Promise((resolvePromise, reject) => {
+    let outputTail = "";
+    const appendOutput = (prefix: string, data: Buffer) => {
+      outputTail = `${outputTail}${prefix}${data.toString()}`.slice(-8000);
+    };
     const proc = spawn(
       "npx",
       [
@@ -43,7 +47,11 @@ async function startViteServer(): Promise<ChildProcess> {
       {
         cwd: BROWSER_DIR,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, KANDELO_BROWSER_DEMO_INPUTS: "mariadb-test" },
+        env: {
+          ...process.env,
+          KANDELO_BROWSER_DEMO_INPUTS: "mariadb-test",
+          KANDELO_BROWSER_TEST_NO_HMR: "1",
+        },
       },
     );
 
@@ -57,6 +65,7 @@ async function startViteServer(): Promise<ChildProcess> {
 
     proc.stdout!.on("data", (data: Buffer) => {
       const text = data.toString();
+      appendOutput("[vite] ", data);
       if (!started && text.includes("Local:")) {
         started = true;
         viteAlive = true;
@@ -65,13 +74,13 @@ async function startViteServer(): Promise<ChildProcess> {
       }
     });
 
-    proc.stderr!.on("data", () => {});
+    proc.stderr!.on("data", (data: Buffer) => appendOutput("[vite:stderr] ", data));
 
     proc.on("exit", (code) => {
       viteAlive = false;
       if (!started) {
         clearTimeout(timeout);
-        reject(new Error(`Vite exited with code ${code}`));
+        reject(new Error(`Vite exited with code ${code}${outputTail ? `\n${outputTail}` : ""}`));
       }
     });
   });
@@ -178,6 +187,7 @@ async function main() {
 
     // Launch browser
     browser = await chromium.launch({
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
       args: ["--enable-features=SharedArrayBuffer"],
     });
 
