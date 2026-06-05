@@ -73,6 +73,9 @@ Kernel/POSIX fixes found by PHPT so far in the current PR:
   directory.
 - `getcwd(2)` validates that the current working directory still exists and
   returns `ENOENT` after it is removed.
+- `chdir(2)` stores a canonical current working directory after successful
+  component-wise resolution, so later `getcwd(2)` does not expose literal `.`
+  or `..` path components.
 - Host-backed absolute symlinks that point inside their guest mount are
   followed for `stat`/`open` while `readlink` still returns the original guest
   target text.

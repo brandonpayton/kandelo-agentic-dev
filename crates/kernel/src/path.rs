@@ -65,6 +65,38 @@ pub fn normalize_path(path: &[u8]) -> Vec<u8> {
     clean_path(path)
 }
 
+/// Collapse `.` and `..` components for an already-resolved existing path.
+///
+/// General pathname resolution must not do this before lookup, because
+/// `missing/..` must still fail while resolving `missing`. After `chdir(2)`
+/// has successfully validated the target directory, however, the process cwd
+/// should be stored in canonical form so `getcwd(2)` does not report literal
+/// `.` or `..` components.
+pub fn canonicalize_existing_path(path: &[u8]) -> Vec<u8> {
+    let mut components: Vec<&[u8]> = Vec::new();
+
+    for component in path.split(|&b| b == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+
+    if components.is_empty() {
+        return alloc::vec![b'/'];
+    }
+
+    let mut result = Vec::new();
+    for component in components {
+        result.push(b'/');
+        result.extend_from_slice(component);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +192,14 @@ mod tests {
     #[test]
     fn test_clean_preserves_trailing_slash_after_dot() {
         assert_eq!(clean_path(b"/a/./"), b"/a/");
+    }
+
+    #[test]
+    fn test_canonicalize_existing_path_collapses_dotdot() {
+        assert_eq!(
+            canonicalize_existing_path(b"/a/b/../c/./"),
+            b"/a/c",
+        );
+        assert_eq!(canonicalize_existing_path(b"/.."), b"/");
     }
 }
