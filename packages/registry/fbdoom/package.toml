@@ -1,8 +1,10 @@
 kind = "program"
 name = "fbdoom"
 version = "0.1.0"
-# rev5: coalesce queued PS/2 mouse packets into one Doom mouse event per
-# input poll so pointer-lock motion is not lost inside a game tic. rev4 fixed
+# rev6: re-enable fbDOOM multiplayer with a POSIX UDP net module for
+# WebRTC DataChannel relay demos. rev5 coalesced queued PS/2 mouse packets
+# into one Doom mouse event per input poll so pointer-lock motion is not lost
+# inside a game tic. rev4 fixed
 # fbDOOM's wasm exit path by avoiding an invalid G_CheckDemoStatus ->
 # atexit_func_t cast. rev3 dropped the bundled IWAD; the browser demo fetches
 # the DOOM shareware `doom1.wad` at page load from a Linux-distro mirror and
