@@ -1206,14 +1206,18 @@ export class CentralizedKernelWorker {
 
     // Cap mmap address space. New hosts pass the process memory maximum here
     // because syscall channels live below PROCESS_MMAP_BASE in a reserved
-    // control arena. Legacy callers without maxAddr still cap at the lowest
-    // channel offset, preserving the old high-channel layout behavior.
+    // control arena. Legacy high-channel callers without maxAddr still need
+    // the kernel's guest-managed mmap/brk ranges to stop before the host's
+    // control pages. A channel offset is the primary syscall page; the two
+    // pages immediately before it are host-owned TLS/fork-save control pages
+    // in that layout. Letting mmap use those pages corrupts the syscall
+    // channel/control slab and can make later kernel syscalls trap.
     const setMaxAddr = this.kernelInstance!.exports.kernel_set_max_addr as
       ((pid: number, maxAddr: bigint) => number) | undefined;
+    let legacyHighControlFloor: number | undefined;
     if (setMaxAddr) {
-      const maxAddr = options?.maxAddr ?? (
-        channelOffsets.length > 0 ? Math.min(...channelOffsets) : undefined
-      );
+      legacyHighControlFloor = this.legacyHighControlFloor(channelOffsets);
+      const maxAddr = options?.maxAddr ?? legacyHighControlFloor;
       if (maxAddr !== undefined) {
         setMaxAddr(pid, BigInt(maxAddr));
       }
@@ -1227,8 +1231,9 @@ export class CentralizedKernelWorker {
       }
     }
 
-    if (options?.brkLimit !== undefined) {
-      if (!this.setBrkLimit(pid, options.brkLimit)) {
+    const brkLimit = options?.brkLimit ?? legacyHighControlFloor;
+    if (brkLimit !== undefined) {
+      if (!this.setBrkLimit(pid, brkLimit)) {
         throw new Error(
           "Kernel export kernel_set_brk_limit is required for legacy low-control layout",
         );
@@ -1262,6 +1267,14 @@ export class CentralizedKernelWorker {
         this.listenOnChannel(channel);
       }
     }
+  }
+
+  private legacyHighControlFloor(channelOffsets: number[]): number | undefined {
+    if (channelOffsets.length === 0) return undefined;
+    return Math.min(...channelOffsets.map((channelOffset) => {
+      const tlsPageAddr = channelOffset - 2 * WASM_PAGE_SIZE;
+      return tlsPageAddr >= PROCESS_MMAP_BASE ? tlsPageAddr : channelOffset;
+    }));
   }
 
   /**
@@ -1808,6 +1821,7 @@ export class CentralizedKernelWorker {
       const tlsPageAddr = channelOffset - 2 * WASM_PAGE_SIZE;
       if (tlsPageAddr >= PROCESS_MMAP_BASE) {
         setMaxAddr(pid, BigInt(tlsPageAddr));
+        this.setBrkLimit(pid, tlsPageAddr);
       }
     }
 
