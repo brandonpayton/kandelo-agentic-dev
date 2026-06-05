@@ -137,7 +137,10 @@ function resolvePhpSource(): string {
 }
 
 function parsePhpt(path: string, sourceRoot: string): PhptTest {
-  const text = readFileSync(path, "utf-8");
+  // PHPT files are byte-oriented. A few upstream tests intentionally contain
+  // non-UTF-8 PHP source/EXPECT bytes, so keep a one-code-point-per-byte
+  // representation and write/capture generated scripts the same way.
+  const text = readFileSync(path, "latin1");
   const marker = /^--([A-Z_]+)--[ \t]*\r?$/gm;
   const matches = [...text.matchAll(marker)];
   const sections: Record<string, string> = {};
@@ -217,20 +220,35 @@ function splitArgs(input: string | undefined): string[] {
   return out;
 }
 
-function iniArgs(ini: string | undefined): string[] {
+function guestTestDir(test: PhptTest): string {
+  const relDir = dirname(test.rel).split("\\").join("/");
+  return relDir === "." ? "/php-src" : `/php-src/${relDir}`;
+}
+
+function expandSectionPlaceholders(value: string, test: PhptTest): string {
+  return value.replaceAll("{PWD}", guestTestDir(test));
+}
+
+function iniArgs(ini: string | undefined, test: PhptTest): string[] {
   if (!ini) return [];
   const args: string[] = [];
-  for (const raw of ini.split(/\r?\n/)) {
-    const line = raw.trim();
+  for (const raw of expandSectionPlaceholders(ini, test).split(/\r?\n/)) {
+    let line = raw.trim();
     if (!line || line.startsWith(";") || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq >= 0) {
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim();
+      line = `${key}=${value}`;
+    }
     args.push("-d", line);
   }
   return args;
 }
 
-function envArgs(env: string | undefined): string[] {
+function envArgs(env: string | undefined, test: PhptTest): string[] {
   if (!env) return [];
-  return env
+  return expandSectionPlaceholders(env, test)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
@@ -240,6 +258,16 @@ function passthroughEnvArgs(): string[] {
   return PASSTHROUGH_ENV_NAMES.flatMap((name) =>
     process.env[name] === undefined ? [] : [`${name}=${process.env[name]}`],
   );
+}
+
+function isFlakyTest(test: PhptTest): boolean {
+  if (test.sections.FLAKY !== undefined) return true;
+  const file = test.sections.FILE ?? "";
+  return /\b(?:disk_free_space|hrtime|microtime|sleep|usleep)\s*\(/i.test(file);
+}
+
+function isFlakyOutput(output: string): boolean {
+  return /\b(?:404: page not found|address already in use|connection refused|deadlock|mailbox already exists|timed out)\b/i.test(output);
 }
 
 function shellEscape(value: string): string {
@@ -431,7 +459,7 @@ function testScript(test: PhptTest): string {
   if (test.sections.FILE_EXTERNAL !== undefined) {
     return readFileSync(
       join(dirname(test.path), test.sections.FILE_EXTERNAL.trim()),
-      "utf-8",
+      "latin1",
     );
   }
   return "";
@@ -490,7 +518,7 @@ class NodePhpRunner implements PhpRunner {
     const previousScript = existsSync(hostScriptPath)
       ? readFileSync(hostScriptPath)
       : null;
-    writeFileSync(hostScriptPath, opts.script);
+    writeFileSync(hostScriptPath, opts.script, "latin1");
     const start = performance.now();
     let stdout = "";
     let stderr = "";
@@ -507,10 +535,10 @@ class NodePhpRunner implements PhpRunner {
         },
       ],
       onStdout: (_pid, data) => {
-        stdout += new TextDecoder().decode(data);
+        stdout += Buffer.from(data).toString("latin1");
       },
       onStderr: (_pid, data) => {
-        stderr += new TextDecoder().decode(data);
+        stderr += Buffer.from(data).toString("latin1");
       },
       onResolveExec: (path) => {
         const base = path.split("/").pop();
@@ -521,7 +549,7 @@ class NodePhpRunner implements PhpRunner {
     });
     await host.init();
     const stdin =
-      opts.stdin == null ? undefined : new TextEncoder().encode(opts.stdin);
+      opts.stdin == null ? undefined : Buffer.from(opts.stdin, "latin1");
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     let pid: number | null = null;
     try {
@@ -857,8 +885,8 @@ async function runPhpt(
     };
   }
 
-  const commonEnv = [...passthroughEnvArgs(), ...envArgs(test.sections.ENV)];
-  const testArgv = iniArgs(test.sections.INI);
+  const commonEnv = [...passthroughEnvArgs(), ...envArgs(test.sections.ENV, test)];
+  const testArgv = iniArgs(test.sections.INI, test);
   const args = splitArgs(test.sections.ARGS);
 
   const requiredExtensions = extensionArgs(test.sections.EXTENSIONS);
@@ -931,23 +959,24 @@ async function runPhpt(
     }
   }
 
-  const main = await runner.runScript({
-    test,
-    kind: "file",
-    script: testScript(test),
-    argv: testArgv,
-    scriptArgs: args,
-    env: commonEnv,
-    stdin: test.sections.STDIN,
-    timeoutMs,
-  });
+  const runMain = () =>
+    runner.runScript({
+      test,
+      kind: "file",
+      script: testScript(test),
+      argv: testArgv,
+      scriptArgs: args,
+      env: commonEnv,
+      stdin: test.sections.STDIN,
+      timeoutMs,
+    });
+
+  let main = await runMain();
 
   let ok = false;
   let detail = main.error;
-  if (main.error === "TIMEOUT") {
-    ok = false;
-  } else {
-    const actualOutput = `${main.stdout}${main.stderr}`;
+  let actualOutput = `${main.stdout}${main.stderr}`;
+  if (main.error !== "TIMEOUT") {
     const compared = compareExpectation(test, actualOutput);
     // PHPTs often intentionally trigger fatal errors; upstream run-tests.php
     // treats matching output as the authority rather than requiring exit 0.
@@ -959,6 +988,28 @@ async function runPhpt(
         .replace(/\n/g, "\\n");
       const errorDetail = main.error ? `; error=${main.error}` : "";
       detail = `${detail}; exit=${main.exitCode}${errorDetail}; actual: ${snippet}`;
+    }
+  }
+
+  if (
+    !ok &&
+    main.error !== "TIMEOUT" &&
+    (isFlakyTest(test) || isFlakyOutput(actualOutput))
+  ) {
+    main = await runMain();
+    actualOutput = `${main.stdout}${main.stderr}`;
+    detail = main.error;
+    if (main.error !== "TIMEOUT") {
+      const compared = compareExpectation(test, actualOutput);
+      ok = compared.ok;
+      detail = compared.detail;
+      if (!ok && detail) {
+        const snippet = normalizeOutput(actualOutput)
+          .slice(0, 2000)
+          .replace(/\n/g, "\\n");
+        const errorDetail = main.error ? `; error=${main.error}` : "";
+        detail = `${detail}; exit=${main.exitCode}${errorDetail}; actual: ${snippet}`;
+      }
     }
   }
 

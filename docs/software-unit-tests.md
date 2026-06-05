@@ -39,6 +39,33 @@ utility binary inputs.
 Recommended commands while iterating:
 
 ```bash
+# Expanded ext/standard PHPT tranche that currently passes cleanly on both
+# supported hosts: 537 total, 466 pass, 70 skip, 1 unsupported.
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host node \
+  ext/standard/tests/time ext/standard/tests/versioning \
+  ext/standard/tests/directory ext/standard/tests/crypt \
+  ext/standard/tests/ini_info ext/standard/tests/hrtime \
+  ext/standard/tests/password ext/standard/tests/misc \
+  ext/standard/tests/assert ext/standard/tests/url \
+  ext/standard/tests/filters ext/standard/tests/class_object \
+  ext/standard/tests/image ext/standard/tests/math \
+  ext/standard/tests/serialize \
+  --timeout 60000 --json
+
+LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host browser \
+  ext/standard/tests/time ext/standard/tests/versioning \
+  ext/standard/tests/directory ext/standard/tests/crypt \
+  ext/standard/tests/ini_info ext/standard/tests/hrtime \
+  ext/standard/tests/password ext/standard/tests/misc \
+  ext/standard/tests/assert ext/standard/tests/url \
+  ext/standard/tests/filters ext/standard/tests/class_object \
+  ext/standard/tests/image ext/standard/tests/math \
+  ext/standard/tests/serialize \
+  --timeout 60000 --json
+
 # Node host. Shard full runs; SKIP_* vars are upstream PHPT control env.
 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   --host node --all --shard 1/16 --timeout 180000 --json
@@ -84,9 +111,11 @@ Kernel/POSIX fixes found by PHPT so far in the current PR:
   `LOCK_NB` returns `EAGAIN` instead of being retried as a blocking syscall.
 - PHPT section semantics now match upstream more closely: test `--INI--` is
   applied to `--FILE--` only, stable generated names are used for `--FILE--`
-  and `--CLEAN--`, PHP-style trim removes edge NUL bytes for EXPECT matching,
-  and selected upstream control env vars such as `SKIP_SLOW_TESTS` pass through
-  to guest PHP.
+  and `--CLEAN--`, `--INI--` assignment whitespace is normalized, `{PWD}` in
+  `--INI--`/`--ENV--` expands to the guest test directory, PHP-style trim
+  removes edge NUL bytes for EXPECT matching, PHPT source/output bytes are
+  preserved instead of UTF-8 decoded, flaky PHPTs retry once, and selected
+  upstream control env vars such as `SKIP_SLOW_TESTS` pass through to guest PHP.
 - Stream/socket behavior now covers the standard cases exercised by PHP's
   stream suite: abstract AF_UNIX addresses are not filesystem-backed, UDP
   `INADDR_ANY` destinations route to loopback, AF_INET6 loopback sockaddrs are

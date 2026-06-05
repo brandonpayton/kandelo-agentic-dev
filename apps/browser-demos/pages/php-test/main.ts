@@ -6,7 +6,7 @@
  */
 import { BrowserKernel } from "@host/browser-kernel-host";
 import { MemoryFileSystem } from "@host/vfs/memory-fs";
-import { ensureDirRecursive, writeVfsFile } from "@host/vfs/image-helpers";
+import { ensureDirRecursive, writeVfsBinary } from "@host/vfs/image-helpers";
 import kernelWasmUrl from "@kernel-wasm?url";
 
 interface RunPhpScriptRequest {
@@ -67,6 +67,23 @@ function ensureParent(fs: MemoryFileSystem, path: string): void {
   if (slash > 0) ensureDirRecursive(fs, path.slice(0, slash));
 }
 
+function binaryStringToBytes(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length);
+  for (let i = 0; i < value.length; i++) {
+    bytes[i] = value.charCodeAt(i) & 0xff;
+  }
+  return bytes;
+}
+
+function bytesToBinaryString(data: Uint8Array): string {
+  let out = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < data.length; i += chunk) {
+    out += String.fromCharCode(...data.subarray(i, i + chunk));
+  }
+  return out;
+}
+
 async function init() {
   const [kernelBuf, imageBuf] = await Promise.all([
     fetch(kernelWasmUrl).then((r) => {
@@ -93,18 +110,18 @@ async function init() {
     const start = performance.now();
     const fs = createFs();
     ensureParent(fs, request.scriptPath);
-    writeVfsFile(fs, request.scriptPath, request.script, 0o644);
+    writeVfsBinary(fs, request.scriptPath, binaryStringToBytes(request.script), 0o644);
 
     let stdout = "";
     let stderr = "";
     const kernel = new BrowserKernel({
       memfs: fs,
       maxWorkers: 4,
-      onStdout: (data) => { stdout += new TextDecoder().decode(data); },
-      onStderr: (data) => { stderr += new TextDecoder().decode(data); },
+      onStdout: (data) => { stdout += bytesToBinaryString(data); },
+      onStderr: (data) => { stderr += bytesToBinaryString(data); },
     });
 
-    const stdin = request.stdin == null ? undefined : new TextEncoder().encode(request.stdin);
+    const stdin = request.stdin == null ? undefined : binaryStringToBytes(request.stdin);
     const env = [
       "HOME=/tmp",
       "TMPDIR=/tmp",
