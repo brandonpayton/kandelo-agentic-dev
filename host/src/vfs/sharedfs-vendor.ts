@@ -551,7 +551,17 @@ export class SharedFS {
     this.w32(off + INO_LINK_COUNT, 0);
     this.w64(off + INO_CTIME, Date.now());
     if (this.r32(off + INO_OPEN_COUNT) > 0) return false;
-    this.inodeTruncate(ino, 0);
+    const mode = this.r32(off + INO_MODE);
+    const size = this.r64(off + INO_SIZE);
+    if ((mode & S_IFMT) === S_IFLNK && size <= INLINE_SYMLINK_SIZE) {
+      // Short symlink targets are stored inline in the inode's direct-pointer
+      // area. POSIX unlink removes the symlink inode itself even if the target
+      // is dangling; do not interpret inline target bytes as block numbers.
+      this.u8.fill(0, off + INO_DIRECT, off + INO_DIRECT + INLINE_SYMLINK_SIZE);
+      this.w64(off + INO_SIZE, 0);
+    } else {
+      this.inodeTruncate(ino, 0);
+    }
     return true;
   }
 
