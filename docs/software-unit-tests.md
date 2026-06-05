@@ -75,6 +75,15 @@ LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   --host browser ext/standard/tests/strings --timeout 60000 --json
 
+# Full ext/standard array directory, now clean on both supported hosts:
+# 817 total, 802 pass, 15 skip.
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host node ext/standard/tests/array --timeout 60000 --json
+
+LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host browser ext/standard/tests/array --timeout 60000 --json
+
 # Node host. Shard full runs; SKIP_* vars are upstream PHPT control env.
 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   --host node --all --shard 1/16 --timeout 180000 --json
