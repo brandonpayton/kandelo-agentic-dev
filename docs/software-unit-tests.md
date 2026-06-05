@@ -90,6 +90,9 @@ Kernel/POSIX fixes found by PHPT so far in the current PR:
   round-tripped, accepted sockets preserve Kandelo's nonblocking status
   contract, and malformed numeric IPv4 names fail resolution instead of being
   treated as browser synthetic DNS names.
+- Additional network PHPT coverage now passes for AF_UNIX datagram loopback,
+  AF_INET6 UDP loopback, and browser-side rejection of syntactically invalid
+  DNS names instead of assigning synthetic addresses to them.
 
 ## 2026-06-02 SQLite Allocator Status
 
