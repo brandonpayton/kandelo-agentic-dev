@@ -199,9 +199,9 @@ PATCH_DIR="$SCRIPT_DIR/patches"
 if [ -d "$PATCH_DIR" ]; then
     for patch_file in "$PATCH_DIR"/*.patch; do
         [ -f "$patch_file" ] || continue
-        if patch -p1 -N --dry-run --silent -d "$SRC_DIR" < "$patch_file" >/dev/null 2>&1; then
+        if patch -p1 -N --fuzz=0 --dry-run --silent -d "$SRC_DIR" < "$patch_file" >/dev/null 2>&1; then
             echo "==> Applying $(basename "$patch_file")..."
-            patch -p1 -N -d "$SRC_DIR" < "$patch_file"
+            patch -p1 -N --fuzz=0 -d "$SRC_DIR" < "$patch_file"
         fi
     done
 fi
@@ -297,7 +297,9 @@ else
 fi
 export CFLAGS="${CFLAGS:-} -D_GNU_SOURCE -I$OPENSSL_PREFIX/include -I$ZLIB_PREFIX/include"
 export CXXFLAGS="${CXXFLAGS:-} -D_GNU_SOURCE -fexceptions -I$OPENSSL_PREFIX/include -I$ZLIB_PREFIX/include"
-export LDFLAGS="${LDFLAGS:-} -lc++ -lc++abi $OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a $ZLIB_PREFIX/lib/libz.a -Wl,-z,stack-size=16777216"
+SPIDERMONKEY_WASM_MAX_MEMORY="${SPIDERMONKEY_WASM_MAX_MEMORY:-2147483648}"
+export WASM_POSIX_MAX_MEMORY="$SPIDERMONKEY_WASM_MAX_MEMORY"
+export LDFLAGS="${LDFLAGS:-} -lc++ -lc++abi $OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a $ZLIB_PREFIX/lib/libz.a -Wl,-z,stack-size=16777216 -Wl,--max-memory=$SPIDERMONKEY_WASM_MAX_MEMORY"
 
 if [ -f "$OBJ_DIR/config.status" ] && {
     ! grep -q 'getrandom_backend' "$OBJ_DIR/config.status" ||
