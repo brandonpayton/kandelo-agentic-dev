@@ -42,6 +42,20 @@ unsafe extern "C" {
     fn host_read(handle: i64, buf_ptr: *mut u8, buf_len: u32) -> i32;
     fn host_write(handle: i64, buf_ptr: *const u8, buf_len: u32) -> i32;
     fn host_seek(handle: i64, offset_lo: u32, offset_hi: i32, whence: u32) -> i64;
+    fn host_pread(
+        handle: i64,
+        offset_lo: u32,
+        offset_hi: i32,
+        buf_ptr: *mut u8,
+        buf_len: u32,
+    ) -> i32;
+    fn host_pwrite(
+        handle: i64,
+        offset_lo: u32,
+        offset_hi: i32,
+        buf_ptr: *const u8,
+        buf_len: u32,
+    ) -> i32;
     fn host_fstat(handle: i64, stat_ptr: *mut u8) -> i32;
     fn host_stat(path_ptr: *const u8, path_len: u32, stat_ptr: *mut u8) -> i32;
     fn host_lstat(path_ptr: *const u8, path_len: u32, stat_ptr: *mut u8) -> i32;
@@ -247,23 +261,45 @@ impl HostIO for WasmHostIO {
         }
     }
 
-    fn host_fstat(&mut self, handle: i64) -> Result<WasmStat, Errno> {
-        let mut stat = WasmStat {
-            st_dev: 0,
-            st_ino: 0,
-            st_mode: 0,
-            st_nlink: 0,
-            st_uid: 0,
-            st_gid: 0,
-            st_size: 0,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            _pad: 0,
+    fn host_pread(&mut self, handle: i64, offset: i64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let offset_lo = offset as u32;
+        let offset_hi = (offset >> 32) as i32;
+        let result = unsafe {
+            host_pread(
+                handle,
+                offset_lo,
+                offset_hi,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
         };
+        if result < 0 {
+            match Errno::from_u32((-result) as u32) {
+                Some(e) => Err(e),
+                None => Err(Errno::EIO),
+            }
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn host_pwrite(&mut self, handle: i64, offset: i64, buf: &[u8]) -> Result<usize, Errno> {
+        let offset_lo = offset as u32;
+        let offset_hi = (offset >> 32) as i32;
+        let result =
+            unsafe { host_pwrite(handle, offset_lo, offset_hi, buf.as_ptr(), buf.len() as u32) };
+        if result < 0 {
+            match Errno::from_u32((-result) as u32) {
+                Some(e) => Err(e),
+                None => Err(Errno::EIO),
+            }
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn host_fstat(&mut self, handle: i64) -> Result<WasmStat, Errno> {
+        let mut stat = WasmStat::default();
         let stat_ptr = &mut stat as *mut WasmStat as *mut u8;
         let result = unsafe { host_fstat(handle, stat_ptr) };
         i32_to_result(result)?;
@@ -271,22 +307,7 @@ impl HostIO for WasmHostIO {
     }
 
     fn host_stat(&mut self, path: &[u8]) -> Result<WasmStat, Errno> {
-        let mut stat = WasmStat {
-            st_dev: 0,
-            st_ino: 0,
-            st_mode: 0,
-            st_nlink: 0,
-            st_uid: 0,
-            st_gid: 0,
-            st_size: 0,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            _pad: 0,
-        };
+        let mut stat = WasmStat::default();
         let stat_ptr = &mut stat as *mut WasmStat as *mut u8;
         let result = unsafe { host_stat(path.as_ptr(), path.len() as u32, stat_ptr) };
         i32_to_result(result)?;
@@ -294,22 +315,7 @@ impl HostIO for WasmHostIO {
     }
 
     fn host_lstat(&mut self, path: &[u8]) -> Result<WasmStat, Errno> {
-        let mut stat = WasmStat {
-            st_dev: 0,
-            st_ino: 0,
-            st_mode: 0,
-            st_nlink: 0,
-            st_uid: 0,
-            st_gid: 0,
-            st_size: 0,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            _pad: 0,
-        };
+        let mut stat = WasmStat::default();
         let stat_ptr = &mut stat as *mut WasmStat as *mut u8;
         let result = unsafe { host_lstat(path.as_ptr(), path.len() as u32, stat_ptr) };
         i32_to_result(result)?;
@@ -1128,6 +1134,18 @@ fn ensure_memory_covers(_end_addr: usize) {
     // No-op on non-Wasm targets (tests)
 }
 
+fn terminate_process_by_signal(
+    proc: &mut crate::process::Process,
+    host: &mut WasmHostIO,
+    signum: u32,
+) {
+    proc.sigsuspend_saved_mask = None;
+    for t in proc.threads.iter_mut() {
+        t.signals.sigsuspend_saved_mask = None;
+    }
+    crate::syscalls::sys_exit(proc, host, 128 + signum as i32);
+}
+
 // 3c. Signal delivery at syscall boundaries
 // ---------------------------------------------------------------------------
 
@@ -1155,8 +1173,7 @@ fn deliver_pending_signals(proc: &mut Process, host: &mut WasmHostIO) {
                     let _ = dequeue_signal_for(proc, tid, signum);
                     match default_action(signum) {
                         DefaultAction::Terminate | DefaultAction::CoreDump => {
-                            proc.state = crate::process::ProcessState::Exited;
-                            proc.exit_status = 128 + signum as i32;
+                            terminate_process_by_signal(proc, host, signum);
                         }
                         _ => {}
                     }
@@ -1185,8 +1202,7 @@ fn deliver_pending_signals(proc: &mut Process, host: &mut WasmHostIO) {
                         // The signal has already been dequeued, so we must handle it here.
                         match default_action(signum) {
                             DefaultAction::Terminate | DefaultAction::CoreDump => {
-                                proc.state = crate::process::ProcessState::Exited;
-                                proc.exit_status = 128 + signum as i32;
+                                terminate_process_by_signal(proc, host, signum);
                             }
                             _ => {}
                         }
@@ -1194,8 +1210,7 @@ fn deliver_pending_signals(proc: &mut Process, host: &mut WasmHostIO) {
                 }
                 SignalHandler::Default => match default_action(signum) {
                     DefaultAction::Terminate | DefaultAction::CoreDump => {
-                        proc.state = crate::process::ProcessState::Exited;
-                        proc.exit_status = 128 + signum as i32;
+                        terminate_process_by_signal(proc, host, signum);
                     }
                     _ => {}
                 },
@@ -1656,9 +1671,33 @@ pub extern "C" fn kernel_get_parent_pid(pid: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_mark_process_signaled(pid: u32, signum: u32) -> i32 {
     let table = unsafe { &mut *PROCESS_TABLE.0.get() };
-    match table.mark_process_signaled(pid, signum) {
-        Ok(()) => 0,
-        Err(e) => -(e as i32),
+    match table.get_mut(pid) {
+        Some(proc) => {
+            let mut host = WasmHostIO;
+            terminate_process_by_signal(proc, &mut host, signum);
+            0
+        }
+        None => -(Errno::ESRCH as i32),
+    }
+}
+
+/// Mark a process as normally exited without trapping.
+///
+/// Guest `_exit` still goes through `kernel_exit`, which is intentionally
+/// non-returning. The centralized host, however, needs to run the same cleanup
+/// from JS after observing SYS_EXIT/SYS_EXIT_GROUP; routing that through
+/// `kernel_handle_channel` would catch the intentional trap and leak the Wasm
+/// shadow stack.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_mark_process_exited(pid: u32, status: i32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.get_mut(pid) {
+        Some(proc) => {
+            let mut host = WasmHostIO;
+            crate::syscalls::sys_exit(proc, &mut host, status);
+            0
+        }
+        None => -(Errno::ESRCH as i32),
     }
 }
 
@@ -1690,11 +1729,14 @@ pub extern "C" fn kernel_wait4_poll(parent_pid: u32, target_pid: i32, status_ptr
 /// the host to remove arbitrary process-table entries during wait handling.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_reap_exited_child(parent_pid: u32, child_pid: u32) -> i32 {
-    let table = unsafe { &*PROCESS_TABLE.0.get() };
-    if !table.is_exited_child_of(parent_pid, child_pid) {
-        return -(Errno::ECHILD as i32);
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.reap_exited_child_of(parent_pid, child_pid) {
+        Ok(result) => {
+            finish_removed_process(child_pid, result);
+            0
+        }
+        Err(e) => -(e as i32),
     }
-    reap_process_and_cleanup(child_pid)
 }
 
 /// Check if a process has SA_NOCLDWAIT set for SIGCHLD (centralized mode).
@@ -2109,13 +2151,8 @@ pub extern "C" fn kernel_dequeue_signal(pid: u32, out_ptr: *mut u8) -> i32 {
                 let _ = dequeue_signal_for(proc, tid, signum);
                 match default_action(signum) {
                     DefaultAction::Terminate | DefaultAction::CoreDump => {
-                        // Process is dying; clear sigsuspend state
-                        proc.sigsuspend_saved_mask = None;
-                        for t in proc.threads.iter_mut() {
-                            t.signals.sigsuspend_saved_mask = None;
-                        }
-                        proc.state = crate::process::ProcessState::Exited;
-                        proc.exit_status = 128 + signum as i32;
+                        let mut host = WasmHostIO;
+                        terminate_process_by_signal(proc, &mut host, signum);
                         return 0;
                     }
                     _ => continue,
@@ -2266,12 +2303,12 @@ pub extern "C" fn kernel_exec_setup(pid: u32) -> i32 {
 
     // Deserialize back to replace the process with exec-sanitized version
     match crate::fork::deserialize_exec_state(&buf[..written], pid) {
-        Ok(new_proc) => {
-            table.get_mut(pid).map(|p| {
-                *p = new_proc;
-                p.has_exec = true;
-            });
-            0
+        Ok(mut new_proc) => {
+            new_proc.has_exec = true;
+            match table.replace_process(pid, new_proc) {
+                Ok(()) => 0,
+                Err(e) => -(e as i32),
+            }
         }
         Err(e) => -(e as i32),
     }
@@ -2345,8 +2382,21 @@ pub extern "C" fn kernel_handle_channel(offset: usize, pid: u32) -> i32 {
     let table = unsafe { &mut *PROCESS_TABLE.0.get() };
     table.set_current_pid(pid);
 
-    // Read syscall number and args from kernel memory
     let base = offset;
+
+    if !table.has_process(pid) {
+        let out = unsafe {
+            let ptr = base as *mut u8;
+            core::slice::from_raw_parts_mut(ptr, MIN_CHANNEL_SIZE)
+        };
+        let ret_val = -1i64;
+        let errno_val = Errno::ESRCH as u32;
+        out[RETURN_OFFSET..RETURN_OFFSET + 8].copy_from_slice(&ret_val.to_le_bytes());
+        out[ERRNO_OFFSET..ERRNO_OFFSET + 4].copy_from_slice(&errno_val.to_le_bytes());
+        return -(Errno::ESRCH as i32);
+    }
+
+    // Read syscall number and args from kernel memory
     let mem = unsafe {
         let ptr = base as *const u8;
         core::slice::from_raw_parts(ptr, MIN_CHANNEL_SIZE)
@@ -2373,6 +2423,12 @@ pub extern "C" fn kernel_handle_channel(offset: usize, pid: u32) -> i32 {
             mem[off + 6],
             mem[off + 7],
         ]);
+    }
+
+    if let Err(e) = validate_channel_cstrings(syscall_nr, &args, base) {
+        let result = -(e as i32);
+        write_channel_result(base, result);
+        return result;
     }
 
     // Pointer args in the channel reference kernel memory (JS copies data
@@ -2418,6 +2474,78 @@ unsafe fn cstr_len(ptr: *const u8) -> u32 {
         len += 1;
     }
     len
+}
+
+fn validate_channel_cstring_arg(args: &[i64; 6], index: usize, base: usize) -> Result<(), Errno> {
+    let ptr = args[index];
+    if ptr == 0 {
+        return Ok(());
+    }
+    if ptr < 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let ptr = ptr as usize;
+    let data_start = base + wasm_posix_shared::channel::DATA_OFFSET;
+    let data_end = data_start + wasm_posix_shared::channel::DATA_SIZE;
+    if ptr < data_start || ptr >= data_end {
+        return Err(Errno::EFAULT);
+    }
+
+    let mut cur = ptr;
+    while cur < data_end {
+        if unsafe { *(cur as *const u8) } == 0 {
+            return Ok(());
+        }
+        cur += 1;
+    }
+    Err(Errno::ENAMETOOLONG)
+}
+
+fn validate_channel_cstrings(nr: u32, args: &[i64; 6], base: usize) -> Result<(), Errno> {
+    match nr {
+        1 | 11 | 12 | 13 | 14 | 15 | 19 | 20 | 21 | 22 | 24 | 25 | 43 | 45 | 85 | 109 | 129
+        | 140 | 211 | 271 | 331 | 332 => validate_channel_cstring_arg(args, 0, base),
+        16 | 17 | 18 | 44 => {
+            validate_channel_cstring_arg(args, 0, base)?;
+            validate_channel_cstring_arg(args, 1, base)
+        }
+        69 | 93 | 94 | 95 | 97 | 98 | 99 | 125 | 260 | 272 | 382 | 383 => {
+            validate_channel_cstring_arg(args, 1, base)
+        }
+        96 | 100 => {
+            validate_channel_cstring_arg(args, 1, base)?;
+            validate_channel_cstring_arg(args, 3, base)
+        }
+        101 => {
+            validate_channel_cstring_arg(args, 0, base)?;
+            validate_channel_cstring_arg(args, 2, base)
+        }
+        102 => validate_channel_cstring_arg(args, 1, base),
+        _ => Ok(()),
+    }
+}
+
+fn write_channel_result(base: usize, result: i32) {
+    use wasm_posix_shared::channel::*;
+
+    let out = unsafe {
+        let ptr = base as *mut u8;
+        core::slice::from_raw_parts_mut(ptr, MIN_CHANNEL_SIZE)
+    };
+
+    let ret_val: i64;
+    let errno_val: u32;
+    if result < 0 {
+        ret_val = -1;
+        errno_val = (-result) as u32;
+    } else {
+        ret_val = result as i64;
+        errno_val = 0;
+    }
+
+    out[RETURN_OFFSET..RETURN_OFFSET + 8].copy_from_slice(&ret_val.to_le_bytes());
+    out[ERRNO_OFFSET..ERRNO_OFFSET + 4].copy_from_slice(&errno_val.to_le_bytes());
 }
 
 /// Dispatch a syscall by number with raw musl arguments.
@@ -2944,8 +3072,8 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
         130 => kernel_fstatfs(a1, a3 as *mut u8), // SYS_FSTATFS64: (fd, sizeof, buf)
         81 => kernel_writev(a1, a2 as *const u8, a3), // SYS_WRITEV
         82 => kernel_readv(a1, a2 as *mut u8, a3), // SYS_READV
-        295 => kernel_preadv(a1, a2 as *mut u8, a3, a4 as u32, a5), // SYS_PREADV
-        296 => kernel_pwritev(a1, a2 as *const u8, a3, a4 as u32, a5), // SYS_PWRITEV
+        295 => kernel_preadv(a1, a2 as *mut u8, a3, args[3]), // SYS_PREADV
+        296 => kernel_pwritev(a1, a2 as *const u8, a3, args[3]), // SYS_PWRITEV
         294 => kernel_sendfile(a1, a2, a3 as *mut u8, a4 as u32), // SYS_SENDFILE
 
         // *at variants — musl: (dirfd, path, ...) without explicit path_len
@@ -3689,8 +3817,8 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
             }
         }
         293 => 0, // SYS_READAHEAD: advisory, always succeed
-        297 => kernel_preadv(a1, a2 as *mut u8, a3, a4 as u32, a5), // SYS_PREADV2 (ignore flags in a6)
-        298 => kernel_pwritev(a1, a2 as *const u8, a3, a4 as u32, a5), // SYS_PWRITEV2 (ignore flags in a6)
+        297 => kernel_preadv(a1, a2 as *mut u8, a3, args[3]), // SYS_PREADV2 (ignore flags in a5)
+        298 => kernel_pwritev(a1, a2 as *const u8, a3, args[3]), // SYS_PWRITEV2 (ignore flags in a5)
 
         // -- Scheduling stubs (single-CPU Wasm) --
         237 => 0, // SYS_SCHED_SETAFFINITY: no-op (single CPU)
@@ -4444,7 +4572,7 @@ pub extern "C" fn kernel_init_from_fork(buf_ptr: *const u8, buf_len: u32, child_
     match crate::fork::deserialize_fork_state(buf, child_pid) {
         Ok(proc) => {
             unsafe {
-                *PROCESS.0.get() = Some(proc);
+                *PROCESS.0.get() = Some(*proc);
             }
             0
         }
@@ -4473,7 +4601,7 @@ pub extern "C" fn kernel_init_from_exec(buf_ptr: *const u8, buf_len: u32, pid: u
     match crate::fork::deserialize_exec_state(buf, pid) {
         Ok(proc) => {
             unsafe {
-                *PROCESS.0.get() = Some(proc);
+                *PROCESS.0.get() = Some(*proc);
             }
             0
         }
@@ -8065,19 +8193,11 @@ pub extern "C" fn kernel_readv(fd: i32, iov_ptr: *mut u8, iovcnt: i32) -> i32 {
 
 /// preadv -- scatter-gather read at offset.
 /// iov_ptr points to iovec array (8 bytes each: base u32, len u32).
-/// offset is split into (lo, hi) u32 pair.
 /// Returns total bytes read or negative errno.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_preadv(
-    fd: i32,
-    iov_ptr: *mut u8,
-    iovcnt: i32,
-    offset_lo: u32,
-    offset_hi: i32,
-) -> i32 {
+pub extern "C" fn kernel_preadv(fd: i32, iov_ptr: *mut u8, iovcnt: i32, offset: i64) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
     let mut host = WasmHostIO;
-    let offset = ((offset_hi as i64) << 32) | (offset_lo as u64 as i64);
 
     let result = 'done: {
         if iovcnt <= 0 || iovcnt > 1024 {
@@ -8120,19 +8240,11 @@ pub extern "C" fn kernel_preadv(
 
 /// pwritev -- scatter-gather write at offset.
 /// iov_ptr points to iovec array (8 bytes each: base u32, len u32).
-/// offset is split into (lo, hi) u32 pair.
 /// Returns total bytes written or negative errno.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_pwritev(
-    fd: i32,
-    iov_ptr: *const u8,
-    iovcnt: i32,
-    offset_lo: u32,
-    offset_hi: i32,
-) -> i32 {
+pub extern "C" fn kernel_pwritev(fd: i32, iov_ptr: *const u8, iovcnt: i32, offset: i64) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
     let mut host = WasmHostIO;
-    let offset = ((offset_hi as i64) << 32) | (offset_lo as u64 as i64);
 
     let result = 'done: {
         if iovcnt <= 0 || iovcnt > 1024 {

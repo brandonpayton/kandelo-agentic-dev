@@ -1,11 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import {
   COMPILE_FLAGS,
+  DEFAULT_EXECUTABLE_STACK_SIZE,
   filterArgs,
+  globalBaseForStackSize,
   inferThreadSlotDeclaration,
   LINK_FLAGS,
   needsLinking,
   parseArgs,
+  requestedWasmGlobalBase,
+  requestedWasmStackSize,
   THREAD_SLOT_NONE,
   THREAD_SLOT_USE_HOST_DEFAULT,
 } from '../src/lib/flags.ts';
@@ -159,6 +163,19 @@ describe('LINK_FLAGS', () => {
     expect(LINK_FLAGS).toContain('-Wl,--entry=_start');
     expect(LINK_FLAGS).toContain('-Wl,--import-memory');
     expect(LINK_FLAGS).toContain('-Wl,--shared-memory');
+    expect(LINK_FLAGS).toContain(`-Wl,-z,stack-size=${DEFAULT_EXECUTABLE_STACK_SIZE}`);
+    expect(LINK_FLAGS).toContain(`-Wl,--global-base=${globalBaseForStackSize(DEFAULT_EXECUTABLE_STACK_SIZE)}`);
+  });
+});
+
+describe('wasm linker request parsing', () => {
+  it('extracts stack size and global base overrides', () => {
+    const args = [
+      '-Wl,-z,stack-size=16777216',
+      '-Wl,--global-base=16842752',
+    ];
+    expect(requestedWasmStackSize(args)).toBe(16777216);
+    expect(requestedWasmGlobalBase(args)).toBe(16842752);
   });
 });
 

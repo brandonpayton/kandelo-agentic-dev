@@ -11,7 +11,11 @@
 // batches and waking blocked retries. In a dedicated worker there's no UI
 // to starve, so we can use a simple MessageChannel polyfill.
 if (typeof globalThis.setImmediate === "undefined") {
-  const _immQueue: Array<{ id: number; fn: (...args: any[]) => void; args: any[] }> = [];
+  const _immQueue: Array<{
+    id: number;
+    fn: (...args: any[]) => void;
+    args: any[];
+  }> = [];
   let _immNextId = 0;
   let _immScheduled = false;
   let _immFlushing = false;
@@ -46,7 +50,10 @@ if (typeof globalThis.setImmediate === "undefined") {
     }
   }
 
-  (globalThis as any).setImmediate = (fn: (...args: any[]) => void, ...args: any[]) => {
+  (globalThis as any).setImmediate = (
+    fn: (...args: any[]) => void,
+    ...args: any[]
+  ) => {
     const id = ++_immNextId;
     _immQueue.push({ id, fn, args });
     if (!_immScheduled && !_immFlushing) {
@@ -63,6 +70,7 @@ if (typeof globalThis.setImmediate === "undefined") {
 import { CentralizedKernelWorker } from "./kernel-worker";
 import type {
   ForkFromThreadContext,
+  ProcessExitInfo,
   ResolvedSpawnProgram,
 } from "./kernel-worker";
 import type { KernelPointer } from "./kernel";
@@ -71,10 +79,7 @@ import { VirtualPlatformIO } from "./vfs/vfs";
 import { MemoryFileSystem } from "./vfs/memory-fs";
 import { DeviceFileSystem } from "./vfs/device-fs";
 import { BrowserTimeProvider } from "./vfs/time";
-import {
-  DEFAULT_MOUNT_SPEC,
-  resolveForBrowser,
-} from "./vfs/default-mounts";
+import { DEFAULT_MOUNT_SPEC, resolveForBrowser } from "./vfs/default-mounts";
 import type { MountConfig } from "./vfs/types";
 import { TlsNetworkBackend } from "./networking/tls-network-backend";
 import { patchWasmForThread } from "./worker-main";
@@ -110,6 +115,10 @@ let io: VirtualPlatformIO;
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
 let defaultEnv: string[] = [];
+const THREAD_TRACE =
+  typeof process !== "undefined" && !!process.env?.KERNEL_THREAD_TRACE;
+const MAX_POOLED_PROCESS_MEMORIES = 8;
+const CHANNEL_ERROR_TRAP_EXPORT = "__wasm_posix_channel_error_traps";
 
 // Process tracking
 interface ProcessInfo {
@@ -122,6 +131,7 @@ interface ProcessInfo {
   ptrWidth: 4 | 8;
   layout: ProcessMemoryLayout;
   threadAllocator: ThreadPageAllocator;
+  channelErrorTraps: boolean;
 }
 const processes = new Map<number, ProcessInfo>();
 const processTeardowns = new Map<number, Promise<void>>();
@@ -131,6 +141,26 @@ const workerTeardowns = new Set<Promise<void>>();
 const threadedProcessPids = new Set<number>();
 const THREADED_WORKER_TERMINATION_SETTLE_MS = 250;
 const NODE_PROCESS_WORKER_TERMINATION_SETTLE_MS = 2000;
+
+function moduleSupportsChannelErrorTrap(module: WebAssembly.Module): boolean {
+  return WebAssembly.Module.exports(module).some(
+    (entry) =>
+      entry.kind === "function" && entry.name === CHANNEL_ERROR_TRAP_EXPORT,
+  );
+}
+
+function programSupportsChannelErrorTrap(
+  programBytes: ArrayBuffer,
+  module?: WebAssembly.Module,
+): boolean {
+  try {
+    return moduleSupportsChannelErrorTrap(
+      module ?? new WebAssembly.Module(programBytes),
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Workers we deliberately terminated — exec, exit, top-level destroy. The
@@ -143,12 +173,17 @@ const intentionallyTerminated = new WeakSet<object>();
 
 const MAX_SHEBANG_DEPTH = 4;
 
-function parseShebang(bytes: ArrayBuffer): { interpreter: string; arg?: string } | null {
+function parseShebang(
+  bytes: ArrayBuffer,
+): { interpreter: string; arg?: string } | null {
   const view = new Uint8Array(bytes);
   if (view.length < 2 || view[0] !== 0x23 || view[1] !== 0x21) return null;
   let end = 2;
   while (end < view.length && view[end] !== 0x0a && end < 4096) end++;
-  const line = new TextDecoder().decode(view.subarray(2, end)).replace(/\r$/, "").trim();
+  const line = new TextDecoder()
+    .decode(view.subarray(2, end))
+    .replace(/\r$/, "")
+    .trim();
   if (!line) return null;
   const match = line.match(/^(\S+)(?:\s+(.*))?$/);
   if (!match) return null;
@@ -232,6 +267,13 @@ async function terminateTrackedWorker(
   await teardown;
 }
 
+function terminateThreadEntry(entry: ThreadWorkerInfo): Promise<void> {
+  if (!entry.termination) {
+    entry.termination = terminateTrackedWorker(entry.worker);
+  }
+  return entry.termination;
+}
+
 async function terminateThreadWorkers(pid: number): Promise<void> {
   const threads = threadWorkers.get(pid);
   if (!threads) return;
@@ -245,6 +287,209 @@ async function terminateThreadWorkers(pid: number): Promise<void> {
   }
 }
 const ptyByPid = new Map<number, number>();
+const processMemoryPool = new Map<string, WebAssembly.Memory[]>();
+let processMemoryPoolSize = 0;
+const quiescedProcessWorkers = new WeakSet<object>();
+const retiredProcessWorkers = new Map<
+  object,
+  { pid: number; info: ProcessInfo }
+>();
+
+function processMemoryPages(memory: WebAssembly.Memory): number {
+  return Math.ceil(memory.buffer.byteLength / PAGE_SIZE);
+}
+
+function processMemoryPoolKey(
+  ptrWidth: 4 | 8,
+  maximumPages: number,
+  currentPages: number,
+  layoutKey: string,
+): string {
+  return `${ptrWidth}:${maximumPages}:${currentPages}:${layoutKey}`;
+}
+
+function zeroProcessMemory(memory: WebAssembly.Memory): void {
+  new Uint8Array(memory.buffer).fill(0);
+}
+
+function processMemoryLayoutPoolKey(layout: ProcessMemoryLayout): string {
+  return [
+    layout.channelOffset,
+    layout.brkBase,
+    layout.threadArenaEndPage,
+    layout.threadSlotCount,
+  ].join(":");
+}
+
+function processMemoryPoolSummary(): string {
+  const entries = [...processMemoryPool.entries()].map(
+    ([key, pool]) => `${key}x${pool.length}`,
+  );
+  return entries.length > 0
+    ? `total=${processMemoryPoolSize} ${entries.join(",")}`
+    : "empty";
+}
+
+function pooledProcessMemoryPagesFromKey(key: string): number {
+  return Number(key.split(":")[2]) || 0;
+}
+
+function evictLargestPooledProcessMemory(): boolean {
+  let evictKey: string | undefined;
+  let evictPages = -1;
+  for (const [key, pool] of processMemoryPool) {
+    if (pool.length === 0) continue;
+    const pages = pooledProcessMemoryPagesFromKey(key);
+    if (pages > evictPages) {
+      evictKey = key;
+      evictPages = pages;
+    }
+  }
+  if (!evictKey) return false;
+  const pool = processMemoryPool.get(evictKey);
+  pool?.pop();
+  if (pool && pool.length === 0) processMemoryPool.delete(evictKey);
+  processMemoryPoolSize = Math.max(0, processMemoryPoolSize - 1);
+  return true;
+}
+
+function clearProcessMemoryPool(): void {
+  processMemoryPool.clear();
+  processMemoryPoolSize = 0;
+}
+
+function takePooledProcessMemory(
+  ptrWidth: 4 | 8,
+  maximumPages: number,
+  initialPages: number,
+  layoutKey: string,
+): WebAssembly.Memory | null {
+  const key = processMemoryPoolKey(
+    ptrWidth,
+    maximumPages,
+    initialPages,
+    layoutKey,
+  );
+  const pool = processMemoryPool.get(key);
+  const memory = pool?.pop() ?? null;
+  if (pool && pool.length === 0) processMemoryPool.delete(key);
+  if (memory) {
+    processMemoryPoolSize = Math.max(0, processMemoryPoolSize - 1);
+    zeroProcessMemory(memory);
+  }
+  return memory;
+}
+
+function recycleProcessMemory(
+  ptrWidth: 4 | 8,
+  maximumPages: number,
+  memory: WebAssembly.Memory,
+  layoutKey: string,
+): void {
+  const currentPages = processMemoryPages(memory);
+  const key = processMemoryPoolKey(
+    ptrWidth,
+    maximumPages,
+    currentPages,
+    layoutKey,
+  );
+  let pool = processMemoryPool.get(key);
+  if (!pool) {
+    pool = [];
+    processMemoryPool.set(key, pool);
+  }
+  while (processMemoryPoolSize >= MAX_POOLED_PROCESS_MEMORIES) {
+    if (!evictLargestPooledProcessMemory()) break;
+  }
+  if (processMemoryPoolSize < MAX_POOLED_PROCESS_MEMORIES) {
+    pool.push(memory);
+    processMemoryPoolSize++;
+  }
+}
+
+function recycleProcessInfoMemory(info: ProcessInfo | undefined): void {
+  if (!info) return;
+  recycleProcessMemory(
+    info.ptrWidth,
+    info.layout.maximumPages,
+    info.memory,
+    processMemoryLayoutPoolKey(info.layout),
+  );
+}
+
+function canRecycleQuiescedProcess(
+  pid: number,
+  exitStatus: number,
+  info?: ProcessExitInfo,
+  workerAlreadyQuiesced = false,
+): boolean {
+  if (exitStatus < 0 && !info?.workerWillQuiesce && !workerAlreadyQuiesced)
+    return false;
+  if (exitStatus >= 128 && !info?.workerWillQuiesce && !workerAlreadyQuiesced)
+    return false;
+  return (threadWorkers.get(pid)?.length ?? 0) === 0;
+}
+
+function markProcessWorkerQuiesced(
+  worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
+): void {
+  quiescedProcessWorkers.add(worker as object);
+}
+
+function finishRetiredProcessWorker(
+  worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
+): boolean {
+  const retired = retiredProcessWorkers.get(worker as object);
+  if (!retired) return false;
+  retiredProcessWorkers.delete(worker as object);
+  recycleProcessInfoMemory(retired.info);
+  void terminateTrackedWorker(retired.info.worker);
+  return true;
+}
+
+function reclaimExitedThreadWorker(
+  pid: number,
+  tid: number,
+  channelOffset: number,
+): void {
+  const threads = threadWorkers.get(pid);
+  if (!threads) {
+    if (THREAD_TRACE)
+      console.error(
+        `[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no thread list`,
+      );
+    return;
+  }
+  const idx = threads.findIndex(
+    (entry) =>
+      entry.channelOffset === channelOffset || (tid > 0 && entry.tid === tid),
+  );
+  if (idx < 0) {
+    if (THREAD_TRACE)
+      console.error(
+        `[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no entry`,
+      );
+    return;
+  }
+
+  const [entry] = threads.splice(idx, 1);
+  if (threads.length === 0) threadWorkers.delete(pid);
+
+  const processInfo = processes.get(pid);
+  if (processInfo) {
+    processInfo.threadAllocator.free(entry.basePage);
+  } else if (THREAD_TRACE) {
+    console.error(
+      `[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no process`,
+    );
+  }
+  if (THREAD_TRACE) {
+    console.error(
+      `[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} base=${entry.basePage} remaining=${threads.length}`,
+    );
+  }
+  void terminateThreadEntry(entry);
+}
 
 // Kernel wasm exports cache
 let kernelInstance: WebAssembly.Instance | null = null;
@@ -277,20 +522,54 @@ function createSharedProcessMemory(
   ptrWidth: 4 | 8,
   initialPages: number,
   maximumPages: number,
+  layoutKey: string,
 ): WebAssembly.Memory {
-  if (ptrWidth === 8) {
+  const pooled = takePooledProcessMemory(
+    ptrWidth,
+    maximumPages,
+    initialPages,
+    layoutKey,
+  );
+  if (pooled) return pooled;
+  const allocate = () => {
+    if (ptrWidth === 8) {
+      return new WebAssembly.Memory({
+        initial: BigInt(initialPages),
+        maximum: BigInt(maximumPages),
+        shared: true,
+        address: "i64",
+      } as unknown as WebAssembly.MemoryDescriptor);
+    }
     return new WebAssembly.Memory({
-      initial: BigInt(initialPages),
-      maximum: BigInt(maximumPages),
+      initial: initialPages,
+      maximum: maximumPages,
       shared: true,
-      address: "i64",
-    } as unknown as WebAssembly.MemoryDescriptor);
+    });
+  };
+  try {
+    return allocate();
+  } catch (err) {
+    if (processMemoryPoolSize > 0) {
+      clearProcessMemoryPool();
+      return allocate();
+    }
+    throw err;
   }
-  return new WebAssembly.Memory({
-    initial: initialPages,
-    maximum: maximumPages,
-    shared: true,
-  });
+}
+
+function createProcessMemoryWithPressureRetry(
+  ptrWidth: 4 | 8,
+  layout: ProcessMemoryLayout,
+): WebAssembly.Memory {
+  try {
+    return createProcessMemory(ptrWidth, layout);
+  } catch (err) {
+    if (processMemoryPoolSize > 0) {
+      clearProcessMemoryPool();
+      return createProcessMemory(ptrWidth, layout);
+    }
+    throw err;
+  }
 }
 
 function threadAllocatorForLayout(
@@ -326,7 +605,18 @@ function createFreshProcessMemory(
     programBytes,
     heapBase,
   });
-  const memory = createProcessMemory(ptrWidth, layout);
+  const layoutKey = processMemoryLayoutPoolKey(layout);
+  let memory = takePooledProcessMemory(
+    ptrWidth,
+    layout.maximumPages,
+    layout.initialPages,
+    layoutKey,
+  );
+  if (memory) {
+    zeroProcessMemory(memory);
+  } else {
+    memory = createProcessMemoryWithPressureRetry(ptrWidth, layout);
+  }
   new Uint8Array(memory.buffer, layout.channelOffset, CH_TOTAL_SIZE).fill(0);
   return {
     memory,
@@ -346,15 +636,25 @@ function createFreshProcessMemory(
  * second mount. The kernel's `synthetic_file_content` shim that used
  * to serve these paths in-kernel was removed in PR 4/5.
  */
-function overlayEtcFromRootfs(target: MemoryFileSystem, rootfsImage: Uint8Array): void {
+function overlayEtcFromRootfs(
+  target: MemoryFileSystem,
+  rootfsImage: Uint8Array,
+): void {
   const source = MemoryFileSystem.fromImage(rootfsImage);
 
   // Ensure /etc exists in the target.
-  try { target.mkdir("/etc", 0o755); } catch { /* exists */ }
+  try {
+    target.mkdir("/etc", 0o755);
+  } catch {
+    /* exists */
+  }
 
   let dh: number;
-  try { dh = source.opendir("/etc"); }
-  catch { return; /* no /etc in image — nothing to overlay */ }
+  try {
+    dh = source.opendir("/etc");
+  } catch {
+    return; /* no /etc in image — nothing to overlay */
+  }
 
   try {
     while (true) {
@@ -366,7 +666,10 @@ function overlayEtcFromRootfs(target: MemoryFileSystem, rootfsImage: Uint8Array)
 
       // Skip if the demo already wrote this file — preserve demo intent.
       let exists = false;
-      try { target.stat(targetPath); exists = true; } catch {}
+      try {
+        target.stat(targetPath);
+        exists = true;
+      } catch {}
       if (exists) continue;
 
       // Only handle regular files for now; the canonical images/rootfs/etc/*
@@ -389,7 +692,11 @@ function overlayEtcFromRootfs(target: MemoryFileSystem, rootfsImage: Uint8Array)
       source.close(fdR);
 
       // Write into target.
-      const fdW = target.open(targetPath, 0o1101 /* O_WRONLY|O_CREAT|O_TRUNC */, st.mode & 0o777);
+      const fdW = target.open(
+        targetPath,
+        0o1101 /* O_WRONLY|O_CREAT|O_TRUNC */,
+        st.mode & 0o777,
+      );
       if (read > 0) target.write(fdW, buf.subarray(0, read), null, read);
       target.close(fdW);
     }
@@ -407,7 +714,8 @@ function resolveLazyUrl(base: string, url: string): string {
 
 async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   maxPages = msg.config.maxMemoryPages;
-  defaultThreadSlots = msg.config.defaultThreadSlots ?? DEFAULT_PROCESS_THREAD_SLOTS;
+  defaultThreadSlots =
+    msg.config.defaultThreadSlots ?? DEFAULT_PROCESS_THREAD_SLOTS;
   defaultEnv = msg.config.env;
 
   // Create VFS — prefer pre-built image bytes (kernel-owned FS); fall back
@@ -432,7 +740,9 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
     memfs = rootMount.backend as MemoryFileSystem;
     if (msg.lazyUrlBase) {
       memfs.rewriteLazyFileUrls((url) => resolveLazyUrl(msg.lazyUrlBase!, url));
-      memfs.rewriteLazyArchiveUrls((url) => resolveLazyUrl(msg.lazyUrlBase!, url));
+      memfs.rewriteLazyArchiveUrls((url) =>
+        resolveLazyUrl(msg.lazyUrlBase!, url),
+      );
     }
     mounts = [
       { mountPoint: "/dev/shm", backend: shmfs },
@@ -451,7 +761,10 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       try {
         overlayEtcFromRootfs(memfs, msg.rootfsImage);
       } catch (e) {
-        console.error("[kernel-worker] Failed to overlay /etc from rootfs.vfs:", e);
+        console.error(
+          "[kernel-worker] Failed to overlay /etc from rootfs.vfs:",
+          e,
+        );
       }
     }
     mounts = [
@@ -480,10 +793,18 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   try {
     // Demo images don't always include /etc — create the full chain.
     for (const dir of ["/etc", "/etc/ssl", "/etc/ssl/certs"]) {
-      try { memfs.mkdir(dir, 0o755); } catch { /* exists */ }
+      try {
+        memfs.mkdir(dir, 0o755);
+      } catch {
+        /* exists */
+      }
     }
     const certBytes = new TextEncoder().encode(caCertPem);
-    const certFd = memfs.open("/etc/ssl/certs/ca-certificates.crt", 0o1101, 0o644);
+    const certFd = memfs.open(
+      "/etc/ssl/certs/ca-certificates.crt",
+      0o1101,
+      0o644,
+    );
     memfs.write(certFd, certBytes, 0, certBytes.length);
     memfs.close(certFd);
   } catch (e) {
@@ -508,7 +829,12 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       onFork: (parentPid, childPid, parentMemory, threadFork) => {
         // Tell the main thread a kernel-side fork happened so Inspector
         // panes can refresh their process table without polling.
-        post({ type: "proc_event", kind: "spawn", pid: childPid, ppid: parentPid });
+        post({
+          type: "proc_event",
+          kind: "spawn",
+          pid: childPid,
+          ppid: parentPid,
+        });
         return handleFork(parentPid, childPid, parentMemory, threadFork);
       },
       onExec: async (pid, path, argv, envp) => {
@@ -524,27 +850,29 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       onClone: (pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, memory) =>
         handleClone(pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, memory),
       onThreadExit: (pid, _tid, channelOffset) => handleThreadExit(pid, channelOffset),
-      onExit: (pid, exitStatus) => handleExit(pid, exitStatus),
+      onExit: (pid, exitStatus, info) => handleExit(pid, exitStatus, info),
     },
   );
 
-  // In a dedicated worker, use Atomics.waitAsync directly — no V8 microtask
-  // chain freeze bug (that's main-thread-only).
-  kernelWorker.usePolling = false;
-  // Process a small batch of syscalls via microtask before yielding to the
-  // event loop via setImmediate. Batch size 8 is a good balance: it gives
-  // ~8x throughput vs batch-1 while still yielding frequently enough for
-  // pump timers, message handlers, and rendering to interleave.
-  (kernelWorker as any).relistenBatchSize = 8;
+  // Use the polling scheduler in the dedicated browser worker too. Long,
+  // multi-threaded workloads can otherwise livelock in V8 waitAsync promise
+  // continuations while guest threads are asleep and no channel makes progress.
+  kernelWorker.usePolling = true;
 
   // Inject stdout/stderr/listen callbacks
   const kw = kernelWorker as any;
   const existingCallbacks = kw.kernel.callbacks || {};
   kw.kernel.callbacks = {
     ...existingCallbacks,
-    onStdout: (data: Uint8Array) => post({ type: "stdout", pid: kw.currentHandlePid || 0, data }),
-    onStderr: (data: Uint8Array) => post({ type: "stderr", pid: kw.currentHandlePid || 0, data }),
-    onNetListen: (_fd: number, port: number, addr: [number, number, number, number]) => {
+    onStdout: (data: Uint8Array) =>
+      post({ type: "stdout", pid: kw.currentHandlePid || 0, data }),
+    onStderr: (data: Uint8Array) =>
+      post({ type: "stderr", pid: kw.currentHandlePid || 0, data }),
+    onNetListen: (
+      _fd: number,
+      port: number,
+      addr: [number, number, number, number],
+    ) => {
       const pid = kw.currentHandlePid;
       if (pid !== 0) {
         // Register the listener target for pickListenerTarget
@@ -603,10 +931,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       bytes.byteOffset,
       bytes.byteOffset + bytes.byteLength,
     );
-    post(
-      { type: "fb_write", pid, offset, bytes: new Uint8Array(buf) },
-      [buf],
-    );
+    post({ type: "fb_write", pid, offset, bytes: new Uint8Array(buf) }, [buf]);
   });
 
   // Accept bridge port for HTTP request handling
@@ -619,7 +944,9 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
 
 // ── Spawn ──
 
-async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>) {
+async function handleSpawn(
+  msg: Extract<MainToKernelMessage, { type: "spawn" }>,
+) {
   try {
     await waitForProcessTeardowns();
 
@@ -644,6 +971,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
     const pid = msg.pid ?? kernelWorker.allocatePid();
     const pages = msg.maxPages ?? maxPages;
     const ptrWidth = detectPtrWidth(programBytes);
+    const channelErrorTraps = programSupportsChannelErrorTrap(programBytes);
     const {
       memory,
       layout,
@@ -657,6 +985,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       brkBase: layout.brkBase,
       mmapBase: layout.mmapBase,
       maxAddr: layout.maxAddr,
+      channelErrorTraps,
     });
 
     if (msg.cwd) {
@@ -675,7 +1004,8 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
         kernelWorker.ptySetWinsize(ptyIdx, msg.ptyRows, msg.ptyCols);
       }
     } else if (msg.stdin) {
-      const stdinData = msg.stdin instanceof Uint8Array ? msg.stdin : new Uint8Array(msg.stdin);
+      const stdinData =
+        msg.stdin instanceof Uint8Array ? msg.stdin : new Uint8Array(msg.stdin);
       kernelWorker.setStdinData(pid, stdinData);
     }
 
@@ -703,6 +1033,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       ptrWidth,
       layout,
       threadAllocator,
+      channelErrorTraps,
     });
 
     installProcessWorkerListeners(worker, pid);
@@ -776,8 +1107,15 @@ function installProcessWorkerListeners(
     finalize(128 + 11, "worker exit event");
   });
   worker.on("message", (msg: unknown) => {
-    const m = msg as { type?: string; message?: string; pid?: number; status?: number };
+    const m = msg as {
+      type?: string;
+      message?: string;
+      pid?: number;
+      status?: number;
+    };
     if (m.type === "error") {
+      markProcessWorkerQuiesced(worker);
+      if (finishRetiredProcessWorker(worker)) return;
       console.error(`[kernel-worker] Process error pid=${pid}:`, m.message);
       // Forward to host stderr so the demo log shows the actual failure
       // ("Centralized worker failed: …" with the wasm trap or
@@ -791,6 +1129,8 @@ function installProcessWorkerListeners(
       post({ type: "stderr", pid, data: errBytes });
       finalize(-1, "worker-main error message");
     } else if (m.type === "exit") {
+      markProcessWorkerQuiesced(worker);
+      if (finishRetiredProcessWorker(worker)) return;
       finalize(m.status ?? 0, "worker-main exit message");
     }
   });
@@ -811,18 +1151,29 @@ async function handleFork(
 
   // Pre-compile module for TurboFan-optimized code (smaller stack frames).
   if (!parentInfo.programModule) {
-    parentInfo.programModule = await WebAssembly.compile(parentInfo.programBytes);
+    parentInfo.programModule = await WebAssembly.compile(
+      parentInfo.programBytes,
+    );
   }
 
   const parentBuf = new Uint8Array(parentMemory.buffer);
   const parentPages = Math.ceil(parentBuf.byteLength / PAGE_SIZE);
   const ptrWidth = parentInfo.ptrWidth;
+  const channelErrorTraps = parentInfo.channelErrorTraps;
   const childLayout = parentInfo.layout;
-  const childMemory = createSharedProcessMemory(
-    ptrWidth,
-    parentPages,
-    childLayout.maximumPages,
-  );
+  let childMemory: WebAssembly.Memory;
+  try {
+    childMemory = createSharedProcessMemory(
+      ptrWidth,
+      parentPages,
+      childLayout.maximumPages,
+      processMemoryLayoutPoolKey(childLayout),
+    );
+  } catch (err) {
+    throw new Error(
+      `create child process memory failed parent=${parentPid} child=${childPid} ptrWidth=${ptrWidth} initialPages=${parentPages} maximumPages=${childLayout.maximumPages} pool=${processMemoryPoolSummary()}: ${formatError(err)}`,
+    );
+  }
   new Uint8Array(childMemory.buffer).set(parentBuf);
 
   const childChannelOffset = childLayout.channelOffset;
@@ -833,6 +1184,7 @@ async function handleFork(
     ptrWidth,
     maxAddr: childLayout.maxAddr,
     mmapBase: childLayout.mmapBase,
+    channelErrorTraps,
   });
 
   const forkBufAddr = threadFork
@@ -866,6 +1218,7 @@ async function handleFork(
     ptrWidth,
     layout: childLayout,
     threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth, childPid),
+    channelErrorTraps,
   });
 
   installProcessWorkerListeners(childWorker, childPid);
@@ -895,9 +1248,16 @@ async function handleExec(
   // crash detector and tear down the kernel's view of the still-alive
   // (post-exec) process.
   const oldInfo = processes.get(pid);
-  if (oldInfo?.worker) {
-    intentionallyTerminated.add(oldInfo.worker as object);
-    await oldInfo.worker.terminate().catch(() => {});
+  const oldThreadWorkerCount = threadWorkers.get(pid)?.length ?? 0;
+  const canRetireOldProcessWorker =
+    !!oldInfo?.worker &&
+    oldInfo.channelErrorTraps &&
+    oldThreadWorkerCount === 0;
+  if (!canRetireOldProcessWorker) {
+    await terminateThreadWorkers(pid);
+    if (oldInfo?.worker) {
+      await terminateTrackedWorker(oldInfo.worker);
+    }
   }
 
   // DIAGNOSTIC: track pid → exec path so the sysprof dump can name
@@ -910,11 +1270,12 @@ async function handleExec(
   // Create fresh memory sized for the new binary's arch (exec across
   // wasm32↔wasm64 replaces the process image — memory type must match).
   const ptrWidth = detectPtrWidth(bytes);
+  const channelErrorTraps = programSupportsChannelErrorTrap(bytes);
   const {
     memory: newMemory,
     layout: newLayout,
     threadAllocator: newThreadAllocator,
-  } = createFreshProcessMemory(pid, bytes, ptrWidth);
+  } = createFreshProcessMemory(pid, bytes, ptrWidth, maxPages);
   const newChannelOffset = newLayout.channelOffset;
 
   kernelWorker.registerProcess(pid, newMemory, [newChannelOffset], {
@@ -923,6 +1284,7 @@ async function handleExec(
     brkBase: newLayout.brkBase,
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
+    channelErrorTraps,
     // Refresh the kernel's Process.argv so /proc/<pid>/cmdline and
     // host-side enumeration (Kandelo Inspector → Procs) show the new
     // program's argv after exec, not the parent's pre-exec argv.
@@ -956,6 +1318,7 @@ async function handleExec(
     ptrWidth,
     layout: newLayout,
     threadAllocator: newThreadAllocator,
+    channelErrorTraps,
   });
 
   // Wire post-exec error/exit handling. The handleFork listener (on the
@@ -964,6 +1327,9 @@ async function handleExec(
   // request, sed inside wp-config-init, etc.) leaves the kernel believing
   // the process is alive and the parent's waitpid blocks forever.
   installProcessWorkerListeners(newWorker, pid);
+  if (canRetireOldProcessWorker && oldInfo?.worker) {
+    retiredProcessWorkers.set(oldInfo.worker as object, { pid, info: oldInfo });
+  }
 
   return 0;
 }
@@ -1016,6 +1382,7 @@ async function handlePosixSpawn(
   post({ type: "proc_event", kind: "spawn", pid: childPid });
 
   const ptrWidth = detectPtrWidth(programBytes);
+  const channelErrorTraps = programSupportsChannelErrorTrap(programBytes);
   const {
     memory: newMemory,
     layout: newLayout,
@@ -1030,6 +1397,7 @@ async function handlePosixSpawn(
     brkBase: newLayout.brkBase,
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
+    channelErrorTraps,
   });
 
   const initData: CentralizedWorkerInitMessage = {
@@ -1056,6 +1424,7 @@ async function handlePosixSpawn(
     ptrWidth,
     layout: newLayout,
     threadAllocator,
+    channelErrorTraps,
   });
 
   installProcessWorkerListeners(newWorker, childPid);
@@ -1097,7 +1466,9 @@ async function handleClone(
     post({
       type: "stderr",
       pid,
-      data: new TextEncoder().encode(`[kernel-worker] pid=${pid}: ${message}\n`),
+      data: new TextEncoder().encode(
+        `[kernel-worker] pid=${pid}: ${message}\n`,
+      ),
     });
     throw e;
   }
@@ -1139,16 +1510,19 @@ async function handleClone(
   let reclaimed = false;
   const reclaimThread = () => {
     if (reclaimed) return;
+    const threads = threadWorkers.get(pid);
+    const idx = threads?.indexOf(threadEntry) ?? -1;
+    if (idx < 0) {
+      reclaimed = true;
+      return;
+    }
     reclaimed = true;
     processInfo.threadAllocator.free(alloc.basePage);
     threadExits.release(pid, alloc.channelOffset);
-    const threads = threadWorkers.get(pid);
-    if (threads) {
-      const idx = threads.indexOf(threadEntry);
-      if (idx >= 0) threads.splice(idx, 1);
-    }
+    threads!.splice(idx, 1);
+    if (threads!.length === 0) threadWorkers.delete(pid);
   };
-  const terminateThreadEntry = (): Promise<void> => {
+  const terminateCurrentThreadEntry = (): Promise<void> => {
     if (!threadEntry.termination) {
       threadEntry.termination = terminateTrackedWorker(
         threadWorker,
@@ -1157,20 +1531,20 @@ async function handleClone(
     }
     return threadEntry.termination;
   };
-  threadExits.register(pid, alloc.channelOffset, terminateThreadEntry);
+  threadExits.register(pid, alloc.channelOffset, terminateCurrentThreadEntry);
 
   const failThread = (reason: string) => {
     const text = `[kernel-worker] pid=${pid} tid=${tid}: ${reason}\n`;
     post({ type: "stderr", pid, data: new TextEncoder().encode(text) });
     kernelWorker.notifyThreadExit(pid, tid);
     kernelWorker.removeChannel(pid, alloc.channelOffset);
-    void terminateThreadEntry();
+    void terminateCurrentThreadEntry();
   };
 
   threadWorker.on("message", (msg: unknown) => {
     const m = msg as WorkerToHostMessage;
     if (m.type === "thread_exit") {
-      void terminateThreadEntry();
+      void terminateCurrentThreadEntry();
     } else if ((m as { type?: string }).type === "error") {
       // worker-main posted {type:"error"} — instantiation failure, top-level
       // throw, etc. Without this the parent's pthread_join blocks forever.
@@ -1178,7 +1552,10 @@ async function handleClone(
     }
   });
   threadWorker.on("error", (err: Error) => {
-    console.error(`[kernel-worker] thread worker error pid=${pid} tid=${tid}:`, err.message);
+    console.error(
+      `[kernel-worker] thread worker error pid=${pid} tid=${tid}:`,
+      err.message,
+    );
     failThread(`worker error: ${err.message ?? err}`);
   });
 
@@ -1189,66 +1566,82 @@ function handleThreadExit(pid: number, channelOffset: number): boolean {
   return threadExits.requestExit(pid, channelOffset);
 }
 
-function handleExit(pid: number, exitStatus: number): void {
-  void finishProcessExit(pid, exitStatus);
+function handleExit(
+  pid: number,
+  exitStatus: number,
+  info?: ProcessExitInfo,
+): void {
+  void finishProcessExit(pid, exitStatus, info);
 }
 
-async function finishProcessExit(pid: number, exitStatus: number): Promise<void> {
-  if (processTeardowns.has(pid)) return;
-
+async function finishProcessExit(
+  pid: number,
+  exitStatus: number,
+  exitInfo?: ProcessExitInfo,
+): Promise<void> {
   const info = processes.get(pid);
-  const threadedSettleMs = threadedProcessPids.has(pid)
-    ? THREADED_WORKER_TERMINATION_SETTLE_MS
-    : 0;
-  const settleMs = Math.max(
-    threadedSettleMs,
-    processWorkerTerminationSettleMs(info?.argv),
-  );
-  threadedProcessPids.delete(pid);
+  const workerAlreadyQuiesced =
+    !!info && quiescedProcessWorkers.has(info.worker as object);
+  const canRecycle =
+    !!info &&
+    canRecycleQuiescedProcess(pid, exitStatus, exitInfo, workerAlreadyQuiesced);
 
-  const teardown = (async () => {
-    // Synthesize a SIGSEGV-style reap *before* `deactivateProcess` in
-    // case the worker died without sending SYS_EXIT_GROUP (uncaught
-    // wasm trap -> onerror, worker-main `{type:"error"}` -> finalize(-1),
-    // externally terminated Worker -> "exit" event). Without this, a
-    // concurrent waitpid in the parent blocks until destroy because
-    // the kernel never marked the child as a zombie. Idempotent via
-    // `hostReaped`: when the kernel already processed a clean
-    // SYS_EXIT_GROUP for this pid, this is a no-op. Mirrors
-    // `finalizeProcessWorker` in host/src/node-kernel-worker-entry.ts.
-    try { kernelWorker.notifyHostProcessCrashed(pid); } catch { /* best-effort */ }
-    // Check if this is a "top-level" process or a fork child
-    // For now, always deactivate — the main thread tracks exit promises
-    kernelWorker.deactivateProcess(pid);
+  // Synthesize a SIGSEGV-style reap *before* `deactivateProcess` in
+  // case the worker died without sending SYS_EXIT_GROUP (uncaught
+  // wasm trap → onerror, worker-main `{type:"error"}` → finalize(-1),
+  // externally terminated Worker → "exit" event). Without this, a
+  // concurrent waitpid in the parent blocks until destroy because
+  // the kernel never marked the child as a zombie. Idempotent via
+  // `hostReaped`: when the kernel already processed a clean
+  // SYS_EXIT_GROUP for this pid, this is a no-op. Mirrors
+  // `finalizeProcessWorker` in host/src/node-kernel-worker-entry.ts.
+  try {
+    kernelWorker.notifyHostProcessCrashed(pid);
+  } catch {
+    /* best-effort */
+  }
+  // Check if this is a "top-level" process or a fork child
+  // For now, always deactivate — the main thread tracks exit promises
+  kernelWorker.deactivateProcess(pid);
 
-    processes.delete(pid);
-    threadModuleCache.delete(pid);
-    ptyByPid.delete(pid);
+  processes.delete(pid);
+  threadModuleCache.delete(pid);
+  ptyByPid.delete(pid);
 
-    // Terminate any surviving thread workers for this process; the main
-    // process worker exiting means their shared state (memory, fd table,
-    // signal mask) is gone. Browser `Worker.terminate()` is fire-and-forget,
-    // so threaded process exits get a short settle window before another
-    // process worker can be launched.
-    await terminateThreadWorkers(pid);
-    if (info?.worker) {
-      await terminateTrackedWorker(info.worker, settleMs);
-    }
-  })();
-  processTeardowns.set(pid, teardown);
-
+  // Notify main thread
   post({ type: "exit", pid, status: exitStatus });
 
-  try {
-    await teardown;
-  } finally {
-    processTeardowns.delete(pid);
+  if (!canRecycle) {
+    await terminateThreadWorkers(pid);
+  }
+  if (!info?.worker) {
+    return;
+  }
+
+  const workerKey = info.worker as object;
+  if (!canRecycle) {
+    await terminateTrackedWorker(info.worker);
+    return;
+  }
+
+  if (quiescedProcessWorkers.has(workerKey)) {
+    await terminateTrackedWorker(info.worker);
+    recycleProcessInfoMemory(info);
+  } else {
+    // The kernel-side exit syscall has completed the channel, but the browser
+    // process worker may not have resumed from Atomics.wait and returned from
+    // worker-main yet. Recycle only after worker-main posts its exit message;
+    // otherwise a pooled SharedArrayBuffer can wake stale waiters in a later
+    // process that reuses the same channel offset.
+    retiredProcessWorkers.set(workerKey, { pid, info });
   }
 }
 
 // ── Terminate ──
 
-async function handleTerminateProcess(msg: Extract<MainToKernelMessage, { type: "terminate_process" }>) {
+async function handleTerminateProcess(
+  msg: Extract<MainToKernelMessage, { type: "terminate_process" }>,
+) {
   const pid = msg.pid;
 
   // Terminate thread workers
@@ -1286,12 +1679,19 @@ async function handleTerminateProcess(msg: Extract<MainToKernelMessage, { type: 
 
 // ── Pipe operations ──
 
-function handlePipeRead(msg: Extract<MainToKernelMessage, { type: "pipe_read" }>) {
-  if (!kernelInstance) { respond(msg.requestId, null); return; }
+function handlePipeRead(
+  msg: Extract<MainToKernelMessage, { type: "pipe_read" }>,
+) {
+  if (!kernelInstance) {
+    respond(msg.requestId, null);
+    return;
+  }
   const pipeRead = kernelInstance.exports.kernel_pipe_read as (
     pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number,
   ) => number;
-  const scratchOffset = (kernelWorker as any).tcpScratchOffset || (kernelWorker as any).scratchOffset;
+  const scratchOffset =
+    (kernelWorker as any).tcpScratchOffset ||
+    (kernelWorker as any).scratchOffset;
   const chunks: Uint8Array[] = [];
   for (;;) {
     const n = pipeRead(msg.pid, msg.pipeIdx, kernelWorker.toKernelPtr(scratchOffset), PAGE_SIZE);
@@ -1299,7 +1699,10 @@ function handlePipeRead(msg: Extract<MainToKernelMessage, { type: "pipe_read" }>
     const mem = new Uint8Array(kernelMemory!.buffer);
     chunks.push(mem.slice(scratchOffset, scratchOffset + n));
   }
-  if (chunks.length === 0) { respond(msg.requestId, null); return; }
+  if (chunks.length === 0) {
+    respond(msg.requestId, null);
+    return;
+  }
   const total = chunks.reduce((s, c) => s + c.length, 0);
   const result = new Uint8Array(total);
   let offset = 0;
@@ -1310,12 +1713,19 @@ function handlePipeRead(msg: Extract<MainToKernelMessage, { type: "pipe_read" }>
   respond(msg.requestId, result);
 }
 
-function handlePipeWrite(msg: Extract<MainToKernelMessage, { type: "pipe_write" }>) {
-  if (!kernelInstance) { respond(msg.requestId, -1); return; }
+function handlePipeWrite(
+  msg: Extract<MainToKernelMessage, { type: "pipe_write" }>,
+) {
+  if (!kernelInstance) {
+    respond(msg.requestId, -1);
+    return;
+  }
   const pipeWrite = kernelInstance.exports.kernel_pipe_write as (
     pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number,
   ) => number;
-  const scratchOffset = (kernelWorker as any).tcpScratchOffset || (kernelWorker as any).scratchOffset;
+  const scratchOffset =
+    (kernelWorker as any).tcpScratchOffset ||
+    (kernelWorker as any).scratchOffset;
   let written = 0;
   const data = msg.data;
   while (written < data.length) {
@@ -1331,32 +1741,65 @@ function handlePipeWrite(msg: Extract<MainToKernelMessage, { type: "pipe_write" 
   respond(msg.requestId, written);
 }
 
-function handlePipeCloseRead(msg: Extract<MainToKernelMessage, { type: "pipe_close_read" }>) {
+function handlePipeCloseRead(
+  msg: Extract<MainToKernelMessage, { type: "pipe_close_read" }>,
+) {
   if (!kernelInstance) return;
-  const fn = kernelInstance.exports.kernel_pipe_close_read as (pid: number, pipeIdx: number) => number;
+  const fn = kernelInstance.exports.kernel_pipe_close_read as (
+    pid: number,
+    pipeIdx: number,
+  ) => number;
   fn(msg.pid, msg.pipeIdx);
 }
 
-function handlePipeCloseWrite(msg: Extract<MainToKernelMessage, { type: "pipe_close_write" }>) {
+function handlePipeCloseWrite(
+  msg: Extract<MainToKernelMessage, { type: "pipe_close_write" }>,
+) {
   if (!kernelInstance) return;
-  const fn = kernelInstance.exports.kernel_pipe_close_write as (pid: number, pipeIdx: number) => number;
+  const fn = kernelInstance.exports.kernel_pipe_close_write as (
+    pid: number,
+    pipeIdx: number,
+  ) => number;
   fn(msg.pid, msg.pipeIdx);
 }
 
-function handlePipeIsWriteOpen(msg: Extract<MainToKernelMessage, { type: "pipe_is_write_open" }>) {
-  if (!kernelInstance) { respond(msg.requestId, false); return; }
-  const fn = kernelInstance.exports.kernel_pipe_is_write_open as (pid: number, pipeIdx: number) => number;
+function handlePipeIsWriteOpen(
+  msg: Extract<MainToKernelMessage, { type: "pipe_is_write_open" }>,
+) {
+  if (!kernelInstance) {
+    respond(msg.requestId, false);
+    return;
+  }
+  const fn = kernelInstance.exports.kernel_pipe_is_write_open as (
+    pid: number,
+    pipeIdx: number,
+  ) => number;
   respond(msg.requestId, fn(msg.pid, msg.pipeIdx) === 1);
 }
 
-function handleInjectConnection(msg: Extract<MainToKernelMessage, { type: "inject_connection" }>) {
-  if (!kernelInstance) { respond(msg.requestId, -1); return; }
+function handleInjectConnection(
+  msg: Extract<MainToKernelMessage, { type: "inject_connection" }>,
+) {
+  if (!kernelInstance) {
+    respond(msg.requestId, -1);
+    return;
+  }
   const injectConnection = kernelInstance.exports.kernel_inject_connection as (
-    pid: number, fd: number, a: number, b: number, c: number, d: number, port: number,
+    pid: number,
+    fd: number,
+    a: number,
+    b: number,
+    c: number,
+    d: number,
+    port: number,
   ) => number;
   const recvPipeIdx = injectConnection(
-    msg.pid, msg.fd,
-    msg.peerAddr[0], msg.peerAddr[1], msg.peerAddr[2], msg.peerAddr[3],
+    msg.pid,
+    msg.fd,
+    msg.peerAddr[0],
+    msg.peerAddr[1],
+    msg.peerAddr[2],
+    msg.peerAddr[3],
     msg.peerPort,
   );
   if (recvPipeIdx >= 0) {
@@ -1365,7 +1808,9 @@ function handleInjectConnection(msg: Extract<MainToKernelMessage, { type: "injec
   respond(msg.requestId, recvPipeIdx);
 }
 
-function handleWakeBlockedReaders(msg: Extract<MainToKernelMessage, { type: "wake_blocked_readers" }>) {
+function handleWakeBlockedReaders(
+  msg: Extract<MainToKernelMessage, { type: "wake_blocked_readers" }>,
+) {
   const kw = kernelWorker as any;
   const readers = kw.pendingPipeReaders?.get(msg.pipeIdx);
   if (readers && readers.length > 0) {
@@ -1379,7 +1824,9 @@ function handleWakeBlockedReaders(msg: Extract<MainToKernelMessage, { type: "wak
   kw.scheduleWakeBlockedRetries();
 }
 
-function handleWakeBlockedWriters(msg: Extract<MainToKernelMessage, { type: "wake_blocked_writers" }>) {
+function handleWakeBlockedWriters(
+  msg: Extract<MainToKernelMessage, { type: "wake_blocked_writers" }>,
+) {
   const kw = kernelWorker as any;
   const writers = kw.pendingPipeWriters?.get(msg.pipeIdx);
   if (writers && writers.length > 0) {
@@ -1393,18 +1840,27 @@ function handleWakeBlockedWriters(msg: Extract<MainToKernelMessage, { type: "wak
   kw.scheduleWakeBlockedRetries();
 }
 
-function handleIsStdinConsumed(msg: Extract<MainToKernelMessage, { type: "is_stdin_consumed" }>) {
+function handleIsStdinConsumed(
+  msg: Extract<MainToKernelMessage, { type: "is_stdin_consumed" }>,
+) {
   const kw = kernelWorker as any;
-  respond(msg.requestId, kw.stdinFinite.has(msg.pid) && !kw.stdinBuffers.has(msg.pid));
+  respond(
+    msg.requestId,
+    kw.stdinFinite.has(msg.pid) && !kw.stdinBuffers.has(msg.pid),
+  );
 }
 
-function handlePickListenerTarget(msg: Extract<MainToKernelMessage, { type: "pick_listener_target" }>) {
+function handlePickListenerTarget(
+  msg: Extract<MainToKernelMessage, { type: "pick_listener_target" }>,
+) {
   const kw = kernelWorker as any;
   const result = kw.pickListenerTarget(msg.port);
   respond(msg.requestId, result);
 }
 
-async function handleDestroy(msg: Extract<MainToKernelMessage, { type: "destroy" }>) {
+async function handleDestroy(
+  msg: Extract<MainToKernelMessage, { type: "destroy" }>,
+) {
   // Terminate all process + thread workers, then clear every per-pid
   // map. Mirrors handleDestroy in node-kernel-worker-entry.ts —
   // without the threadWorkers / ptyByPid clears, those maps stay
@@ -1414,7 +1870,9 @@ async function handleDestroy(msg: Extract<MainToKernelMessage, { type: "destroy"
       await terminateThreadWorkers(pid);
       await terminateTrackedWorker(info.worker);
     }
-    try { kernelWorker.unregisterProcess(pid); } catch {}
+    try {
+      kernelWorker.unregisterProcess(pid);
+    } catch {}
   }
   for (const threads of threadWorkers.values()) {
     for (const t of threads) {
@@ -1424,30 +1882,41 @@ async function handleDestroy(msg: Extract<MainToKernelMessage, { type: "destroy"
       );
     }
   }
+  for (const retired of retiredProcessWorkers.values()) {
+    void terminateTrackedWorker(retired.info.worker);
+  }
   processes.clear();
   threadModuleCache.clear();
   threadWorkers.clear();
   threadedProcessPids.clear();
   ptyByPid.clear();
+  retiredProcessWorkers.clear();
+  clearProcessMemoryPool();
   await waitForProcessTeardowns();
   respond(msg.requestId, true);
 }
 
 // ── PTY ──
 
-function handlePtyWrite(msg: Extract<MainToKernelMessage, { type: "pty_write" }>) {
+function handlePtyWrite(
+  msg: Extract<MainToKernelMessage, { type: "pty_write" }>,
+) {
   const ptyIdx = ptyByPid.get(msg.pid);
   if (ptyIdx === undefined) return;
   kernelWorker.ptyMasterWrite(ptyIdx, msg.data);
 }
 
-function handlePtyResize(msg: Extract<MainToKernelMessage, { type: "pty_resize" }>) {
+function handlePtyResize(
+  msg: Extract<MainToKernelMessage, { type: "pty_resize" }>,
+) {
   const ptyIdx = ptyByPid.get(msg.pid);
   if (ptyIdx === undefined) return;
   kernelWorker.ptySetWinsize(ptyIdx, msg.rows, msg.cols);
 }
 
-function handleMouseInject(msg: Extract<MainToKernelMessage, { type: "mouse_inject" }>) {
+function handleMouseInject(
+  msg: Extract<MainToKernelMessage, { type: "mouse_inject" }>,
+) {
   kernelWorker.injectMouseEvent(msg.dx, msg.dy, msg.buttons);
 }
 
@@ -1458,7 +1927,9 @@ function handleMouseInject(msg: Extract<MainToKernelMessage, { type: "mouse_inje
  * (sampleRate, channels) reported by the same call so a runtime config
  * change (`SNDCTL_DSP_SPEED`) is picked up on the next drain.
  */
-function handleAudioDrain(msg: Extract<MainToKernelMessage, { type: "audio_drain" }>) {
+function handleAudioDrain(
+  msg: Extract<MainToKernelMessage, { type: "audio_drain" }>,
+) {
   const cap = Math.min(msg.maxBytes, 65536);
   const buf = new Uint8Array(cap);
   const n = kernelWorker.drainAudio(buf);
@@ -1477,7 +1948,9 @@ function handleAudioDrain(msg: Extract<MainToKernelMessage, { type: "audio_drain
   );
 }
 
-function handleRegisterPtyOutput(msg: Extract<MainToKernelMessage, { type: "register_pty_output" }>) {
+function handleRegisterPtyOutput(
+  msg: Extract<MainToKernelMessage, { type: "register_pty_output" }>,
+) {
   const ptyIdx = ptyByPid.get(msg.pid);
   if (ptyIdx === undefined) return;
   kernelWorker.onPtyOutput(ptyIdx, (data: Uint8Array) => {
@@ -1519,7 +1992,9 @@ async function handleHttpRequest(requestId: number, request: any) {
     return;
   }
 
-  console.log(`[bridge] req#${requestId} ${request.method} ${url} → port=${port}`);
+  console.log(
+    `[bridge] req#${requestId} ${request.method} ${url} → port=${port}`,
+  );
   try {
     const response = await kernelWorker.sendHttpRequest(
       port,
@@ -1565,11 +2040,9 @@ async function handleHttpRequestMessage(msg: {
     return;
   }
   try {
-    const response = await kernelWorker.sendHttpRequest(
-      msg.port,
-      msg.request,
-      { timeoutMs: msg.timeoutMs },
-    );
+    const response = await kernelWorker.sendHttpRequest(msg.port, msg.request, {
+      timeoutMs: msg.timeoutMs,
+    });
     respond(msg.requestId, response);
   } catch (e) {
     respondError(msg.requestId, e instanceof Error ? e.message : String(e));
@@ -1584,7 +2057,10 @@ function readFileFromFs(path: string): ArrayBuffer | null {
     try {
       const stat = memfs.fstat(fd);
       const size = stat.size;
-      if (size <= 0) { memfs.close(fd); return null; }
+      if (size <= 0) {
+        memfs.close(fd);
+        return null;
+      }
       const buf = new Uint8Array(size);
       const nread = memfs.read(fd, buf, null, size);
       memfs.close(fd);
@@ -1621,27 +2097,69 @@ sw.onmessage = (e: MessageEvent) => {
         post({ type: "init_error", error });
       });
       break;
-    case "spawn": void handleSpawn(msg); break;
-    case "terminate_process": void handleTerminateProcess(msg); break;
-    case "append_stdin_data": kernelWorker.appendStdinData(msg.pid, msg.data); break;
-    case "set_stdin_data": kernelWorker.setStdinData(msg.pid, msg.data); break;
-    case "pty_write": handlePtyWrite(msg); break;
-    case "pty_resize": handlePtyResize(msg); break;
-    case "register_pty_output": handleRegisterPtyOutput(msg); break;
-    case "inject_connection": handleInjectConnection(msg); break;
-    case "pipe_read": handlePipeRead(msg); break;
-    case "pipe_write": handlePipeWrite(msg); break;
-    case "pipe_close_read": handlePipeCloseRead(msg); break;
-    case "pipe_close_write": handlePipeCloseWrite(msg); break;
-    case "pipe_is_write_open": handlePipeIsWriteOpen(msg); break;
-    case "wake_blocked_readers": handleWakeBlockedReaders(msg); break;
-    case "wake_blocked_writers": handleWakeBlockedWriters(msg); break;
-    case "is_stdin_consumed": handleIsStdinConsumed(msg); break;
-    case "pick_listener_target": handlePickListenerTarget(msg); break;
-    case "http_request": handleHttpRequestMessage(msg); break;
-    case "destroy": void handleDestroy(msg); break;
-    case "register_lazy_files": memfs.importLazyEntries(msg.entries); break;
-    case "register_lazy_archives": memfs.importLazyArchiveEntries(msg.entries); break;
+    case "spawn":
+      void handleSpawn(msg);
+      break;
+    case "terminate_process":
+      void handleTerminateProcess(msg);
+      break;
+    case "append_stdin_data":
+      kernelWorker.appendStdinData(msg.pid, msg.data);
+      break;
+    case "set_stdin_data":
+      kernelWorker.setStdinData(msg.pid, msg.data);
+      break;
+    case "pty_write":
+      handlePtyWrite(msg);
+      break;
+    case "pty_resize":
+      handlePtyResize(msg);
+      break;
+    case "register_pty_output":
+      handleRegisterPtyOutput(msg);
+      break;
+    case "inject_connection":
+      handleInjectConnection(msg);
+      break;
+    case "pipe_read":
+      handlePipeRead(msg);
+      break;
+    case "pipe_write":
+      handlePipeWrite(msg);
+      break;
+    case "pipe_close_read":
+      handlePipeCloseRead(msg);
+      break;
+    case "pipe_close_write":
+      handlePipeCloseWrite(msg);
+      break;
+    case "pipe_is_write_open":
+      handlePipeIsWriteOpen(msg);
+      break;
+    case "wake_blocked_readers":
+      handleWakeBlockedReaders(msg);
+      break;
+    case "wake_blocked_writers":
+      handleWakeBlockedWriters(msg);
+      break;
+    case "is_stdin_consumed":
+      handleIsStdinConsumed(msg);
+      break;
+    case "pick_listener_target":
+      handlePickListenerTarget(msg);
+      break;
+    case "http_request":
+      handleHttpRequestMessage(msg);
+      break;
+    case "destroy":
+      void handleDestroy(msg);
+      break;
+    case "register_lazy_files":
+      memfs.importLazyEntries(msg.entries);
+      break;
+    case "register_lazy_archives":
+      memfs.importLazyArchiveEntries(msg.entries);
+      break;
     case "get_fork_count": {
       // Round-trip access to the kernel's per-process fork counter for
       // tests asserting SYS_SPAWN didn't fall back to fork. Mirrors the
@@ -1654,8 +2172,12 @@ sw.onmessage = (e: MessageEvent) => {
       }
       break;
     }
-    case "mouse_inject": handleMouseInject(msg); break;
-    case "audio_drain": handleAudioDrain(msg); break;
+    case "mouse_inject":
+      handleMouseInject(msg);
+      break;
+    case "audio_drain":
+      handleAudioDrain(msg);
+      break;
     case "enum_procs": {
       // Snapshot the kernel's process table for the Inspector → Procs tab.
       // Mirrors the Node-side handler in node-kernel-worker-entry.ts —
@@ -1693,20 +2215,51 @@ sw.onmessage = (e: MessageEvent) => {
       const raw = e.data as any;
       if (raw?.type === "sysprof_start") {
         (globalThis as { __sysprof?: boolean }).__sysprof = true;
-        (globalThis as { __sysprofTable?: Map<string, unknown> }).__sysprofTable = new Map();
-        (globalThis as { __sysprofStartedAt?: number }).__sysprofStartedAt = performance.now();
-        post({ type: "stdout", pid: 0, data: new TextEncoder().encode("[sysprof] started\n") });
+        (
+          globalThis as { __sysprofTable?: Map<string, unknown> }
+        ).__sysprofTable = new Map();
+        (globalThis as { __sysprofStartedAt?: number }).__sysprofStartedAt =
+          performance.now();
+        post({
+          type: "stdout",
+          pid: 0,
+          data: new TextEncoder().encode("[sysprof] started\n"),
+        });
       } else if (raw?.type === "pid_map_dump") {
         const m = (globalThis as { __pidMap?: Map<number, string> }).__pidMap;
         const out = ["[pid-map] (pid → exec'd path)\n"];
-        if (m) for (const [pid, p] of [...m.entries()].sort((a, b) => a[0] - b[0])) out.push(`  pid=${pid} ${p}\n`);
-        post({ type: "stdout", pid: 0, data: new TextEncoder().encode(out.join("")) });
+        if (m)
+          for (const [pid, p] of [...m.entries()].sort((a, b) => a[0] - b[0]))
+            out.push(`  pid=${pid} ${p}\n`);
+        post({
+          type: "stdout",
+          pid: 0,
+          data: new TextEncoder().encode(out.join("")),
+        });
       } else if (raw?.type === "sysprof_dump") {
-        const table = (globalThis as { __sysprofTable?: Map<string, { count: number; totalMs: number; maxMs: number }> }).__sysprofTable;
-        const gapTable = (globalThis as { __sysprofGap?: Map<number, { count: number; gapTotalMs: number; gapMaxMs: number }> }).__sysprofGap;
-        const startedAt = (globalThis as { __sysprofStartedAt?: number }).__sysprofStartedAt ?? 0;
+        const table = (
+          globalThis as {
+            __sysprofTable?: Map<
+              string,
+              { count: number; totalMs: number; maxMs: number }
+            >;
+          }
+        ).__sysprofTable;
+        const gapTable = (
+          globalThis as {
+            __sysprofGap?: Map<
+              number,
+              { count: number; gapTotalMs: number; gapMaxMs: number }
+            >;
+          }
+        ).__sysprofGap;
+        const startedAt =
+          (globalThis as { __sysprofStartedAt?: number }).__sysprofStartedAt ??
+          0;
         const elapsed = performance.now() - startedAt;
-        const rows = table ? [...table.entries()].map(([k, v]) => ({ key: k, ...v })) : [];
+        const rows = table
+          ? [...table.entries()].map(([k, v]) => ({ key: k, ...v }))
+          : [];
         rows.sort((a, b) => b.totalMs - a.totalMs);
         let out = `[sysprof] ${elapsed.toFixed(0)}ms total, top syscalls by kernel-side time:\n`;
         for (const r of rows.slice(0, 20)) {
@@ -1716,7 +2269,10 @@ sw.onmessage = (e: MessageEvent) => {
         // Wall-clock gaps tell us which pid's *user wasm code* is the
         // actual bottleneck — kernel handling itself has been ~negligible.
         if (gapTable) {
-          const gapRows = [...gapTable.entries()].map(([pid, v]) => ({ pid, ...v }));
+          const gapRows = [...gapTable.entries()].map(([pid, v]) => ({
+            pid,
+            ...v,
+          }));
           gapRows.sort((a, b) => b.gapTotalMs - a.gapTotalMs);
           out += `[sysprof] gap-between-syscalls per pid (= time spent in user wasm):\n`;
           for (const r of gapRows.slice(0, 15)) {

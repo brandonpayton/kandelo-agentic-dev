@@ -146,11 +146,17 @@ async function init() {
         "",
       ].join("\n"), 0o644);
     }
+    const syscallLogPtrWidth =
+      import.meta.env.VITE_SQLITE_BROWSER_SYSCALL_LOG_PTR_WIDTH === "4" ? 4 :
+      import.meta.env.VITE_SQLITE_BROWSER_SYSCALL_LOG_PTR_WIDTH === "8" ? 8 :
+      undefined;
+    const maxMemoryPages = Number(import.meta.env.VITE_SQLITE_BROWSER_MAX_MEMORY_PAGES || 0) || undefined;
     const kernel = new BrowserKernel({
       memfs: fs,
       maxWorkers: 4,
+      maxMemoryPages,
       enableSyscallLog: import.meta.env.VITE_SQLITE_BROWSER_SYSCALL_LOG === "1",
-      syscallLogPtrWidth: import.meta.env.VITE_SQLITE_BROWSER_SYSCALL_LOG_PTR_WIDTH === "8" ? 8 : 4,
+      syscallLogPtrWidth,
       onStdout: (data) => { appendStdout(new TextDecoder().decode(data)); },
       onStderr: (data) => { stderr += new TextDecoder().decode(data); },
     });

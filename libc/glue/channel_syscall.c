@@ -47,6 +47,19 @@ unsigned int __wasm_posix_user_abi_version(void) {
     return WASM_POSIX_ABI_VERSION;
 }
 
+/*
+ * Capability marker: this binary treats CH_ERROR as a fatal channel wake.
+ * The host uses this to safely wake a signal-terminated worker out of
+ * Atomics.wait so the worker can quiesce and its SharedArrayBuffer can be
+ * recycled without stale waiters.
+ */
+__attribute__((used))
+__attribute__((retain))
+__attribute__((export_name("__wasm_posix_channel_error_traps")))
+unsigned int __wasm_posix_channel_error_traps(void) {
+    return 1;
+}
+
 #ifndef WASM_POSIX_THREAD_SLOT_DECL
 #define WASM_POSIX_THREAD_SLOT_DECL WASM_POSIX_THREAD_SLOT_DECL_DEFAULT
 #endif
@@ -367,12 +380,17 @@ static long __do_syscall(long n, long long a1, long long a2, long long a3,
 
     /* Read result — re-read base from global for safety */
     base = get_channel_base();
+    int32_t status = *(int32_t *)(uintptr_t)(base + CH_STATUS);
     long result = (long)*(int64_t *)(uintptr_t)(base + CH_RETURN);
     int32_t err = *(int32_t *)(uintptr_t)(base + CH_ERRNO);
 
     /* Reset status to IDLE for next syscall */
     __c11_atomic_store((_Atomic int32_t *)(uintptr_t)(base + CH_STATUS),
                        CH_IDLE, __ATOMIC_SEQ_CST);
+
+    if (status == CH_ERROR) {
+        __builtin_trap();
+    }
 
     /* Check for pending signal delivery from the kernel.
      * The kernel writes signal info to CH_SIG_* after each syscall if
@@ -458,8 +476,13 @@ long __syscall6(long n, long long a1, long long a2, long long a3, long long a4, 
 extern void __testcancel(void);
 extern long __syscall_cp_check(long r);
 
+#if __SIZEOF_LONG__ == 4
+long __syscall_cp(long long n, long long a1, long long a2, long long a3,
+                  long long a4, long long a5, long long a6)
+#else
 long __syscall_cp(long n, long a1, long a2, long a3, long a4, long a5,
                   long a6)
+#endif
 {
     __testcancel();
     long r = __do_syscall((long long)n, (long long)a1, (long long)a2,

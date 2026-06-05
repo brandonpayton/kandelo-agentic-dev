@@ -62,12 +62,19 @@ export interface NodeKernelHostOptions {
   /** Called when a process is spawned, execs a new program, or exits.
    *  Used by Inspector-style UIs to refresh their process table without
    *  polling. */
-  onProcessEvent?: (event: { kind: "spawn" | "exec" | "exit"; pid: number; ppid?: number; exitStatus?: number }) => void;
+  onProcessEvent?: (event: {
+    kind: "spawn" | "exec" | "exit";
+    pid: number;
+    ppid?: number;
+    exitStatus?: number;
+  }) => void;
   /**
    * Called when the worker can't resolve an exec path locally.
    * Return the program bytes or null if not found.
    */
-  onResolveExec?: (path: string) => ArrayBuffer | null | Promise<ArrayBuffer | null>;
+  onResolveExec?: (
+    path: string,
+  ) => ArrayBuffer | null | Promise<ArrayBuffer | null>;
   /**
    * Opt in to mount-based VFS for this kernel boot.
    *
@@ -84,7 +91,11 @@ export interface NodeKernelHostOptions {
    *     to a VFS-only world yet.
    */
   rootfsImage?: "default" | ArrayBuffer | Uint8Array;
-  extraMounts?: Array<{ mountPoint: string; hostPath: string; readonly?: boolean }>;
+  extraMounts?: Array<{
+    mountPoint: string;
+    hostPath: string;
+    readonly?: boolean;
+  }>;
 }
 
 export interface SpawnOptions {
@@ -110,9 +121,12 @@ export interface SpawnOptions {
 
 export class NodeKernelHost {
   private worker!: NodeThreadWorker;
-  private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
+  private pendingRequests = new Map<
+    number,
+    { resolve: (val: any) => void; reject: (err: Error) => void }
+  >();
   private exitResolvers = new Map<number, (status: number) => void>();
-  private unclaimedExitStatuses = new Map<number, number>();
+  private pendingExitStatuses = new Map<number, number>();
   private _nextRequestId = 1;
   private options: NodeKernelHostOptions;
 
@@ -161,7 +175,9 @@ export class NodeKernelHost {
         settle(() => reject(err));
       };
       const exitHandler = (code: number) => {
-        settle(() => reject(new Error(`kernel worker exited before ready (code ${code})`)));
+        settle(() =>
+          reject(new Error(`kernel worker exited before ready (code ${code})`)),
+        );
       };
       this.worker.on("message", readyHandler);
       this.worker.once("error", errorHandler);
@@ -196,7 +212,7 @@ export class NodeKernelHost {
   ): Promise<number> {
     const requestId = this._nextRequestId++;
 
-    const pid = await this.request(requestId, {
+    const pid = (await this.request(requestId, {
       type: "spawn",
       requestId,
       programBytes,
@@ -216,17 +232,9 @@ export class NodeKernelHost {
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
       maxAddr: options?.maxAddr,
-    }) as number;
+    })) as number;
 
-    const unclaimedExitStatus = this.unclaimedExitStatuses.get(pid);
-    if (unclaimedExitStatus !== undefined) {
-      this.unclaimedExitStatuses.delete(pid);
-    }
-    const exitPromise = unclaimedExitStatus !== undefined
-      ? Promise.resolve(unclaimedExitStatus)
-      : new Promise<number>((resolve) => {
-          this.exitResolvers.set(pid, resolve);
-        });
+    const exitPromise = this.createExitPromise(pid);
 
     this.options.onProcessEvent?.({ kind: "spawn", pid });
 
@@ -236,6 +244,17 @@ export class NodeKernelHost {
     }
 
     return exitPromise;
+  }
+
+  private createExitPromise(pid: number): Promise<number> {
+    if (this.pendingExitStatuses.has(pid)) {
+      const status = this.pendingExitStatuses.get(pid)!;
+      this.pendingExitStatuses.delete(pid);
+      return Promise.resolve(status);
+    }
+    return new Promise<number>((resolve) => {
+      this.exitResolvers.set(pid, resolve);
+    });
   }
 
   /** Append data to a process's stdin buffer (process sees more data, no EOF) */
@@ -378,7 +397,11 @@ export class NodeKernelHost {
     }
     for (const event of events) {
       for (const cb of this.syscallListeners) {
-        try { cb(event); } catch { /* listener errors don't break the loop */ }
+        try {
+          cb(event);
+        } catch {
+          /* listener errors don't break the loop */
+        }
       }
     }
   }
@@ -415,6 +438,7 @@ export class NodeKernelHost {
     }
     await this.worker.terminate();
     this.exitResolvers.clear();
+    this.pendingExitStatuses.clear();
     this.pendingRequests.clear();
   }
 
@@ -451,21 +475,29 @@ export class NodeKernelHost {
           this.exitResolvers.delete(msg.pid);
           resolver(msg.status);
         } else {
-          this.unclaimedExitStatuses.set(msg.pid, msg.status);
-          while (this.unclaimedExitStatuses.size > 256) {
-            const oldest = this.unclaimedExitStatuses.keys().next().value;
+          this.pendingExitStatuses.set(msg.pid, msg.status);
+          while (this.pendingExitStatuses.size > 256) {
+            const oldest = this.pendingExitStatuses.keys().next().value;
             if (oldest === undefined) break;
-            this.unclaimedExitStatuses.delete(oldest);
+            this.pendingExitStatuses.delete(oldest);
           }
         }
-        this.options.onProcessEvent?.({ kind: "exit", pid: msg.pid, exitStatus: msg.status });
+        this.options.onProcessEvent?.({
+          kind: "exit",
+          pid: msg.pid,
+          exitStatus: msg.status,
+        });
         break;
       }
       case "proc_event": {
         // Kernel-internal fork / exec / posix_spawn. The host doesn't
         // see these via NodeKernelHost.spawn (forks happen inside the
         // wasm kernel without going through the request/response loop).
-        this.options.onProcessEvent?.({ kind: msg.kind, pid: msg.pid, ppid: msg.ppid });
+        this.options.onProcessEvent?.({
+          kind: msg.kind,
+          pid: msg.pid,
+          ppid: msg.ppid,
+        });
         break;
       }
       case "stdout":
@@ -483,7 +515,9 @@ export class NodeKernelHost {
     }
   }
 
-  private async handleResolveExec(msg: ResolveExecRequestMessage): Promise<void> {
+  private async handleResolveExec(
+    msg: ResolveExecRequestMessage,
+  ): Promise<void> {
     let programBytes: ArrayBuffer | null = null;
     if (this.options.onResolveExec) {
       programBytes = await this.options.onResolveExec(msg.path);
@@ -534,8 +568,14 @@ function resolveRootfsArtifact(): string {
     try {
       return resolveBinary("programs/rootfs.vfs");
     } catch (programsError) {
-      const rootfsMessage = rootfsError instanceof Error ? rootfsError.message : String(rootfsError);
-      const programsMessage = programsError instanceof Error ? programsError.message : String(programsError);
+      const rootfsMessage =
+        rootfsError instanceof Error
+          ? rootfsError.message
+          : String(rootfsError);
+      const programsMessage =
+        programsError instanceof Error
+          ? programsError.message
+          : String(programsError);
       throw new Error(
         `rootfsImage:"default" requested but no rootfs image was available.\n` +
           `Tried rootfs.vfs:\n${rootfsMessage}\n` +
@@ -561,7 +601,9 @@ function spawnKernelWorkerThread(): NodeThreadWorker {
   }
 
   // Fallback: tsx eval bootstrap
-  const require = createRequire(pathToFileURL(join(MODULE_DIR, "node-kernel-host.js")).href);
+  const require = createRequire(
+    pathToFileURL(join(MODULE_DIR, "node-kernel-host.js")).href,
+  );
   const tsxApiPath = require.resolve("tsx/esm/api");
   const tsxApiUrl = pathToFileURL(tsxApiPath).href;
   const entryUrl = pathToFileURL(entryTs).href;

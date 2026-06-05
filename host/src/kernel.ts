@@ -8,6 +8,8 @@
  *   env.host_read(handle: i64, buf_ptr, buf_len) -> i32
  *   env.host_write(handle: i64, buf_ptr, buf_len) -> i32
  *   env.host_seek(handle: i64, offset_lo, offset_hi, whence) -> i64
+ *   env.host_pread(handle: i64, offset_lo, offset_hi, buf_ptr, buf_len) -> i32
+ *   env.host_pwrite(handle: i64, offset_lo, offset_hi, buf_ptr, buf_len) -> i32
  *   env.host_fstat(handle: i64, stat_ptr) -> i32
  *   env.host_statfs(path_ptr, path_len, statfs_ptr) -> i32
  *
@@ -98,6 +100,13 @@ const WASM_STATFS_SIZE = 72;
 
 /** Size of the WasmDirent struct: d_ino(u64) + d_type(u32) + d_namlen(u32). */
 const WASM_DIRENT_SIZE = STRUCT_SIZE_WASM_DIRENT;
+const PATH_DECODER = new TextDecoder("utf-8", { fatal: false });
+const PATH_ENCODER = new TextEncoder();
+
+interface HostPath {
+  bytes: Uint8Array;
+  display: string;
+}
 
 export interface KernelCallbacks {
   onKill?: (pid: number, signal: number) => number;
@@ -129,6 +138,7 @@ export class WasmPosixKernel {
   private programFuncTable: WebAssembly.Table | null = null;
   private forkSab: SharedArrayBuffer | null = null;
   private waitpidSab: SharedArrayBuffer | null = null;
+  private debugHandlePaths = new Map<number, string>();
   isThreadWorker = false;
   /** PID for this kernel instance (set by the worker) */
   pid = 0;
@@ -310,8 +320,10 @@ export class WasmPosixKernel {
     this.signalWakeSab = sab;
   }
 
-  registerSharedLockTable(sab: SharedArrayBuffer): void {
-    this.sharedLockTable = SharedLockTable.fromBuffer(sab);
+  registerSharedLockTable(tableOrBuffer: SharedLockTable | SharedArrayBuffer): void {
+    this.sharedLockTable = tableOrBuffer instanceof SharedLockTable
+      ? tableOrBuffer
+      : SharedLockTable.fromBuffer(tableOrBuffer);
   }
 
   registerForkSab(sab: SharedArrayBuffer): void {
@@ -371,6 +383,12 @@ export class WasmPosixKernel {
         },
         host_seek: (handle: bigint, offsetLo: number, offsetHi: number, whence: number): bigint => {
           return this.hostSeek(handle, offsetLo, offsetHi, whence);
+        },
+        host_pread: (handle: bigint, offsetLo: number, offsetHi: number, bufPtr: bigint, bufLen: number): number => {
+          return this.hostPread(handle, offsetLo, offsetHi, Number(bufPtr), bufLen);
+        },
+        host_pwrite: (handle: bigint, offsetLo: number, offsetHi: number, bufPtr: bigint, bufLen: number): number => {
+          return this.hostPwrite(handle, offsetLo, offsetHi, Number(bufPtr), bufLen);
         },
         host_fstat: (handle: bigint, statPtr: bigint): number => {
           return this.hostFstat(handle, Number(statPtr));
@@ -654,6 +672,26 @@ export class WasmPosixKernel {
     return out;
   }
 
+  private sqliteFsTraceEnabled(): boolean {
+    return typeof process !== "undefined"
+      && (process.env.KERNEL_SQLITE_FS_TRACE === "1" || process.env.KERNEL_STAT_TRACE === "1");
+  }
+
+  private isSqliteTestPath(path: string | undefined): boolean {
+    return path !== undefined && /test-[0-9a-f]+\.db(?:-(?:journal|wal|shm|lock))?$/.test(path);
+  }
+
+  private traceSqliteFs(message: string): void {
+    if (this.sqliteFsTraceEnabled()) {
+      console.error(`[KERNEL_SQLITE_FS_TRACE pid=${this.pid}] ${message}`);
+    }
+  }
+
+  private traceSqliteStat(op: string, target: string, stat: StatResult): void {
+    if (!this.sqliteFsTraceEnabled() || !this.isSqliteTestPath(target)) return;
+    this.traceSqliteFs(`${op} ${target} dev=${stat.dev} ino=${stat.ino} mode=0o${stat.mode.toString(8)} size=${stat.size}`);
+  }
+
   /**
    * host_open(path_ptr, path_len, flags, mode) -> i64
    *
@@ -670,10 +708,15 @@ export class WasmPosixKernel {
     mode: number,
   ): bigint {
     try {
-      const mem = this.getMemoryBuffer();
-      const pathBytes = mem.slice(pathPtr, pathPtr + pathLen);
-      const path = new TextDecoder().decode(pathBytes);
-      return BigInt(this.io.open(path, flags, mode));
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      const handle = this.io.openBytes
+        ? this.io.openBytes(path.bytes, flags, mode)
+        : this.io.open(path.display, flags, mode);
+      this.debugHandlePaths.set(handle, path.display);
+      if (this.isSqliteTestPath(path.display)) {
+        this.traceSqliteFs(`open ${path.display} flags=0x${(flags >>> 0).toString(16)} mode=0o${(mode >>> 0).toString(8)} handle=${handle}`);
+      }
+      return BigInt(handle);
     } catch (e) {
       return BigInt(negErrno(e));
     }
@@ -707,7 +750,13 @@ export class WasmPosixKernel {
     }
 
     try {
-      return this.io.close(h);
+      const path = this.debugHandlePaths.get(h);
+      const rc = this.io.close(h);
+      this.debugHandlePaths.delete(h);
+      if (this.isSqliteTestPath(path)) {
+        this.traceSqliteFs(`close handle=${h} path=${path}`);
+      }
+      return rc;
     } catch (e) {
       return negErrno(e);
     }
@@ -824,12 +873,58 @@ export class WasmPosixKernel {
     }
   }
 
+  private hostPread(
+    handle: bigint,
+    offsetLo: number,
+    offsetHi: number,
+    bufPtr: number,
+    bufLen: number,
+  ): number {
+    const h = Number(handle);
+    const offset = offsetHi * 0x100000000 + (offsetLo >>> 0);
+
+    if (h === 0) {
+      return this.hostRead(handle, bufPtr, bufLen);
+    }
+
+    try {
+      const mem = this.getMemoryBuffer();
+      const buf = mem.subarray(bufPtr, bufPtr + bufLen);
+      return this.io.read(h, buf, offset, bufLen);
+    } catch (e) {
+      return negErrno(e);
+    }
+  }
+
+  private hostPwrite(
+    handle: bigint,
+    offsetLo: number,
+    offsetHi: number,
+    bufPtr: number,
+    bufLen: number,
+  ): number {
+    const h = Number(handle);
+    const offset = offsetHi * 0x100000000 + (offsetLo >>> 0);
+
+    if (h === 1 || h === 2) {
+      return this.hostWrite(handle, bufPtr, bufLen);
+    }
+
+    try {
+      const mem = this.getMemoryBuffer();
+      const data = mem.slice(bufPtr, bufPtr + bufLen);
+      return this.io.write(h, data, offset, bufLen);
+    } catch (e) {
+      return negErrno(e);
+    }
+  }
+
   /**
    * host_fstat(handle: i64, stat_ptr) -> i32
    *
    * Writes a WasmStat structure into Wasm memory at stat_ptr.
    *
-   * WasmStat layout (repr(C), 88 bytes total):
+   * WasmStat layout (repr(C), 104 bytes total):
    *   0:  st_dev        u64
    *   8:  st_ino        u64
    *   16: st_mode       u32
@@ -846,12 +941,19 @@ export class WasmPosixKernel {
    *   72: st_ctime_sec  u64
    *   80: st_ctime_nsec u32
    *   84: _pad          u32
+   *   88: st_rdev       u64
+   *   96: st_blksize    i32
+   *   100: st_blocks    i32
    */
   private hostFstat(handle: bigint, statPtr: number): number {
     const h = Number(handle);
 
     try {
       const stat = this.io.fstat(h);
+      const path = this.debugHandlePaths.get(h);
+      if (path !== undefined) {
+        this.traceSqliteStat(`fstat handle=${h}`, path, stat);
+      }
       this.writeStatToMemory(statPtr, stat);
       return 0;
     } catch (e) {
@@ -892,7 +994,14 @@ export class WasmPosixKernel {
     const ctimeNsec = Math.floor((stat.ctimeMs % 1000) * 1_000_000);
     dv.setBigUint64(ptr + 72, BigInt(ctimeSec), true); // st_ctime_sec
     dv.setUint32(ptr + 80, ctimeNsec, true); // st_ctime_nsec
-    // _pad at offset 84 already zeroed
+    // _pad at offset 84 already zeroed.
+    dv.setBigUint64(ptr + 88, 0n, true); // st_rdev
+    dv.setInt32(ptr + 96, 4096, true); // st_blksize
+
+    const blocks = Number.isFinite(stat.size) && stat.size > 0
+      ? Math.min(0x7fffffff, Math.ceil(stat.size / 512))
+      : 0;
+    dv.setInt32(ptr + 100, blocks, true); // st_blocks
   }
 
   private writeStatfsToMemory(ptr: number, statfs: StatfsResult): void {
@@ -925,12 +1034,23 @@ export class WasmPosixKernel {
   // ---- Phase 2: Path-based and directory host imports ----
 
   /**
-   * Read a UTF-8 path string from Wasm memory.
+   * Read a POSIX path byte string from Wasm memory.
+   */
+  private readPathBytesFromMemory(ptr: number, len: number): Uint8Array {
+    const mem = this.getMemoryBuffer();
+    return mem.slice(ptr, ptr + len);
+  }
+
+  private readHostPathFromMemory(ptr: number, len: number): HostPath {
+    const bytes = this.readPathBytesFromMemory(ptr, len);
+    return { bytes, display: PATH_DECODER.decode(bytes) };
+  }
+
+  /**
+   * Read a path string from Wasm memory for string-only host callbacks.
    */
   private readPathFromMemory(ptr: number, len: number): string {
-    const mem = this.getMemoryBuffer();
-    const pathBytes = mem.slice(ptr, ptr + len);
-    return new TextDecoder().decode(pathBytes);
+    return this.readHostPathFromMemory(ptr, len).display;
   }
 
   /**
@@ -941,13 +1061,19 @@ export class WasmPosixKernel {
     pathLen: number,
     statPtr: number,
   ): number {
+    let path: HostPath | null = null;
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      const stat = this.io.stat(path);
+      path = this.readHostPathFromMemory(pathPtr, pathLen);
+      const stat = this.io.statBytes ? this.io.statBytes(path.bytes) : this.io.stat(path.display);
+      this.traceSqliteStat("stat", path.display, stat);
       this.writeStatToMemory(statPtr, stat);
       return 0;
     } catch (e) {
-      return negErrno(e);
+      const errno = negErrno(e);
+      if (this.isSqliteTestPath(path?.display)) {
+        this.traceSqliteFs(`stat ${path!.display} errno=${errno}`);
+      }
+      return errno;
     }
   }
 
@@ -959,13 +1085,19 @@ export class WasmPosixKernel {
     pathLen: number,
     statPtr: number,
   ): number {
+    let path: HostPath | null = null;
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      const stat = this.io.lstat(path);
+      path = this.readHostPathFromMemory(pathPtr, pathLen);
+      const stat = this.io.lstatBytes ? this.io.lstatBytes(path.bytes) : this.io.lstat(path.display);
+      this.traceSqliteStat("lstat", path.display, stat);
       this.writeStatToMemory(statPtr, stat);
       return 0;
     } catch (e) {
-      return negErrno(e);
+      const errno = negErrno(e);
+      if (this.isSqliteTestPath(path?.display)) {
+        this.traceSqliteFs(`lstat ${path!.display} errno=${errno}`);
+      }
+      return errno;
     }
   }
 
@@ -975,8 +1107,8 @@ export class WasmPosixKernel {
     statfsPtr: number,
   ): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      const statfs = this.io.statfs(path);
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      const statfs = this.io.statfsBytes ? this.io.statfsBytes(path.bytes) : this.io.statfs(path.display);
       this.writeStatfsToMemory(statfsPtr, statfs);
       return 0;
     } catch (e) {
@@ -992,12 +1124,21 @@ export class WasmPosixKernel {
     pathLen: number,
     mode: number,
   ): number {
+    let path: HostPath | null = null;
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.mkdir(path, mode);
+      path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.mkdirBytes) this.io.mkdirBytes(path.bytes, mode);
+      else this.io.mkdir(path.display, mode);
+      if (this.isSqliteTestPath(path.display)) {
+        this.traceSqliteFs(`mkdir ${path.display} mode=0o${(mode >>> 0).toString(8)} rc=0`);
+      }
       return 0;
     } catch (e) {
-      return negErrno(e);
+      const errno = negErrno(e);
+      if (this.isSqliteTestPath(path?.display)) {
+        this.traceSqliteFs(`mkdir ${path!.display} errno=${errno}`);
+      }
+      return errno;
     }
   }
 
@@ -1005,12 +1146,21 @@ export class WasmPosixKernel {
    * host_rmdir(path_ptr, path_len) -> i32
    */
   private hostRmdir(pathPtr: number, pathLen: number): number {
+    let path: HostPath | null = null;
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.rmdir(path);
+      path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.rmdirBytes) this.io.rmdirBytes(path.bytes);
+      else this.io.rmdir(path.display);
+      if (this.isSqliteTestPath(path.display)) {
+        this.traceSqliteFs(`rmdir ${path.display} rc=0`);
+      }
       return 0;
     } catch (e) {
-      return negErrno(e);
+      const errno = negErrno(e);
+      if (this.isSqliteTestPath(path?.display)) {
+        this.traceSqliteFs(`rmdir ${path!.display} errno=${errno}`);
+      }
+      return errno;
     }
   }
 
@@ -1019,8 +1169,9 @@ export class WasmPosixKernel {
    */
   private hostUnlink(pathPtr: number, pathLen: number): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.unlink(path);
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.unlinkBytes) this.io.unlinkBytes(path.bytes);
+      else this.io.unlink(path.display);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1037,9 +1188,10 @@ export class WasmPosixKernel {
     newLen: number,
   ): number {
     try {
-      const oldPath = this.readPathFromMemory(oldPtr, oldLen);
-      const newPath = this.readPathFromMemory(newPtr, newLen);
-      this.io.rename(oldPath, newPath);
+      const oldPath = this.readHostPathFromMemory(oldPtr, oldLen);
+      const newPath = this.readHostPathFromMemory(newPtr, newLen);
+      if (this.io.renameBytes) this.io.renameBytes(oldPath.bytes, newPath.bytes);
+      else this.io.rename(oldPath.display, newPath.display);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1056,9 +1208,10 @@ export class WasmPosixKernel {
     newLen: number,
   ): number {
     try {
-      const existingPath = this.readPathFromMemory(oldPtr, oldLen);
-      const newPath = this.readPathFromMemory(newPtr, newLen);
-      this.io.link(existingPath, newPath);
+      const existingPath = this.readHostPathFromMemory(oldPtr, oldLen);
+      const newPath = this.readHostPathFromMemory(newPtr, newLen);
+      if (this.io.linkBytes) this.io.linkBytes(existingPath.bytes, newPath.bytes);
+      else this.io.link(existingPath.display, newPath.display);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1075,9 +1228,10 @@ export class WasmPosixKernel {
     linkLen: number,
   ): number {
     try {
-      const target = this.readPathFromMemory(targetPtr, targetLen);
-      const linkPath = this.readPathFromMemory(linkPtr, linkLen);
-      this.io.symlink(target, linkPath);
+      const target = this.readHostPathFromMemory(targetPtr, targetLen);
+      const linkPath = this.readHostPathFromMemory(linkPtr, linkLen);
+      if (this.io.symlinkBytes) this.io.symlinkBytes(target.bytes, linkPath.bytes);
+      else this.io.symlink(target.display, linkPath.display);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1096,9 +1250,9 @@ export class WasmPosixKernel {
     bufLen: number,
   ): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      const target = this.io.readlink(path);
-      const encoded = new TextEncoder().encode(target);
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      const target = this.io.readlinkBytes ? this.io.readlinkBytes(path.bytes) : this.io.readlink(path.display);
+      const encoded = PATH_ENCODER.encode(target);
       const n = Math.min(encoded.length, bufLen);
       const mem = this.getMemoryBuffer();
       mem.set(encoded.subarray(0, n), bufPtr);
@@ -1117,8 +1271,9 @@ export class WasmPosixKernel {
     mode: number,
   ): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.chmod(path, mode);
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.chmodBytes) this.io.chmodBytes(path.bytes, mode);
+      else this.io.chmod(path.display, mode);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1135,8 +1290,9 @@ export class WasmPosixKernel {
     gid: number,
   ): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.chown(path, uid, gid);
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.chownBytes) this.io.chownBytes(path.bytes, uid, gid);
+      else this.io.chown(path.display, uid, gid);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1152,8 +1308,9 @@ export class WasmPosixKernel {
     amode: number,
   ): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.access(path, amode);
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.accessBytes) this.io.accessBytes(path.bytes, amode);
+      else this.io.access(path.display, amode);
       return 0;
     } catch (e) {
       return negErrno(e);
@@ -1172,11 +1329,15 @@ export class WasmPosixKernel {
     mtimeNsec: bigint,
   ): number {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      this.io.utimensat(path, Number(atimeSec), Number(atimeNsec), Number(mtimeSec), Number(mtimeNsec));
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      if (this.io.utimensatBytes) {
+        this.io.utimensatBytes(path.bytes, Number(atimeSec), Number(atimeNsec), Number(mtimeSec), Number(mtimeNsec));
+      } else {
+        this.io.utimensat(path.display, Number(atimeSec), Number(atimeNsec), Number(mtimeSec), Number(mtimeNsec));
+      }
       return 0;
-    } catch {
-      return -1;
+    } catch (e) {
+      return negErrno(e);
     }
   }
 
@@ -1239,8 +1400,8 @@ export class WasmPosixKernel {
    */
   private hostOpendir(pathPtr: number, pathLen: number): bigint {
     try {
-      const path = this.readPathFromMemory(pathPtr, pathLen);
-      return BigInt(this.io.opendir(path));
+      const path = this.readHostPathFromMemory(pathPtr, pathLen);
+      return BigInt(this.io.opendirBytes ? this.io.opendirBytes(path.bytes) : this.io.opendir(path.display));
     } catch (e) {
       return BigInt(negErrno(e));
     }
@@ -1267,7 +1428,7 @@ export class WasmPosixKernel {
       const mem = this.getMemoryBuffer();
 
       // Write WasmDirent: d_ino(u64) + d_type(u32) + d_namlen(u32)
-      const encoded = new TextEncoder().encode(dirEntry.name);
+      const encoded = dirEntry.nameBytes ?? PATH_ENCODER.encode(dirEntry.name);
       const n = Math.min(encoded.length, nameLen);
 
       dv.setBigUint64(direntPtr, BigInt(dirEntry.ino), true);
@@ -2108,8 +2269,12 @@ export class WasmPosixKernel {
     lenLo: number, lenHi: number,
     resultPtr: number,
   ): number {
+    const trace = typeof process !== "undefined" && !!process.env?.KERNEL_LOCK_TRACE;
     if (!this.sharedLockTable) {
       // No shared lock table — fall through (kernel handles locally)
+      if (trace) {
+        console.error(`[lock] no-shared-table pid=${pid} cmd=${cmd} type=${lockType}`);
+      }
       return 0;
     }
     try {
@@ -2118,6 +2283,7 @@ export class WasmPosixKernel {
       const pathHash = SharedLockTable.hashPath(path);
       const start = (BigInt(startHi) << 32n) | BigInt(startLo >>> 0);
       const len = (BigInt(lenHi) << 32n) | BigInt(lenLo >>> 0);
+      let rc = 0;
 
       switch (cmd) {
         case WasmPosixKernel.F_GETLK: {
@@ -2136,20 +2302,39 @@ export class WasmPosixKernel {
             // No conflict — write F_UNLCK
             dv.setUint32(resultPtr, WasmPosixKernel.F_UNLCK, true);
           }
-          return 0;
+          if (trace) {
+            const blockedBy = blocker ? ` blocked_by_pid=${blocker.pid} blocked_type=${blocker.lockType} blocked_start=${blocker.start} blocked_len=${blocker.len}` : "";
+            console.error(`[lock] pid=${pid} cmd=GETLK type=${lockType} start=${start} len=${len} hash=${pathHash}${blockedBy} path=${path} rc=0`);
+          }
+          return rc;
         }
         case WasmPosixKernel.F_SETLK: {
           const ok = this.sharedLockTable.setLock(pathHash, pid, lockType, start, len);
-          return ok ? 0 : -11; // -EAGAIN
+          rc = ok ? 0 : -11; // -EAGAIN
+          if (trace) {
+            console.error(`[lock] pid=${pid} cmd=SETLK type=${lockType} start=${start} len=${len} hash=${pathHash} path=${path} rc=${rc}`);
+          }
+          return rc;
         }
         case WasmPosixKernel.F_SETLKW: {
-          this.sharedLockTable.setLockWait(pathHash, pid, lockType, start, len);
-          return 0;
+          const ok = this.sharedLockTable.setLock(pathHash, pid, lockType, start, len);
+          rc = ok ? 0 : -11; // -EAGAIN; centralized kernel-worker retries without blocking the host
+          if (trace) {
+            console.error(`[lock] pid=${pid} cmd=SETLKW type=${lockType} start=${start} len=${len} hash=${pathHash} path=${path} rc=${rc}`);
+          }
+          return rc;
         }
         default:
-          return -22; // -EINVAL
+          rc = -22; // -EINVAL
+          if (trace) {
+            console.error(`[lock] pid=${pid} cmd=${cmd} type=${lockType} start=${start} len=${len} hash=${pathHash} path=${path} rc=${rc}`);
+          }
+          return rc;
       }
     } catch {
+      if (trace) {
+        console.error(`[lock] pid=${pid} cmd=${cmd} type=${lockType} rc=-5`);
+      }
       return -5; // -EIO
     }
   }

@@ -105,7 +105,7 @@ export const CH_SIG_HANDLER = 65564 as const;
 export const CH_SIG_FLAGS = 65568 as const;
 export const CH_SIG_OLD_MASK = 65576 as const;
 
-export const STRUCT_SIZE_WASM_STAT = 88 as const;
+export const STRUCT_SIZE_WASM_STAT = 104 as const;
 export const STRUCT_SIZE_WASM_DIRENT = 16 as const;
 export const STRUCT_SIZE_WASM_TIMESPEC = 16 as const;
 export const STRUCT_SIZE_WASM_POLL_FD = 8 as const;
@@ -566,18 +566,18 @@ export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
     { argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } },
   ],
   6: [
-    { argIndex: 1, direction: "out", size: { type: "fixed", size: 88 } },
+    { argIndex: 1, direction: "out", size: { type: "fixed", size: 104 } },
   ],
   9: [
     { argIndex: 0, direction: "out", size: { type: "fixed", size: 8 } },
   ],
   11: [
     { argIndex: 0, direction: "in", size: { type: "cstring" } },
-    { argIndex: 1, direction: "out", size: { type: "fixed", size: 88 } },
+    { argIndex: 1, direction: "out", size: { type: "fixed", size: 104 } },
   ],
   12: [
     { argIndex: 0, direction: "in", size: { type: "cstring" } },
-    { argIndex: 1, direction: "out", size: { type: "fixed", size: 88 } },
+    { argIndex: 1, direction: "out", size: { type: "fixed", size: 104 } },
   ],
   13: [
     { argIndex: 0, direction: "in", size: { type: "cstring" } },
@@ -724,7 +724,7 @@ export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
   ],
   93: [
     { argIndex: 1, direction: "in", size: { type: "cstring" } },
-    { argIndex: 2, direction: "out", size: { type: "fixed", size: 88 } },
+    { argIndex: 2, direction: "out", size: { type: "fixed", size: 104 } },
   ],
   94: [
     { argIndex: 1, direction: "in", size: { type: "cstring" } },

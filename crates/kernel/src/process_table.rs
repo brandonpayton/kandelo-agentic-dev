@@ -13,9 +13,11 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::ptr;
 use core::sync::atomic::AtomicI32;
 
 use wasm_posix_shared::Errno;
@@ -39,7 +41,7 @@ pub static FB0_OWNER: AtomicI32 = AtomicI32::new(-1);
 /// which process is currently being serviced (set by the JS host before
 /// calling `kernel_handle_channel`).
 pub struct ProcessTable {
-    pub(crate) processes: BTreeMap<u32, Process>,
+    pub(crate) processes: BTreeMap<u32, Box<Process>>,
     current_pid: u32,
     next_spawn_pid: u32,
     /// TID of the thread currently servicing a syscall. 0 means "main thread"
@@ -55,7 +57,7 @@ pub struct ProcessTable {
 /// during cleanup. The caller is `kernel_remove_process`, which has
 /// access to the raw `host_net_close` extern; this layer doesn't.
 pub struct RemoveProcessResult {
-    pub process: Process,
+    pub process: Box<Process>,
     /// Host net handles whose cross-process refcount reached 0 during
     /// teardown. The caller must invoke `host_net_close(h)` on each —
     /// this kernel-side bookkeeping intentionally doesn't touch the
@@ -236,14 +238,14 @@ impl ProcessTable {
         if self.processes.contains_key(&pid) {
             return Err(());
         }
-        self.processes.insert(pid, Process::new(pid));
+        self.processes.insert(pid, Process::new_boxed(pid));
         Ok(())
     }
 
     /// Ensure the virtual init process (pid 1) is present. Idempotent.
     pub fn ensure_init(&mut self) {
         if !self.processes.contains_key(&1) {
-            let mut init = Process::new(1);
+            let mut init = Process::new_boxed(1);
             init.ppid = 0;
             init.argv.push(alloc::vec::Vec::from(b"init".as_slice()));
             self.processes.insert(1, init);
@@ -267,6 +269,23 @@ impl ProcessTable {
         let result = self.remove_process_inner(pid, true)?;
         self.prune_empty_limbo_groups();
         Some(result)
+    }
+
+    /// Reap an exited direct child of `parent_pid`.
+    ///
+    /// This keeps the child ownership check and table mutation inside one
+    /// `&mut self` borrow, which avoids creating overlapping references to
+    /// the global process table in the wasm API.
+    pub fn reap_exited_child_of(
+        &mut self,
+        parent_pid: u32,
+        child_pid: u32,
+    ) -> Result<RemoveProcessResult, Errno> {
+        if !self.is_exited_child_of(parent_pid, child_pid) {
+            return Err(Errno::ECHILD);
+        }
+
+        self.reap_process(child_pid).ok_or(Errno::ESRCH)
     }
 
     fn remove_process_inner(
@@ -417,7 +436,8 @@ impl ProcessTable {
         pshared.cleanup_process(pid);
 
         if retain_limbo_leader && proc.pgid == pid && self.group_has_member(pid) {
-            self.processes.insert(pid, Self::limbo_process_from(&proc));
+            self.processes
+                .insert(pid, Self::limbo_process_from(proc.as_ref()));
         }
 
         Some(RemoveProcessResult {
@@ -432,32 +452,70 @@ impl ProcessTable {
         })
     }
 
-    fn limbo_process_from(proc: &Process) -> Process {
-        let mut limbo = Process::new(proc.pid);
-        limbo.ppid = proc.ppid;
-        limbo.uid = proc.uid;
-        limbo.gid = proc.gid;
-        limbo.euid = proc.euid;
-        limbo.egid = proc.egid;
-        limbo.pgid = proc.pgid;
-        limbo.sid = proc.sid;
-        limbo.is_session_leader = proc.is_session_leader;
-        limbo.state = ProcessState::Limbo;
-        limbo.exit_status = proc.exit_status;
-        limbo.cwd = proc.cwd.clone();
-        limbo.environ = proc.environ.clone();
-        limbo.argv = proc.argv.clone();
-        limbo.umask = proc.umask;
-        limbo.nice = proc.nice;
-        limbo.rlimits = proc.rlimits;
-        limbo.thread_name = proc.thread_name;
-        limbo.has_exec = proc.has_exec;
+    #[inline(never)]
+    fn limbo_process_from(proc: &Process) -> Box<Process> {
+        let mut boxed = Box::<Process>::new_uninit();
+        let slot = boxed.as_mut_ptr();
 
-        // Process::new preopens stdio; limbo records must not own any
-        // resources because teardown already ran for the real process.
-        limbo.fd_table = crate::fd::FdTable::new();
-        limbo.ofd_table = crate::ofd::OfdTable::new();
-        limbo
+        // Limbo records preserve identity/group metadata for getpgid/setpgid
+        // after wait consumes a group leader. They must not retain any live
+        // process resources because teardown for the real process already ran.
+        unsafe {
+            ptr::addr_of_mut!((*slot).pid).write(proc.pid);
+            ptr::addr_of_mut!((*slot).ppid).write(proc.ppid);
+            ptr::addr_of_mut!((*slot).uid).write(proc.uid);
+            ptr::addr_of_mut!((*slot).gid).write(proc.gid);
+            ptr::addr_of_mut!((*slot).euid).write(proc.euid);
+            ptr::addr_of_mut!((*slot).egid).write(proc.egid);
+            ptr::addr_of_mut!((*slot).pgid).write(proc.pgid);
+            ptr::addr_of_mut!((*slot).sid).write(proc.sid);
+            ptr::addr_of_mut!((*slot).is_session_leader).write(proc.is_session_leader);
+            ptr::addr_of_mut!((*slot).state).write(ProcessState::Limbo);
+            ptr::addr_of_mut!((*slot).exit_status).write(proc.exit_status);
+            ptr::addr_of_mut!((*slot).fd_table).write(crate::fd::FdTable::new());
+            ptr::addr_of_mut!((*slot).ofd_table).write(crate::ofd::OfdTable::new());
+            ptr::addr_of_mut!((*slot).lock_table).write(crate::lock::LockTable::new());
+            ptr::addr_of_mut!((*slot).pipes).write(Vec::new());
+            ptr::addr_of_mut!((*slot).sockets).write(crate::socket::SocketTable::new());
+            ptr::addr_of_mut!((*slot).cwd).write(proc.cwd.clone());
+            ptr::addr_of_mut!((*slot).dir_streams).write(Vec::new());
+            ptr::addr_of_mut!((*slot).signals).write(crate::signal::SignalState::new());
+            ptr::addr_of_mut!((*slot).memory).write(crate::memory::MemoryManager::new());
+            ptr::addr_of_mut!((*slot).terminal).write(crate::terminal::TerminalState::new());
+            ptr::addr_of_mut!((*slot).environ).write(proc.environ.clone());
+            ptr::addr_of_mut!((*slot).argv).write(proc.argv.clone());
+            ptr::addr_of_mut!((*slot).umask).write(proc.umask);
+            ptr::addr_of_mut!((*slot).nice).write(proc.nice);
+            ptr::addr_of_mut!((*slot).rlimits).write(proc.rlimits);
+            ptr::addr_of_mut!((*slot).alarm_deadline_ns).write(0);
+            ptr::addr_of_mut!((*slot).alarm_interval_ns).write(0);
+            ptr::addr_of_mut!((*slot).thread_name).write(proc.thread_name);
+            ptr::addr_of_mut!((*slot).fork_child).write(false);
+            ptr::addr_of_mut!((*slot).sigsuspend_saved_mask).write(None);
+            ptr::addr_of_mut!((*slot).fork_exec_path).write(None);
+            ptr::addr_of_mut!((*slot).fork_exec_argv).write(None);
+            ptr::addr_of_mut!((*slot).fork_fd_actions).write(Vec::new());
+            ptr::addr_of_mut!((*slot).next_ephemeral_port).write(49152);
+            ptr::addr_of_mut!((*slot).threads).write(Vec::new());
+            ptr::addr_of_mut!((*slot).next_tid).write(0);
+            ptr::addr_of_mut!((*slot).eventfds).write(Vec::new());
+            ptr::addr_of_mut!((*slot).epolls).write(Vec::new());
+            ptr::addr_of_mut!((*slot).timerfds).write(Vec::new());
+            ptr::addr_of_mut!((*slot).signalfds).write(Vec::new());
+            ptr::addr_of_mut!((*slot).posix_timers).write(Vec::new());
+            ptr::addr_of_mut!((*slot).alt_stack_sp).write(0);
+            ptr::addr_of_mut!((*slot).alt_stack_flags).write(2);
+            ptr::addr_of_mut!((*slot).alt_stack_size).write(0);
+            ptr::addr_of_mut!((*slot).alt_stack_depth).write(0);
+            ptr::addr_of_mut!((*slot).fork_pipe_replay).write(Vec::new());
+            ptr::addr_of_mut!((*slot).memfds).write(Vec::new());
+            ptr::addr_of_mut!((*slot).procfs_bufs).write(Vec::new());
+            ptr::addr_of_mut!((*slot).has_exec).write(proc.has_exec);
+            ptr::addr_of_mut!((*slot).fb_binding).write(None);
+            ptr::addr_of_mut!((*slot).fork_count).write(0);
+
+            boxed.assume_init()
+        }
     }
 
     pub fn prune_empty_limbo_groups(&mut self) {
@@ -501,12 +559,27 @@ impl ProcessTable {
 
     /// Get a mutable reference to the current process.
     pub fn current_process(&mut self) -> Option<&mut Process> {
-        self.processes.get_mut(&self.current_pid)
+        self.processes.get_mut(&self.current_pid).map(Box::as_mut)
+    }
+
+    /// Return whether a process table entry exists for this pid.
+    pub fn has_process(&self, pid: u32) -> bool {
+        self.processes.contains_key(&pid)
     }
 
     /// Get a mutable reference to a process by pid.
     pub fn get_mut(&mut self, pid: u32) -> Option<&mut Process> {
-        self.processes.get_mut(&pid)
+        self.processes.get_mut(&pid).map(Box::as_mut)
+    }
+
+    /// Replace an existing process table entry without moving the Process
+    /// record through the wasm stack.
+    pub fn replace_process(&mut self, pid: u32, process: Box<Process>) -> Result<(), Errno> {
+        if !self.processes.contains_key(&pid) {
+            return Err(Errno::ESRCH);
+        }
+        self.processes.insert(pid, process);
+        Ok(())
     }
 
     /// Fork a process: serialize the parent's state and deserialize it as the child.
@@ -523,7 +596,9 @@ impl ProcessTable {
         buf.resize(64 * 1024, 0u8); // 64KB should be plenty
         let written = crate::fork::serialize_fork_state(parent, &mut buf)?;
 
-        // Deserialize as child
+        // Deserialize directly into heap storage. Fork can run deep inside
+        // syscall dispatch; avoid placing a full Process value on the wasm
+        // linear-memory stack before inserting into the boxed table.
         let mut child = crate::fork::deserialize_fork_state(&buf[..written], child_pid)?;
 
         // Bump cross-process refcounts on inherited fd state (host handles,
@@ -602,7 +677,7 @@ impl ProcessTable {
         };
 
         let child_pid = self.allocate_spawn_pid();
-        let mut child = Process::new(child_pid);
+        let mut child = Process::new_boxed(child_pid);
 
         // ── POSIX-required inheritance ─────────────────────────────────
         child.ppid = parent_pid;
@@ -800,7 +875,7 @@ impl ProcessTable {
 
     /// Get a reference to a process by pid.
     pub fn get(&self, pid: u32) -> Option<&Process> {
-        self.processes.get(&pid)
+        self.processes.get(&pid).map(Box::as_ref)
     }
 
     /// Collect all active PIDs.
@@ -965,6 +1040,34 @@ mod wait_tests {
 
         assert!(table.get(101).is_none());
         assert_eq!(table.get(102).unwrap().pgid, 101);
+    }
+
+    #[test]
+    fn reap_exited_child_of_reaps_only_exited_direct_child() {
+        let mut table = ProcessTable::new();
+        table.create_process(100).unwrap();
+        table.fork_process(100, 101).unwrap();
+        table.fork_process(100, 102).unwrap();
+        table.processes.get_mut(&101).unwrap().state = ProcessState::Exited;
+
+        let result = table
+            .reap_exited_child_of(100, 101)
+            .expect("reap exited child");
+
+        assert_eq!(result.process.pid, 101);
+        assert!(table.get(101).is_none());
+        assert!(matches!(
+            table.reap_exited_child_of(100, 102),
+            Err(Errno::ECHILD)
+        ));
+        assert!(matches!(
+            table.reap_exited_child_of(102, 101),
+            Err(Errno::ECHILD)
+        ));
+        assert!(matches!(
+            table.reap_exited_child_of(100, 999),
+            Err(Errno::ECHILD)
+        ));
     }
 }
 

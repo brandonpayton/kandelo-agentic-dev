@@ -2052,9 +2052,24 @@
           "name": "_pad",
           "offset": 84,
           "span": 4
+        },
+        {
+          "name": "st_rdev",
+          "offset": 88,
+          "span": 8
+        },
+        {
+          "name": "st_blksize",
+          "offset": 96,
+          "span": 4
+        },
+        {
+          "name": "st_blocks",
+          "offset": 100,
+          "span": 4
         }
       ],
-      "size": 88
+      "size": 104
     },
     "WasmStatfs": {
       "fields": [
@@ -2302,7 +2317,7 @@
         "argIndex": 1,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
@@ -2375,7 +2390,7 @@
         "argIndex": 1,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
@@ -3374,7 +3389,7 @@
         "argIndex": 1,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
@@ -3574,7 +3589,7 @@
         "argIndex": 2,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
