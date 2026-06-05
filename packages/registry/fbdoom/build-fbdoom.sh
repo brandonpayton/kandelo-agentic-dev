@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile maximevince/fbDOOM for the kandelo using
+# Cross-compile maximevince/fbDOOM for Kandelo using
 # wasm32posix-cc. The fbdev frontend writes BGRA32 pixels into the
 # framebuffer mmap; the canvas renderer (host/src/framebuffer/canvas-renderer.ts)
 # consumes them.
@@ -18,6 +18,29 @@ CDOOM_SRC="$HERE/chocolate-doom-src"
 # when removing SDL; we vendor them back so the music path compiles.
 CDOOM_COMMIT="35fb1372d10756ca27eca05665bd8a7cebc71c05" # chocolate-doom-3.1.0
 
+# Vendored net sources from chocolate-doom needed by
+# patches/0007-i_net-posix.patch. fbDOOM kept the multiplayer headers but
+# dropped the implementations when it removed SDL; we vendor them back so
+# FEATURE_MULTIPLAYER can use a POSIX UDP transport over Kandelo's WebRTC
+# relay. Skipped intentionally: net_dedicated.{c,h} (headless server),
+# net_gui.c (textscreen UI; patch provides NET_WaitForLaunch), and net_sdl.c
+# (replaced by net_posix.c).
+CDOOM_NET_FILES=(
+    aes_prng.c aes_prng.h
+    d_loop.h
+    net_client.c net_client.h
+    net_common.c net_common.h
+    net_defs.h
+    net_io.c net_io.h
+    net_loop.c net_loop.h
+    net_packet.c net_packet.h
+    net_petname.c net_petname.h
+    net_query.c net_query.h
+    net_sdl.h
+    net_server.c net_server.h
+    net_structrw.c net_structrw.h
+)
+
 # Use this worktree's SDK and sysroot rather than the global `npm link`
 # (which may point at a sibling worktree without our linux/fb.h overlay).
 source "$REPO_ROOT/sdk/activate.sh"
@@ -28,12 +51,43 @@ if [ ! -d "$SRC" ]; then
     git clone --depth 1 https://github.com/maximevince/fbDOOM "$SRC"
 fi
 
-# Sentinel — last file added by patches/0005-add-music-support.patch. If
-# it's present, the source tree is already fully vendored + patched and
-# we skip both steps. Re-vendoring would clobber 0004's edits to
-# opl.c/opl_internal.h/midifile.c. To force a re-apply (e.g. when
-# iterating on patches), `rm -rf packages/registry/fbdoom/fbdoom-src`.
-SENTINEL="$SRC/fbdoom/opl/opl_kernel.c"
+# Sentinels for patch groups. Existing local source trees may have the
+# audio/music patches but not the multiplayer patch; keep this incremental so
+# developers do not have to delete fbdoom-src when this package gains net_posix.
+MUSIC_SENTINEL="$SRC/fbdoom/opl/opl_kernel.c"
+NET_SENTINEL="$SRC/fbdoom/net_posix.c"
+
+ensure_chocolate_doom() {
+    if [ ! -d "$CDOOM_SRC" ]; then
+        echo "==> Cloning chocolate-doom @ $CDOOM_COMMIT for vendored sources..."
+        # Shallow-by-commit needs `--filter=blob:none` since github
+        # archives don't carry refs/tags reachability for arbitrary SHAs.
+        git clone --filter=blob:none --no-checkout \
+            https://github.com/chocolate-doom/chocolate-doom "$CDOOM_SRC"
+        (cd "$CDOOM_SRC" && git checkout "$CDOOM_COMMIT")
+    elif [ "$(cd "$CDOOM_SRC" && git rev-parse HEAD)" != "$CDOOM_COMMIT" ]; then
+        echo "==> Re-pinning chocolate-doom to $CDOOM_COMMIT..."
+        (cd "$CDOOM_SRC" && git fetch && git checkout "$CDOOM_COMMIT")
+    fi
+}
+
+vendor_music_sources() {
+    echo "==> Vendoring OPL/MIDI/MUS sources from chocolate-doom..."
+    mkdir -p "$SRC/fbdoom/opl"
+    for f in opl.c opl.h opl3.c opl3.h opl_internal.h opl_queue.c opl_queue.h; do
+        cp "$CDOOM_SRC/opl/$f" "$SRC/fbdoom/opl/$f"
+    done
+    for f in mus2mid.c mus2mid.h midifile.c midifile.h; do
+        cp "$CDOOM_SRC/src/$f" "$SRC/fbdoom/$f"
+    done
+}
+
+vendor_net_sources() {
+    echo "==> Vendoring multiplayer NET sources from chocolate-doom..."
+    for f in "${CDOOM_NET_FILES[@]}"; do
+        cp "$CDOOM_SRC/src/$f" "$SRC/fbdoom/$f"
+    done
+}
 
 apply_patches() {
     local mode="${1:-strict}"
@@ -53,32 +107,23 @@ apply_patches() {
     done
 }
 
-if [ -e "$SENTINEL" ]; then
-    echo "==> Source tree already vendored (sentinel present); checking patches."
-    apply_patches lenient
-else
-    if [ ! -d "$CDOOM_SRC" ]; then
-        echo "==> Cloning chocolate-doom @ $CDOOM_COMMIT for music sources..."
-        # Shallow-by-commit needs `--filter=blob:none` since github
-        # archives don't carry refs/tags reachability for arbitrary SHAs.
-        git clone --filter=blob:none --no-checkout \
-            https://github.com/chocolate-doom/chocolate-doom "$CDOOM_SRC"
-        (cd "$CDOOM_SRC" && git checkout "$CDOOM_COMMIT")
-    elif [ "$(cd "$CDOOM_SRC" && git rev-parse HEAD)" != "$CDOOM_COMMIT" ]; then
-        echo "==> Re-pinning chocolate-doom to $CDOOM_COMMIT..."
-        (cd "$CDOOM_SRC" && git fetch && git checkout "$CDOOM_COMMIT")
+needs_music=0
+needs_net=0
+[ -e "$MUSIC_SENTINEL" ] || needs_music=1
+[ -e "$NET_SENTINEL" ] || needs_net=1
+
+if [ "$needs_music" -eq 1 ] || [ "$needs_net" -eq 1 ]; then
+    ensure_chocolate_doom
+    [ "$needs_music" -eq 0 ] || vendor_music_sources
+    [ "$needs_net" -eq 0 ] || vendor_net_sources
+    if [ "$needs_music" -eq 1 ] && [ "$needs_net" -eq 1 ]; then
+        apply_patches strict
+    else
+        apply_patches lenient
     fi
-
-    echo "==> Vendoring OPL/MIDI/MUS sources from chocolate-doom..."
-    mkdir -p "$SRC/fbdoom/opl"
-    for f in opl.c opl.h opl3.c opl3.h opl_internal.h opl_queue.c opl_queue.h; do
-        cp "$CDOOM_SRC/opl/$f" "$SRC/fbdoom/opl/$f"
-    done
-    for f in mus2mid.c mus2mid.h midifile.c midifile.h; do
-        cp "$CDOOM_SRC/src/$f" "$SRC/fbdoom/$f"
-    done
-
-    apply_patches strict
+else
+    echo "==> Source tree already vendored (sentinels present); checking patches."
+    apply_patches lenient
 fi
 
 cd "$SRC/fbdoom"
@@ -121,7 +166,7 @@ echo "==> fbdoom.wasm built."
 #
 # No IWAD is bundled. The browser demo fetches the DOOM shareware
 # `doom1.wad` at page load (id Software, freely redistributable) and
-# caches it via the Cache API — see apps/browser-demos/pages/doom/main.ts.
+# caches it via the Cache API — see apps/browser-demos/pages/doom-mp/main.ts.
 cd "$REPO_ROOT"
 source "$REPO_ROOT/scripts/install-local-binary.sh"
 install_local_binary fbdoom "$HERE/fbdoom.wasm" fbdoom.wasm

@@ -149,6 +149,7 @@ Located in `apps/browser-demos/pages/`:
 | benchmark | (per-suite) | legacy spawn | Micro-benchmarks + WordPress + Erlang ring |
 | network | dash + GNU Netcat + curl | `kernel.boot` x 3 | Boots multiple local Kandelo machines and verifies UDP datagrams, TCP streams, and HTTP over virtual TCP |
 | doom | fbDOOM | legacy spawn | `/dev/fb0` framebuffer + canvas renderer + keyboard via stdin + mouse via `/dev/input/mice` (pointer-locked) + SFX **and** OPL2-synthesized music via `/dev/dsp` → AudioContext. The shareware `doom1.wad` is **fetched at page load** from a Linux-distro mirror (SHA-256 verified, Cache API cached); no IWAD ships in the package archive. |
+| doom-mp | fbDOOM multiplayer | browser WebRTC page | Two separate browsers exchange manual SDP, use Google STUN (`stun:stun.l.google.com:19302`), and relay fbDOOM's POSIX UDP over an unreliable `RTCDataChannel`; see `docs/multiplayer-doom-webrtc.md`. |
 
 The "Boot pattern" column reflects how the demo enters the kernel:
 - **`kernel.boot`** — `kernelOwnedFs: true`, exec the language interpreter as the first process.
