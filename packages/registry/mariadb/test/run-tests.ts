@@ -182,7 +182,7 @@ async function main() {
     console.error(`Thread module ready.`);
 
     // Create data directory
-    const dataDir = resolve(scriptDir, "test-data");
+    const dataDir = resolve(process.env.MARIADB_TEST_DATA_DIR ?? resolve(scriptDir, "test-data"));
     mkdirSync(resolve(dataDir, "mysql"), { recursive: true });
     mkdirSync(resolve(dataDir, "tmp"), { recursive: true });
     tmpTestDir = resolve(dataDir, "tmp", "mysqltest");

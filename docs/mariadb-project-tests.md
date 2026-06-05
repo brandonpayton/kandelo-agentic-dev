@@ -35,6 +35,14 @@ Each run emits:
 - `summary.md` — markdown table for PR descriptions.
 - `summary.json` — same counts for scripts.
 
+For the Node host, the wrapper also assigns a fresh
+`MARIADB_TEST_DATA_DIR` under the results directory for each chunk (or for the
+single non-chunked run). This keeps repeated full-suite runs and chunk retries
+from sharing MariaDB datadir state. The lower-level
+`packages/registry/mariadb/test/run-tests.ts` runner still defaults to its
+historical `packages/registry/mariadb/test/test-data` path when invoked
+directly without `MARIADB_TEST_DATA_DIR`.
+
 ## Prerequisites
 
 Either fetch release binaries for the active ABI or build them locally:
@@ -56,9 +64,10 @@ On minimal Linux runners, Playwright also needs system browser libraries
   1/1.
 - Node full unchunked: reached 59/1183 results before the Node process was
   killed by the runner (exit 137): 21 PASS, 1 FAIL, 13 XFAIL, 6 XPASS, 18 SKIP.
-- Node full chunked: chunk 1/48 completed with 25 results: 13 PASS, 0 FAIL,
-  6 XFAIL, 4 XPASS, 2 SKIP. The chunked mode is the recommended reusable path
-  for completing the full suite under memory pressure.
-- Browser host on this runner did not reach MariaDB because Chromium could not
-  launch: missing `libatk-1.0.so.0`. Harness/Vite startup is now diagnosed in
-  the browser log.
+- Node full chunked: the current reusable path is
+  `--all --chunk-size 10 --timeout-ms 60000`; a full run is in progress in the
+  PR branch and should be treated as the source of current counts in the PR
+  description.
+- Browser smoke: `scripts/run-mariadb-project-tests.sh --host browser 1st`
+  passes 1/1 after launching Chromium with this container's local Playwright
+  dependency library path. Full browser counts are pending the full run.

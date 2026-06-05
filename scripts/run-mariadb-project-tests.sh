@@ -196,6 +196,12 @@ run_host() {
       chunk=$((chunk + 1))
       local chunk_tests=("${all_tests[@]:start:CHUNK_SIZE}")
       local cmd=("${base_cmd[@]}" "${chunk_tests[@]}")
+      if [ "$h" = "node" ]; then
+        local chunk_data_dir="$RESULTS_DIR/node-test-data/chunk-$chunk"
+        rm -rf "$chunk_data_dir"
+        mkdir -p "$chunk_data_dir"
+        cmd=(env "MARIADB_TEST_DATA_DIR=$chunk_data_dir" "${cmd[@]}")
+      fi
       echo "" | tee -a "$log"
       echo "===== Chunk $chunk: tests $((start + 1))-$((start + ${#chunk_tests[@]})) of $total =====" | tee -a "$log"
       echo "Command: TEST_TIMEOUT=${TIMEOUT_MS:-<default>} ${cmd[*]}" | tee -a "$log"
@@ -207,6 +213,12 @@ run_host() {
     local cmd=("${base_cmd[@]}")
     if $ALL_MODE; then cmd+=(--all); fi
     cmd+=("${TEST_ARGS[@]}")
+    if [ "$h" = "node" ]; then
+      local host_data_dir="$RESULTS_DIR/node-test-data/full"
+      rm -rf "$host_data_dir"
+      mkdir -p "$host_data_dir"
+      cmd=(env "MARIADB_TEST_DATA_DIR=$host_data_dir" "${cmd[@]}")
+    fi
     echo "Command: TEST_TIMEOUT=${TIMEOUT_MS:-<default>} ${cmd[*]}" | tee -a "$log"
     if ! run_command_logged "$log" "${cmd[@]}"; then
       status=1
