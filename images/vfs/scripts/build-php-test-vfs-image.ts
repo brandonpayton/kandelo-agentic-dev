@@ -2,7 +2,7 @@
  * Build a VFS image for running php-src PHPT runtime tests in the browser.
  *
  * The image contains:
- *   - /bin/sh and coreutils for PHP's shell-backed exec APIs
+ *   - /bin/sh plus standard shell utilities for PHP's shell-backed exec APIs
  *   - /usr/local/bin/php
  *   - /php-src/<test directories containing .phpt files>
  *
@@ -31,6 +31,8 @@ const DASH_WASM = process.env.DASH_WASM
   ?? tryResolveBinary("programs/dash.wasm");
 const COREUTILS_WASM = process.env.COREUTILS_WASM
   ?? tryResolveBinary("programs/coreutils.wasm");
+const SED_WASM = process.env.SED_WASM
+  ?? tryResolveBinary("programs/sed.wasm");
 const OUT_FILE = process.env.PHP_TEST_VFS_OUT
   ?? join(REPO_ROOT, "apps/browser-demos/public/php-test.vfs.zst");
 const FS_INITIAL_BYTES = Number(process.env.PHP_TEST_VFS_INITIAL_BYTES ?? 256 * 1024 * 1024);
@@ -101,6 +103,9 @@ async function main() {
   if (!COREUTILS_WASM || !existsSync(COREUTILS_WASM)) {
     throw new Error("coreutils.wasm not found. Run: scripts/fetch-binaries.sh or set COREUTILS_WASM");
   }
+  if (!SED_WASM || !existsSync(SED_WASM)) {
+    throw new Error("sed.wasm not found. Run: scripts/fetch-binaries.sh or set SED_WASM");
+  }
   const phpSrc = resolvePhpSource();
   if (!existsSync(phpSrc)) {
     throw new Error(`php-src not found at ${phpSrc}`);
@@ -130,6 +135,9 @@ async function main() {
   }
   symlink(fs, "/usr/bin/coreutils", "/bin/[");
   symlink(fs, "/usr/bin/coreutils", "/usr/bin/[");
+
+  writeVfsBinary(fs, "/usr/bin/sed", new Uint8Array(readFileSync(SED_WASM)));
+  symlink(fs, "/usr/bin/sed", "/bin/sed");
 
   writeVfsBinary(fs, "/usr/local/bin/php", new Uint8Array(readFileSync(PHP_WASM)));
 

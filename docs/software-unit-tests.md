@@ -34,30 +34,31 @@ directory at `/kandelo-bin`, and runs tests from `/php-src` to match upstream
 `run-tests.php` working-directory semantics. The browser host uses the
 `php-test` Vite page and `apps/browser-demos/public/php-test.vfs.zst`; rebuild
 that image after changing the PHP source, PHP binary, kernel, shell, or
-coreutils inputs.
+utility binary inputs.
 
 Recommended commands while iterating:
 
 ```bash
-# Node host. Shard full runs; SKIP_SLOW_TESTS is an upstream PHPT control env.
-SKIP_SLOW_TESTS=1 scripts/run-php-upstream-tests.sh \
+# Node host. Shard full runs; SKIP_* vars are upstream PHPT control env.
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   --host node --all --shard 1/16 --timeout 180000 --json
 
 # Browser host. Requires Playwright's shared library deps on this AO runner.
 LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
-SKIP_SLOW_TESTS=1 scripts/run-php-upstream-tests.sh \
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   --host browser --all --shard 1/16 --timeout 180000 --json
 
 # Rebuild the browser PHPT VFS image. The image includes /bin/sh and
-# coreutils so PHP shell-backed APIs such as system()/exec() work.
+# standard utilities so PHP shell-backed APIs such as system()/exec() work.
 LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
 scripts/run-php-upstream-tests.sh \
   --host browser --rebuild-vfs --limit 3 --timeout 90000 --json
 ```
 
 The browser VFS builder resolves `php.wasm`, `dash.wasm`, and
-`coreutils.wasm` via the normal binary resolver. If a local binary cache is
-stale, set `PHP_WASM`, `DASH_WASM`, or `COREUTILS_WASM` explicitly.
+`coreutils.wasm`, and `sed.wasm` via the normal binary resolver. If a local
+binary cache is stale, set `PHP_WASM`, `DASH_WASM`, `COREUTILS_WASM`, or
+`SED_WASM` explicitly.
 
 Kernel/POSIX fixes found by PHPT so far in the current PR:
 
@@ -83,6 +84,12 @@ Kernel/POSIX fixes found by PHPT so far in the current PR:
   and `--CLEAN--`, PHP-style trim removes edge NUL bytes for EXPECT matching,
   and selected upstream control env vars such as `SKIP_SLOW_TESTS` pass through
   to guest PHP.
+- Stream/socket behavior now covers the standard cases exercised by PHP's
+  stream suite: abstract AF_UNIX addresses are not filesystem-backed, UDP
+  `INADDR_ANY` destinations route to loopback, AF_INET6 loopback sockaddrs are
+  round-tripped, accepted sockets preserve Kandelo's nonblocking status
+  contract, and malformed numeric IPv4 names fail resolution instead of being
+  treated as browser synthetic DNS names.
 
 ## 2026-06-02 SQLite Allocator Status
 
