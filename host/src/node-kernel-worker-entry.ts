@@ -387,6 +387,7 @@ function readExecFromVfs(path: string): ArrayBuffer | null {
       if (n <= 0) break;
       offset += n;
     }
+    if (offset === 0 && st.size > 0) return null;
     return bytes.slice(0, offset).buffer;
   } catch {
     return null;
@@ -406,6 +407,10 @@ async function resolveExecFromRootfs(
 
   const lazy = rootfsMemfs.getLazyEntry(path);
   if (lazy) {
+    // Lazy rootfs entries are placeholders: their stat size is the expected
+    // materialized size, but the in-image file body is intentionally empty.
+    // If the backing asset cannot be loaded, do not fall through and hand an
+    // empty placeholder to WebAssembly as if it were an executable.
     return readLazyExecBytes(lazy.url);
   }
 
@@ -426,6 +431,7 @@ async function resolveExecFromRootfs(
         if (n <= 0) break;
         offset += n;
       }
+      if (offset === 0 && st.size > 0) return null;
       return bufferToArrayBuffer(bytes.subarray(0, offset));
     } finally {
       rootfsMemfs.close(fd);
@@ -534,7 +540,7 @@ function buildVirtualPlatformIO(
   shmfs.chmod("/", 0o1777);
   const extras: MountConfig[] = (extraMounts ?? []).map((m) => ({
     mountPoint: m.mountPoint,
-    backend: new HostFileSystem(m.hostPath),
+    backend: new HostFileSystem(m.hostPath, m.mountPoint),
     readonly: m.readonly,
   }));
   const mounts = [

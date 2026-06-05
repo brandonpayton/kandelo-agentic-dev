@@ -46,7 +46,7 @@ export function resolveForNode(
     } else {
       const hostDir = join(sessionDir, m.path);
       mkdirSync(hostDir, { recursive: true, mode: m.mode });
-      const backend = new HostFileSystem(hostDir);
+      const backend = new HostFileSystem(hostDir, m.path);
       if (m.mode !== undefined) backend.chmod("/", m.mode);
       if (m.uid !== undefined || m.gid !== undefined) {
         backend.chown("/", m.uid ?? 0, m.gid ?? 0);

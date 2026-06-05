@@ -45,6 +45,7 @@ export class VirtualPlatformIO implements PlatformIO {
     backend: FileSystemBackend;
     relativePath: string;
   } {
+    path = this.resolveMountRootDotDot(path);
     for (const m of this.mounts) {
       if (m.prefix === "/") {
         return { backend: m.backend, relativePath: path };
@@ -56,6 +57,44 @@ export class VirtualPlatformIO implements PlatformIO {
       }
     }
     throw new Error(`ENOENT: no mount for path: ${path}`);
+  }
+
+  private isMountPoint(path: string): boolean {
+    return this.mounts.some((m) => m.prefix === path);
+  }
+
+  private resolveMountRootDotDot(path: string): string {
+    if (!path.includes("..")) return path;
+
+    const parts: string[] = [];
+    let changed = false;
+    for (const part of path.split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part !== "..") {
+        parts.push(part);
+        continue;
+      }
+
+      const currentPath = parts.length === 0 ? "/" : `/${parts.join("/")}`;
+      if (currentPath === "/") {
+        changed = true;
+        continue;
+      }
+      if (this.isMountPoint(currentPath)) {
+        parts.pop();
+        changed = true;
+        continue;
+      }
+
+      // Do not lexically collapse arbitrary existing-or-missing backend
+      // components. POSIX must first look them up before `..` can step out;
+      // backend component walkers enforce that.
+      return path;
+    }
+
+    if (!changed) return path;
+    const resolved = parts.length === 0 ? "/" : `/${parts.join("/")}`;
+    return path.endsWith("/") && resolved !== "/" ? `${resolved}/` : resolved;
   }
 
   private resolveTwoPaths(

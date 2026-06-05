@@ -603,10 +603,23 @@ fn parent_path(path: &[u8]) -> Vec<u8> {
     if path == b"/" {
         return alloc::vec![b'/'];
     }
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let path = &path[..end];
     match path.iter().rposition(|&b| b == b'/') {
         Some(0) | None => alloc::vec![b'/'],
         Some(pos) => path[..pos].to_vec(),
     }
+}
+
+fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    &path[..end]
 }
 
 fn check_search_dir(proc: &Process, host: &mut dyn HostIO, path: &[u8]) -> Result<(), Errno> {
@@ -618,6 +631,13 @@ fn check_search_dir(proc: &Process, host: &mut dyn HostIO, path: &[u8]) -> Resul
 }
 
 fn check_search_path(proc: &Process, host: &mut dyn HostIO, path: &[u8]) -> Result<(), Errno> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    let trimmed = trim_trailing_slashes(path);
+    if trimmed.len() != path.len() {
+        return check_search_dir_chain(proc, host, trimmed);
+    }
     let parent = parent_path(path);
     check_search_dir_chain(proc, host, &parent)
 }
@@ -638,6 +658,9 @@ fn check_search_dir_chain(proc: &Process, host: &mut dyn HostIO, dir: &[u8]) -> 
 }
 
 fn check_parent_writable(proc: &Process, host: &mut dyn HostIO, path: &[u8]) -> Result<(), Errno> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
     let parent = parent_path(path);
     check_search_dir_chain(proc, host, &parent)?;
     let st = host.host_stat(&parent)?;
@@ -645,6 +668,9 @@ fn check_parent_writable(proc: &Process, host: &mut dyn HostIO, path: &[u8]) -> 
 }
 
 fn check_sticky_child(proc: &Process, host: &mut dyn HostIO, path: &[u8]) -> Result<(), Errno> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
     let parent = parent_path(path);
     let parent_st = host.host_stat(&parent)?;
     if parent_st.st_mode & S_ISVTX == 0 || proc.euid == 0 {
@@ -910,12 +936,12 @@ pub fn sys_close(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<(
 
     // POSIX: closing any fd for a file releases all advisory locks on that file
     // held by this process, regardless of which fd acquired the lock.
-    if host_handle >= 0
+    let releases_host_locks = host_handle >= 0
         && file_type != FileType::Pipe
         && file_type != FileType::Socket
         && file_type != FileType::PtyMaster
-        && file_type != FileType::PtySlave
-    {
+        && file_type != FileType::PtySlave;
+    if releases_host_locks {
         proc.lock_table.remove_for_handle(host_handle, proc.pid);
         // Also release in the shared (cross-process) lock table
         if !path.is_empty() {
@@ -927,6 +953,13 @@ pub fn sys_close(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<(
     let freed = proc.ofd_table.dec_ref(idx);
 
     if freed {
+        if releases_host_locks && !path.is_empty() {
+            // BSD flock locks are owned by the open file description. Release
+            // them only when the last duplicated fd for this OFD closes.
+            let mut dummy = [0u8; 24];
+            let flock_owner = (idx as u32) | 0x80000000;
+            let _ = host.host_fcntl_lock(&path, flock_owner, F_SETLK, F_UNLCK, 0, 0, &mut dummy);
+        }
         match file_type {
             FileType::Pipe => {
                 if host_handle >= 0 {
@@ -3089,6 +3122,28 @@ pub fn sys_flock(
         _pad2: 0,
     };
 
+    // BSD flock(2) locks are associated with the open file description and do
+    // not impose fcntl(2)'s read-lock/readable-fd or write-lock/writable-fd
+    // access-mode checks. Keep those checks in sys_fcntl_lock(), but bypass
+    // them here so LOCK_SH on a write-only descriptor behaves like Linux/PHP
+    // expect.
+    let entry = proc.fd_table.get(fd)?;
+    let ofd_idx = entry.ofd_ref.0;
+    let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+    let lock_owner = (ofd_idx as u32) | 0x80000000;
+    if ofd.host_handle >= 0 && !ofd.path.is_empty() {
+        let mut result_buf = [0u8; 24];
+        return host.host_fcntl_lock(
+            &ofd.path,
+            lock_owner,
+            cmd,
+            lock_type,
+            flock.l_start,
+            flock.l_len,
+            &mut result_buf,
+        );
+    }
+
     sys_fcntl_lock(proc, fd, cmd, &mut flock, host)
 }
 
@@ -3476,7 +3531,11 @@ pub fn sys_fchdir(proc: &mut Process, fd: i32) -> Result<(), Errno> {
 /// Get the current working directory.
 /// Writes the cwd path to `buf` and returns the number of bytes written.
 /// Returns ERANGE if the buffer is too small.
-pub fn sys_getcwd(proc: &Process, buf: &mut [u8]) -> Result<usize, Errno> {
+pub fn sys_getcwd(proc: &Process, host: &mut dyn HostIO, buf: &mut [u8]) -> Result<usize, Errno> {
+    let st = host.host_stat(&proc.cwd)?;
+    if st.st_mode & S_IFMT != S_IFDIR {
+        return Err(Errno::ENOTDIR);
+    }
     // Linux getcwd returns the path WITH a null terminator and the length
     // includes the null byte.  musl expects this convention.
     let needed = proc.cwd.len() + 1; // +1 for NUL
@@ -10330,6 +10389,36 @@ mod tests {
     /// that call sys_bind/sys_connect for AF_UNIX must hold this lock.
     static UNIX_REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn test_parent_path_ignores_trailing_slash() {
+        assert_eq!(parent_path(b"/tmp/newdir/"), b"/tmp");
+        assert_eq!(parent_path(b"/tmp/newdir///"), b"/tmp");
+        assert_eq!(parent_path(b"/tmp"), b"/");
+        assert_eq!(parent_path(b"/"), b"/");
+    }
+
+    #[test]
+    fn test_stat_trailing_slash_requires_directory() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+
+        assert_eq!(
+            sys_stat(&mut proc, &mut host, b"/tmp/file/").unwrap_err(),
+            Errno::ENOTDIR,
+        );
+    }
+
+    #[test]
+    fn test_empty_path_is_enoent() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+
+        assert_eq!(
+            sys_stat(&mut proc, &mut host, b"").unwrap_err(),
+            Errno::ENOENT,
+        );
+    }
+
     fn test_path_is_dir(path: &[u8]) -> bool {
         path.ends_with(b"/")
             || path.ends_with(b"dir")
@@ -11418,8 +11507,9 @@ mod tests {
     #[test]
     fn test_getcwd_returns_initial_cwd() {
         let proc = Process::new(1);
+        let mut host = MockHostIO::new();
         let mut buf = [0u8; 256];
-        let n = sys_getcwd(&proc, &mut buf).unwrap();
+        let n = sys_getcwd(&proc, &mut host, &mut buf).unwrap();
         // Linux convention: returned length includes the NUL terminator
         assert_eq!(&buf[..n], b"/\0");
     }
@@ -11430,7 +11520,7 @@ mod tests {
         let mut host = MockHostIO::new();
         sys_chdir(&mut proc, &mut host, b"/tmp").unwrap();
         let mut buf = [0u8; 256];
-        let n = sys_getcwd(&proc, &mut buf).unwrap();
+        let n = sys_getcwd(&proc, &mut host, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"/tmp\0");
     }
 
@@ -11443,8 +11533,22 @@ mod tests {
         // Then chdir to "subdir" relative (resolves to /tmp/subdir, ends with "dir")
         sys_chdir(&mut proc, &mut host, b"subdir").unwrap();
         let mut buf = [0u8; 256];
-        let n = sys_getcwd(&proc, &mut buf).unwrap();
+        let n = sys_getcwd(&proc, &mut host, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"/tmp/subdir\0");
+    }
+
+    #[test]
+    fn test_getcwd_enoent_when_cwd_was_removed() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        proc.cwd = b"/tmp/gone".to_vec();
+        host.set_missing_path(b"/tmp/gone");
+        let mut buf = [0u8; 256];
+
+        assert_eq!(
+            sys_getcwd(&proc, &mut host, &mut buf).unwrap_err(),
+            Errno::ENOENT,
+        );
     }
 
     #[test]
@@ -11462,7 +11566,7 @@ mod tests {
         let mut host = MockHostIO::new();
         sys_chdir(&mut proc, &mut host, b"/tmp").unwrap();
         let mut buf = [0u8; 2]; // too small for "/tmp"
-        let result = sys_getcwd(&proc, &mut buf);
+        let result = sys_getcwd(&proc, &mut host, &mut buf);
         assert_eq!(result, Err(Errno::ERANGE));
     }
 
@@ -12113,6 +12217,22 @@ mod tests {
         };
         let result = sys_fcntl_lock(&mut proc, fd, F_SETLK, &mut flock, &mut host);
         assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_flock_shared_allows_write_only_fd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(
+            &mut proc,
+            &mut host,
+            b"/tmp/test",
+            O_WRONLY | O_CREAT,
+            0o644,
+        )
+        .unwrap();
+
+        sys_flock(&mut proc, fd, LOCK_SH, &mut host).unwrap();
     }
 
     #[test]

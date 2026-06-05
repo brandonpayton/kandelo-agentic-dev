@@ -58,7 +58,7 @@ function readVfsFile(fs: MemoryFileSystem, path: string): Uint8Array {
 function createFs(): MemoryFileSystem {
   if (!vfsImageBytes) throw new Error("PHP test VFS image not loaded");
   return MemoryFileSystem.fromImage(vfsImageBytes, {
-    maxByteLength: 768 * 1024 * 1024,
+    maxByteLength: 2 * 1024 * 1024 * 1024,
   });
 }
 
@@ -110,6 +110,7 @@ async function init() {
       "TMPDIR=/tmp",
       "PATH=/usr/local/bin:/usr/bin:/bin",
       "TEST_PHP_EXECUTABLE=/usr/local/bin/php",
+      "TEST_PHP_EXECUTABLE_ESCAPED='/usr/local/bin/php'",
       ...(request.env ?? []),
     ];
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { VirtualPlatformIO } from "../src/vfs/vfs";
@@ -224,6 +224,38 @@ describe("VirtualPlatformIO mount resolution", () => {
     vfs.stat("/tmp/abc");
     expect(tmp.calls).toContain("stat:/abc");
   });
+
+  it("routes mount-root .. to the parent mount", () => {
+    const root = createMockBackend();
+    const phpSrc = createMockBackend();
+    const vfs = new VirtualPlatformIO(
+      [
+        { mountPoint: "/", backend: root },
+        { mountPoint: "/php-src", backend: phpSrc },
+      ],
+      new NodeTimeProvider(),
+    );
+
+    vfs.stat("/php-src/..");
+
+    expect(root.calls).toContain("stat:/");
+    expect(phpSrc.calls.length).toBe(0);
+  });
+
+  it("leaves backend-internal missing/.. paths for component-wise resolution", () => {
+    const phpSrc = createMockBackend();
+    const vfs = new VirtualPlatformIO(
+      [
+        { mountPoint: "/", backend: createMockBackend() },
+        { mountPoint: "/php-src", backend: phpSrc },
+      ],
+      new NodeTimeProvider(),
+    );
+
+    vfs.stat("/php-src/missing/../file.txt");
+
+    expect(phpSrc.calls).toContain("stat:/missing/../file.txt");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -344,8 +376,56 @@ describe("HostFileSystem path traversal", () => {
   });
 
   it("rejects paths with embedded .. sequences", () => {
-    const hfs = new HostFileSystem("/tmp/sandbox");
-    expect(() => hfs.stat("/subdir/../../etc/passwd")).toThrow("EACCES");
+    const root = mkdtempSync(join(tmpdir(), "hostfs-traversal-"));
+    try {
+      mkdirSync(join(root, "subdir"));
+      const hfs = new HostFileSystem(root);
+      expect(() => hfs.stat("/subdir/../../etc/passwd")).toThrow("EACCES");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not lexically erase missing intermediate components before ..", () => {
+    const root = mkdtempSync(join(tmpdir(), "hostfs-path-"));
+    try {
+      mkdirSync(join(root, "existing"));
+      writeFileSync(join(root, "existing", "file.txt"), "data");
+      const hfs = new HostFileSystem(root);
+
+      expect(() =>
+        hfs.chmod("/existing/missing/../file.txt", 0o755),
+      ).toThrow("ENOENT");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves trailing slash semantics for non-directory final components", () => {
+    const root = mkdtempSync(join(tmpdir(), "hostfs-trailing-slash-"));
+    try {
+      writeFileSync(join(root, "file.txt"), "data");
+      const hfs = new HostFileSystem(root);
+
+      expect(() => hfs.stat("/file.txt/")).toThrow("ENOTDIR");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows absolute guest symlinks that stay inside the host mount", () => {
+    const root = mkdtempSync(join(tmpdir(), "hostfs-symlink-"));
+    try {
+      writeFileSync(join(root, "target.txt"), "data");
+      const hfs = new HostFileSystem(root, "/mnt");
+
+      hfs.symlink("/mnt/target.txt", "/link.txt");
+
+      expect(hfs.readlink("/link.txt")).toBe("/mnt/target.txt");
+      expect(hfs.stat("/link.txt").size).toBe(4);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
