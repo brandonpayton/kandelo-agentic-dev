@@ -3489,20 +3489,21 @@ pub fn sys_access(
 /// Validates that the path exists and is a directory via host_stat.
 pub fn sys_chdir(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Result<(), Errno> {
     let resolved = crate::path::resolve_path(path, &proc.cwd);
+    let canonical = || crate::path::canonicalize_existing_path(&resolved);
     // Check virtual filesystems first (procfs, devfs), then fall through to host
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
         let st = crate::procfs::procfs_stat(&entry, 0, true);
         if st.st_mode & wasm_posix_shared::mode::S_IFMT != wasm_posix_shared::mode::S_IFDIR {
             return Err(Errno::ENOTDIR);
         }
-        proc.cwd = resolved;
+        proc.cwd = canonical();
         return Ok(());
     }
     if let Some(st) = crate::devfs::match_devfs_stat(&resolved, proc.euid, proc.egid) {
         if st.st_mode & wasm_posix_shared::mode::S_IFMT != wasm_posix_shared::mode::S_IFDIR {
             return Err(Errno::ENOTDIR);
         }
-        proc.cwd = resolved;
+        proc.cwd = canonical();
         return Ok(());
     }
     // Validate the path exists and is a directory
@@ -3513,7 +3514,7 @@ pub fn sys_chdir(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Resu
         return Err(Errno::ENOTDIR);
     }
     check_access(proc, &stat, X_OK)?;
-    proc.cwd = resolved;
+    proc.cwd = canonical();
     Ok(())
 }
 
@@ -3524,7 +3525,7 @@ pub fn sys_fchdir(proc: &mut Process, fd: i32) -> Result<(), Errno> {
     if ofd.file_type != FileType::Directory {
         return Err(Errno::ENOTDIR);
     }
-    proc.cwd = ofd.path.clone();
+    proc.cwd = crate::path::canonicalize_existing_path(&ofd.path);
     Ok(())
 }
 
@@ -12064,6 +12065,21 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = sys_getcwd(&proc, &mut host, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"/tmp/subdir\0");
+    }
+
+    #[test]
+    fn test_chdir_canonicalizes_dotdot_in_cwd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        sys_chdir(&mut proc, &mut host, b"/tmp").unwrap();
+        sys_chdir(&mut proc, &mut host, b"subdir").unwrap();
+        host.set_dir_with_owner(b"/tmp/subdir/..", 0, 0, 0o755);
+
+        sys_chdir(&mut proc, &mut host, b"..").unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = sys_getcwd(&proc, &mut host, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/tmp\0");
     }
 
     #[test]
