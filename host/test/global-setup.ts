@@ -18,6 +18,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "../..");
 const examplesDir = join(repoRoot, "examples");
 const fixturesDir = join(__dirname, "fixtures");
+const wasm32posixCc = existsSync(join(repoRoot, "sdk/bin/wasm32posix-cc"))
+  ? join(repoRoot, "sdk/bin/wasm32posix-cc")
+  : "wasm32posix-cc";
 
 /** C programs that tests depend on. */
 const TEST_PROGRAMS = [
@@ -29,6 +32,9 @@ const TEST_PROGRAMS = [
   "mount_probe_test.c",
   "getpwent_smoke.c",
   "thread-exit-group.c",
+  "thread-slot-reuse.c",
+  "mmap_shared_munmap_reuse.c",
+  "mmap_shared_large_pwrite.c",
 ];
 
 /** WAT fixtures used by host/test/wasi-shim.test.ts. */
@@ -54,7 +60,7 @@ export async function setup() {
     if (!needsRebuild(src, out)) continue;
 
     console.log(`[global-setup] Compiling ${cFile}...`);
-    execFileSync("wasm32posix-cc", [src, "-o", out], {
+    execFileSync(wasm32posixCc, [src, "-o", out], {
       cwd: repoRoot,
       stdio: "pipe",
     });

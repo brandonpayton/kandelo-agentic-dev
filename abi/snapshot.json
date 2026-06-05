@@ -1,5 +1,5 @@
 {
-  "abi_version": 13,
+  "abi_version": 14,
   "channel_buffers": {
     "data_offset": 72,
     "data_size": 65536,
@@ -113,7 +113,7 @@
   },
   "host_adapter": {
     "manifest": {
-      "abi_version": 13,
+      "abi_version": 14,
       "channel_data_offset": 72,
       "channel_data_size": 65536,
       "channel_header_size": 72,
@@ -585,6 +585,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_get_fd_accept_wake_idx",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_get_fd_path",
       "signature": "(i32,i32,i64,i32) -> (i32)"
     },
@@ -835,6 +840,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_inject_datagram",
+      "signature": "(i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i64,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_inject_mouse_event",
       "signature": "(i32,i32,i32) -> ()"
     },
@@ -922,6 +932,11 @@
       "kind": "func",
       "name": "kernel_madvise",
       "signature": "(i64,i64,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_mark_process_exited",
+      "signature": "(i32,i32) -> (i32)"
     },
     {
       "kind": "func",
@@ -1071,7 +1086,7 @@
     {
       "kind": "func",
       "name": "kernel_preadv",
-      "signature": "(i32,i64,i32,i32,i32) -> (i32)"
+      "signature": "(i32,i64,i32,i64) -> (i32)"
     },
     {
       "kind": "func",
@@ -1111,7 +1126,7 @@
     {
       "kind": "func",
       "name": "kernel_pwritev",
-      "signature": "(i32,i64,i32,i32,i32) -> (i32)"
+      "signature": "(i32,i64,i32,i64) -> (i32)"
     },
     {
       "kind": "func",
@@ -2030,9 +2045,24 @@
           "name": "_pad",
           "offset": 84,
           "span": 4
+        },
+        {
+          "name": "st_rdev",
+          "offset": 88,
+          "span": 8
+        },
+        {
+          "name": "st_blksize",
+          "offset": 96,
+          "span": 4
+        },
+        {
+          "name": "st_blocks",
+          "offset": 100,
+          "span": 4
         }
       ],
-      "size": 88
+      "size": 104
     },
     "WasmStatfs": {
       "fields": [
@@ -2280,7 +2310,7 @@
         "argIndex": 1,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
@@ -2353,7 +2383,7 @@
         "argIndex": 1,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
@@ -3352,7 +3382,7 @@
         "argIndex": 1,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }
@@ -3552,7 +3582,7 @@
         "argIndex": 2,
         "direction": "out",
         "size": {
-          "size": 88,
+          "size": 104,
           "type": "fixed"
         }
       }

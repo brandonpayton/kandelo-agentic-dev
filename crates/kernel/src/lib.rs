@@ -107,108 +107,72 @@ pub fn set_kernel_mode(mode: u32) {
 #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 mod wasm {
     use core::alloc::{GlobalAlloc, Layout};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicI32, Ordering};
 
-    /// Bump allocator that grows upward from __heap_base.
-    ///
-    /// The kernel's heap starts at the linker-defined __heap_base and grows
-    /// upward. When the cursor exceeds the current Wasm memory size, we grow
-    /// memory just enough to cover the allocation. This avoids conflicts with
-    /// the user-space allocator (musl mallocng) which uses mmap addresses
-    /// starting at 0x10000000 — the kernel heap stays well below that.
-    struct BumpAlloc {
-        cursor: AtomicUsize,
+    struct KernelAllocator {
+        lock: AtomicI32,
+        inner: UnsafeCell<dlmalloc::Dlmalloc>,
     }
 
-    impl BumpAlloc {
+    unsafe impl Sync for KernelAllocator {}
+
+    impl KernelAllocator {
         const fn new() -> Self {
-            BumpAlloc {
-                cursor: AtomicUsize::new(0),
+            Self {
+                lock: AtomicI32::new(0),
+                inner: UnsafeCell::new(dlmalloc::Dlmalloc::new()),
             }
         }
-    }
 
-    unsafe extern "C" {
-        static __heap_base: u8;
-    }
-
-    #[inline(always)]
-    fn wasm_memory_size() -> usize {
-        #[cfg(target_arch = "wasm32")]
-        {
-            core::arch::wasm32::memory_size(0)
-        }
-        #[cfg(target_arch = "wasm64")]
-        {
-            core::arch::wasm64::memory_size(0)
+        fn acquire(&self) -> AllocGuard<'_> {
+            while self
+                .lock
+                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            AllocGuard { allocator: self }
         }
     }
 
-    #[inline(always)]
-    fn wasm_memory_grow(pages: usize) -> usize {
-        #[cfg(target_arch = "wasm32")]
-        {
-            core::arch::wasm32::memory_grow(0, pages)
-        }
-        #[cfg(target_arch = "wasm64")]
-        {
-            core::arch::wasm64::memory_grow(0, pages)
+    struct AllocGuard<'a> {
+        allocator: &'a KernelAllocator,
+    }
+
+    impl Drop for AllocGuard<'_> {
+        fn drop(&mut self) {
+            self.allocator.lock.store(0, Ordering::Release);
         }
     }
 
-    unsafe impl GlobalAlloc for BumpAlloc {
+    unsafe impl GlobalAlloc for KernelAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let align = layout.align();
-            let size = layout.size();
-
-            loop {
-                let mut cur = self.cursor.load(Ordering::Relaxed);
-
-                // Lazy-init: set cursor to __heap_base on first allocation
-                if cur == 0 {
-                    let base = unsafe { &__heap_base as *const u8 as usize };
-                    let _ =
-                        self.cursor
-                            .compare_exchange(0, base, Ordering::Relaxed, Ordering::Relaxed);
-                    cur = self.cursor.load(Ordering::Relaxed);
-                }
-
-                // Align the cursor
-                let aligned = (cur + align - 1) & !(align - 1);
-                let new_cursor = match aligned.checked_add(size) {
-                    Some(nc) => nc,
-                    None => return core::ptr::null_mut(),
-                };
-
-                // Ensure Wasm memory covers the allocation
-                let current_bytes = wasm_memory_size() * 65536;
-                if new_cursor > current_bytes {
-                    let needed_pages = (new_cursor - current_bytes + 65535) / 65536;
-                    let prev = wasm_memory_grow(needed_pages);
-                    if prev == usize::MAX {
-                        return core::ptr::null_mut();
-                    }
-                }
-
-                // Try to claim the region atomically
-                if self
-                    .cursor
-                    .compare_exchange(cur, new_cursor, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return aligned as *mut u8;
-                }
-                // Another thread won; retry with updated cursor
-            }
+            let _guard = self.acquire();
+            unsafe { (&mut *self.inner.get()).malloc(layout.size(), layout.align()) }
         }
 
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-            // No-op: bump allocator does not reclaim memory.
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            let _guard = self.acquire();
+            unsafe { (&mut *self.inner.get()).free(ptr, layout.size(), layout.align()) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _guard = self.acquire();
+            unsafe { (&mut *self.inner.get()).calloc(layout.size(), layout.align()) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _guard = self.acquire();
+            unsafe {
+                (&mut *self.inner.get()).realloc(ptr, layout.size(), layout.align(), new_size)
+            }
         }
     }
 
     #[global_allocator]
-    static ALLOC: BumpAlloc = BumpAlloc::new();
+    static ALLOC: KernelAllocator = KernelAllocator::new();
 
     #[panic_handler]
     fn panic(_info: &core::panic::PanicInfo) -> ! {

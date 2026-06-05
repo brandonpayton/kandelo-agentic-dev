@@ -419,6 +419,37 @@ describe("MemoryFileSystem", () => {
     expect(() => mfs.stat("/todelete.txt")).toThrow();
   });
 
+  it("keeps an unlinked open file alive until close", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_RDWR = 0x0002,
+      O_TRUNC = 0x0200;
+
+    const oldFd = mfs.open("/open.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const oldData = new TextEncoder().encode("old");
+    mfs.write(oldFd, oldData, null, oldData.length);
+    mfs.unlink("/open.txt");
+    expect(() => mfs.stat("/open.txt")).toThrow();
+
+    const newFd = mfs.open("/open.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const newData = new TextEncoder().encode("newer");
+    mfs.write(newFd, newData, null, newData.length);
+
+    mfs.seek(oldFd, 0, 0);
+    const oldBuf = new Uint8Array(8);
+    const oldRead = mfs.read(oldFd, oldBuf, null, oldBuf.length);
+    expect(new TextDecoder().decode(oldBuf.subarray(0, oldRead))).toBe("old");
+
+    mfs.seek(newFd, 0, 0);
+    const newBuf = new Uint8Array(8);
+    const newRead = mfs.read(newFd, newBuf, null, newBuf.length);
+    expect(new TextDecoder().decode(newBuf.subarray(0, newRead))).toBe("newer");
+
+    mfs.close(oldFd);
+    mfs.close(newFd);
+  });
+
   it("ftruncate changes file size", () => {
     const sab = new SharedArrayBuffer(4 * 1024 * 1024);
     const mfs = MemoryFileSystem.create(sab);
@@ -431,6 +462,24 @@ describe("MemoryFileSystem", () => {
     expect(mfs.fstat(fd).size).toBe(10);
     mfs.ftruncate(fd, 5);
     expect(mfs.fstat(fd).size).toBe(5);
+    mfs.close(fd);
+  });
+
+  it("ftruncate shrink then extend zero-fills the truncated tail", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_RDWR = 0x0002,
+      O_TRUNC = 0x0200;
+    const fd = mfs.open("/zero-tail.bin", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const data = new TextEncoder().encode("abcdefghij");
+    mfs.write(fd, data, null, data.length);
+    mfs.ftruncate(fd, 3);
+    mfs.ftruncate(fd, 10);
+    mfs.seek(fd, 0, 0);
+    const buf = new Uint8Array(10);
+    expect(mfs.read(fd, buf, null, buf.length)).toBe(10);
+    expect(Array.from(buf)).toEqual([97, 98, 99, 0, 0, 0, 0, 0, 0, 0]);
     mfs.close(fd);
   });
 
