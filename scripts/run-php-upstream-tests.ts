@@ -248,10 +248,19 @@ function iniArgs(ini: string | undefined, test: PhptTest): string[] {
 
 function envArgs(env: string | undefined, test: PhptTest): string[] {
   if (!env) return [];
-  return expandSectionPlaceholders(env, test)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
+  const args: string[] = [];
+  for (const raw of expandSectionPlaceholders(env, test).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    // Upstream run-tests.php feeds --ENV-- through PHP's proc_open()
+    // environment array. proc_open's POSIX envp builder intentionally skips
+    // entries whose value is an empty string, so mirror that rather than
+    // passing NAME= directly to Kandelo.
+    if (eq >= 0 && line.slice(eq + 1).length === 0) continue;
+    args.push(line);
+  }
+  return args;
 }
 
 function passthroughEnvArgs(): string[] {
