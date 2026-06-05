@@ -90,6 +90,14 @@ interface PhpRunner {
 
 let tempCounter = 0;
 
+const PASSTHROUGH_ENV_NAMES = [
+  "NO_INTERACTION",
+  "SKIP_IO_CAPTURE_TESTS",
+  "SKIP_ONLINE_TESTS",
+  "SKIP_PERF_SENSITIVE",
+  "SKIP_SLOW_TESTS",
+];
+
 function forceNodeGc(): void {
   try {
     setFlagsFromString("--expose-gc");
@@ -228,10 +236,51 @@ function envArgs(env: string | undefined): string[] {
     .filter((line) => line && !line.startsWith("#"));
 }
 
+function passthroughEnvArgs(): string[] {
+  return PASSTHROUGH_ENV_NAMES.flatMap((name) =>
+    process.env[name] === undefined ? [] : [`${name}=${process.env[name]}`],
+  );
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function extensionArgs(extensions: string | undefined): string[] {
+  if (!extensions) return [];
+  return extensions
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+}
+
+function extensionSkipScript(extensions: string[]): string {
+  return `<?php
+$required = ${JSON.stringify(extensions)};
+$missing = [];
+foreach ($required as $extension) {
+    $name = strtolower($extension);
+    if ($name === "zend opcache") {
+        $name = "opcache";
+    }
+    if (!extension_loaded($extension) && !extension_loaded($name)) {
+        $missing[] = $extension;
+    }
+}
+if ($missing) {
+    echo "skip required extension(s) not loaded: " . implode(", ", $missing);
+}
+?>`;
+}
+
 function normalizeOutput(text: string): string {
-  // Upstream php-src run-tests.php normalizes CRLF and compares trim($out)
-  // against trim(EXPECT*). Match that outer-whitespace behavior here.
-  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  // Upstream php-src run-tests.php normalizes CRLF and compares PHP
+  // trim($out) against trim(EXPECT*). PHP trim's default charlist includes
+  // NUL bytes, unlike JavaScript String#trim().
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/^[\x00\t\n\v\r ]+|[\x00\t\n\v\r ]+$/g, "");
 }
 
 function escapeRegExp(text: string): string {
@@ -341,6 +390,7 @@ function unsupportedReason(test: PhptTest): string | null {
     return "REDIRECTTEST is not supported by the Kandelo PHPT harness yet";
   const sapiOnly = [
     "POST",
+    "POST_RAW",
     "PUT",
     "GET",
     "COOKIE",
@@ -388,31 +438,41 @@ function testScript(test: PhptTest): string {
 }
 
 function phptGeneratedScriptName(test: PhptTest, kind: string): string {
+  const base = basename(test.path, ".phpt");
   if (kind === "file") {
-    return `${basename(test.path, ".phpt")}.php`;
+    return `${base}.php`;
+  }
+  if (kind === "clean") {
+    return `${base}.clean.php`;
+  }
+  if (kind === "skipif") {
+    return `${base}.skip.php`;
   }
   return `.kandelo-phpt-${process.pid}-${tempCounter++}-${kind}.php`;
 }
 
-function nodeTempPath(test: PhptTest, kind: string): string {
-  return join(dirname(test.path), phptGeneratedScriptName(test, kind));
+function nodeTempPath(test: PhptTest, scriptName: string): string {
+  return join(dirname(test.path), scriptName);
 }
 
-function browserScriptPath(
+function guestScriptPath(
   test: PhptTest,
   sourceRoot: string,
-  kind: string,
+  scriptName: string,
 ): string {
   const relDir = relative(sourceRoot, dirname(test.path)).split("\\").join("/");
-  const name = phptGeneratedScriptName(test, kind);
-  return relDir ? `/php-src/${relDir}/${name}` : `/php-src/${name}`;
+  return relDir ? `/php-src/${relDir}/${scriptName}` : `/php-src/${scriptName}`;
 }
 
 class NodePhpRunner implements PhpRunner {
+  private virtualPhpPath: string;
+
   constructor(
     private sourceRoot: string,
     private phpPath: string,
-  ) {}
+  ) {
+    this.virtualPhpPath = `/kandelo-bin/${basename(phpPath)}`;
+  }
 
   async runScript(opts: {
     test: PhptTest;
@@ -424,17 +484,28 @@ class NodePhpRunner implements PhpRunner {
     stdin?: string;
     timeoutMs: number;
   }): Promise<PhpRunResult> {
-    const scriptPath = nodeTempPath(opts.test, opts.kind);
-    const previousScript = existsSync(scriptPath)
-      ? readFileSync(scriptPath)
+    const scriptName = phptGeneratedScriptName(opts.test, opts.kind);
+    const hostScriptPath = nodeTempPath(opts.test, scriptName);
+    const scriptPath = guestScriptPath(opts.test, this.sourceRoot, scriptName);
+    const previousScript = existsSync(hostScriptPath)
+      ? readFileSync(hostScriptPath)
       : null;
-    writeFileSync(scriptPath, opts.script);
+    writeFileSync(hostScriptPath, opts.script);
     const start = performance.now();
     let stdout = "";
     let stderr = "";
     const phpBytes = loadBytes(this.phpPath);
     const host = new NodeKernelHost({
       maxWorkers: 4,
+      rootfsImage: "default",
+      extraMounts: [
+        { mountPoint: "/php-src", hostPath: this.sourceRoot },
+        {
+          mountPoint: "/kandelo-bin",
+          hostPath: dirname(this.phpPath),
+          readonly: true,
+        },
+      ],
       onStdout: (_pid, data) => {
         stdout += new TextDecoder().decode(data);
       },
@@ -456,17 +527,23 @@ class NodePhpRunner implements PhpRunner {
     try {
       const exitPromise = host.spawn(
         phpBytes,
-        [this.phpPath, ...opts.argv, scriptPath, ...(opts.scriptArgs ?? [])],
+        [
+          this.virtualPhpPath,
+          ...opts.argv,
+          scriptPath,
+          ...(opts.scriptArgs ?? []),
+        ],
         {
           // php-src run-tests.php executes generated test files from the
           // source root. Several PHPTs intentionally use source-root-relative
           // paths such as ./ext/standard/tests/file.
-          cwd: this.sourceRoot,
+          cwd: "/php-src",
           env: [
             "HOME=/tmp",
             "TMPDIR=/tmp",
-            `TEST_PHP_SRCDIR=${this.sourceRoot}`,
-            `TEST_PHP_EXECUTABLE=${this.phpPath}`,
+            `TEST_PHP_SRCDIR=/php-src`,
+            `TEST_PHP_EXECUTABLE=${this.virtualPhpPath}`,
+            `TEST_PHP_EXECUTABLE_ESCAPED=${shellEscape(this.virtualPhpPath)}`,
             ...opts.env,
           ],
           stdin,
@@ -505,9 +582,9 @@ class NodePhpRunner implements PhpRunner {
       await host.destroy().catch(() => {});
       forceNodeGc();
       if (previousScript) {
-        writeFileSync(scriptPath, previousScript);
+        writeFileSync(hostScriptPath, previousScript);
       } else {
-        rmSync(scriptPath, { force: true });
+        rmSync(hostScriptPath, { force: true });
       }
     }
   }
@@ -664,7 +741,8 @@ class BrowserPhpRunner implements PhpRunner {
     }
     this.runs++;
 
-    const scriptPath = browserScriptPath(opts.test, this.sourceRoot, opts.kind);
+    const scriptName = phptGeneratedScriptName(opts.test, opts.kind);
+    const scriptPath = guestScriptPath(opts.test, this.sourceRoot, scriptName);
     const request = {
       scriptPath,
       script: opts.script,
@@ -767,16 +845,50 @@ async function runPhpt(
     };
   }
 
-  const commonEnv = envArgs(test.sections.ENV);
-  const baseArgv = iniArgs(test.sections.INI);
+  const commonEnv = [...passthroughEnvArgs(), ...envArgs(test.sections.ENV)];
+  const testArgv = iniArgs(test.sections.INI);
   const args = splitArgs(test.sections.ARGS);
+
+  const requiredExtensions = extensionArgs(test.sections.EXTENSIONS);
+  if (requiredExtensions.length > 0) {
+    const extensionSkip = await runner.runScript({
+      test,
+      kind: "skipif",
+      script: extensionSkipScript(requiredExtensions),
+      argv: [],
+      env: commonEnv,
+      timeoutMs,
+    });
+    const extensionOutput = normalizeOutput(
+      `${extensionSkip.stdout}${extensionSkip.stderr}`,
+    );
+    if (/^skip\b/i.test(extensionOutput)) {
+      return {
+        test: test.rel,
+        status: "skip",
+        time_ms: Math.round(performance.now() - start),
+        reason: extensionOutput,
+      };
+    }
+    if (extensionSkip.error === "TIMEOUT") {
+      return {
+        test: test.rel,
+        status: "time",
+        time_ms: extensionSkip.durationMs,
+        reason: "EXTENSIONS check timed out",
+      };
+    }
+  }
 
   if (test.sections.SKIPIF !== undefined) {
     const skip = await runner.runScript({
       test,
       kind: "skipif",
       script: test.sections.SKIPIF,
-      argv: baseArgv,
+      // Upstream run-tests.php executes SKIPIF before applying the test's
+      // --INI-- block. Keep that ordering so resource-probing SKIPIF sections
+      // are not distorted by settings meant only for the main FILE body.
+      argv: [],
       env: commonEnv,
       timeoutMs,
     });
@@ -785,6 +897,14 @@ async function runPhpt(
       return {
         test: test.rel,
         status: "skip",
+        time_ms: Math.round(performance.now() - start),
+        reason: skipOutput,
+      };
+    }
+    if (/^xfail\b/i.test(skipOutput)) {
+      return {
+        test: test.rel,
+        status: "xfail",
         time_ms: Math.round(performance.now() - start),
         reason: skipOutput,
       };
@@ -803,7 +923,7 @@ async function runPhpt(
     test,
     kind: "file",
     script: testScript(test),
-    argv: baseArgv,
+    argv: testArgv,
     scriptArgs: args,
     env: commonEnv,
     stdin: test.sections.STDIN,
@@ -825,7 +945,8 @@ async function runPhpt(
       const snippet = normalizeOutput(actualOutput)
         .slice(0, 2000)
         .replace(/\n/g, "\\n");
-      detail = `${detail}; actual: ${snippet}`;
+      const errorDetail = main.error ? `; error=${main.error}` : "";
+      detail = `${detail}; exit=${main.exitCode}${errorDetail}; actual: ${snippet}`;
     }
   }
 
@@ -835,7 +956,8 @@ async function runPhpt(
         test,
         kind: "clean",
         script: test.sections.CLEAN,
-        argv: baseArgv,
+        // CLEAN runs with the same pre-test INI baseline as SKIPIF upstream.
+        argv: [],
         env: commonEnv,
         timeoutMs: Math.min(timeoutMs, 30_000),
       })

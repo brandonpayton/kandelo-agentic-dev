@@ -5387,11 +5387,11 @@ pub extern "C" fn kernel_fchdir(fd: i32) -> i32 {
 pub extern "C" fn kernel_getcwd(buf_ptr: *mut u8, buf_len: u32) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
     let buf = unsafe { slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
-    let result = match syscalls::sys_getcwd(proc, buf) {
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_getcwd(proc, &mut host, buf) {
         Ok(n) => n as i32,
         Err(e) => -(e as i32),
     };
-    let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
 }

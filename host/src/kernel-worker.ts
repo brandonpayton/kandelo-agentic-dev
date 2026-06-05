@@ -118,6 +118,8 @@ const SYS_EPOLL_CREATE = ABI_SYSCALLS.EpollCreate;
 const SYS_EPOLL_CTL = ABI_SYSCALLS.EpollCtl;
 const SYS_EPOLL_WAIT = ABI_SYSCALLS.EpollWait;
 const SYS_RT_SIGTIMEDWAIT = ABI_SYSCALLS.RtSigtimedwait;
+const SYS_FLOCK = ABI_SYSCALLS.Flock;
+const LOCK_NB = 4;
 
 /**
  * Grace period for signal-mask-swapping ppoll/pselect wakeups after a pipe
@@ -2659,6 +2661,17 @@ export class CentralizedKernelWorker {
     // 1. EAGAIN: kernel returned EAGAIN for a blocking syscall.
     //    Schedule async retry — the process stays blocked on Atomics.wait.
     if (retVal === -1 && errVal === EAGAIN) {
+      if (syscallNr === SYS_FLOCK && (origArgs[1] & LOCK_NB) !== 0) {
+        this.completeChannel(
+          channel,
+          syscallNr,
+          origArgs,
+          SYSCALL_ARGS[syscallNr],
+          retVal,
+          errVal,
+        );
+        return;
+      }
       if (logging) {
         console.error(logEntry + " = -1 (EAGAIN, will retry)");
       }

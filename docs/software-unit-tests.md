@@ -3,7 +3,7 @@
 This project proves Kandelo by running real upstream/project test suites for
 large guest software on both Node.js and browser hosts where possible.
 
-Status date: 2026-06-04.
+Status date: 2026-06-05.
 
 ## Current Status
 
@@ -18,6 +18,71 @@ Status date: 2026-06-04.
 | Node.js library | Upstream Node.js `test/parallel/test-*.js` and `test/sequential/test-*.js` through the SpiderMonkey-backed Node-compatible runtime | Completed 3925 tests: 336 PASS, 3264 FAIL, 325 TIME | Completed 3925 tests: 339 PASS, 3564 FAIL, 22 TIME |
 
 Logs from the 2026-05-28 full runs are under `test-runs/software-unit-tests/`.
+
+## 2026-06-05 PHP PHPT Harness Notes
+
+The PHP PHPT harness is `scripts/run-php-upstream-tests.sh`. It runs the
+upstream `php-src` `.phpt` inventory against Kandelo without calling native
+`run-tests.php` directly: each `--EXTENSIONS--`, `--SKIPIF--`, `--FILE--`,
+and `--CLEAN--` section is executed as a PHP process inside Kandelo, then the
+harness applies the PHPT expectation match.
+
+Current defaults use the PHP package source metadata, which now matches the
+PHP binary built by `packages/registry/php/build-php.sh` (PHP 8.3.15). The
+node host mounts the source tree at `/php-src`, mounts the PHP binary
+directory at `/kandelo-bin`, and runs tests from `/php-src` to match upstream
+`run-tests.php` working-directory semantics. The browser host uses the
+`php-test` Vite page and `apps/browser-demos/public/php-test.vfs.zst`; rebuild
+that image after changing the PHP source, PHP binary, kernel, shell, or
+coreutils inputs.
+
+Recommended commands while iterating:
+
+```bash
+# Node host. Shard full runs; SKIP_SLOW_TESTS is an upstream PHPT control env.
+SKIP_SLOW_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host node --all --shard 1/16 --timeout 180000 --json
+
+# Browser host. Requires Playwright's shared library deps on this AO runner.
+LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
+SKIP_SLOW_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host browser --all --shard 1/16 --timeout 180000 --json
+
+# Rebuild the browser PHPT VFS image. The image includes /bin/sh and
+# coreutils so PHP shell-backed APIs such as system()/exec() work.
+LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
+scripts/run-php-upstream-tests.sh \
+  --host browser --rebuild-vfs --limit 3 --timeout 90000 --json
+```
+
+The browser VFS builder resolves `php.wasm`, `dash.wasm`, and
+`coreutils.wasm` via the normal binary resolver. If a local binary cache is
+stale, set `PHP_WASM`, `DASH_WASM`, or `COREUTILS_WASM` explicitly.
+
+Kernel/POSIX fixes found by PHPT so far in the current PR:
+
+- Pathname resolution must be component-wise. Kandelo no longer collapses
+  `missing/..` lexically before the backend can report `ENOENT`.
+- A trailing slash is significant: it requires the preceding component to
+  resolve as a directory, while `mkdir("newdir/")` still uses the parent of
+  `newdir`.
+- `..` at a VFS mount root resolves to the parent mount instead of being
+  treated as an escape from the host-backed mount.
+- Empty pathnames now fail with `ENOENT` instead of resolving to the current
+  directory.
+- `getcwd(2)` validates that the current working directory still exists and
+  returns `ENOENT` after it is removed.
+- Host-backed absolute symlinks that point inside their guest mount are
+  followed for `stat`/`open` while `readlink` still returns the original guest
+  target text.
+- BSD `flock(2)` locks are open-file-description locks. `LOCK_SH` is allowed
+  on write-only descriptors, separate opens in the same process conflict, and
+  `LOCK_NB` returns `EAGAIN` instead of being retried as a blocking syscall.
+- PHPT section semantics now match upstream more closely: test `--INI--` is
+  applied to `--FILE--` only, stable generated names are used for `--FILE--`
+  and `--CLEAN--`, PHP-style trim removes edge NUL bytes for EXPECT matching,
+  and selected upstream control env vars such as `SKIP_SLOW_TESTS` pass through
+  to guest PHP.
 
 ## 2026-06-02 SQLite Allocator Status
 
