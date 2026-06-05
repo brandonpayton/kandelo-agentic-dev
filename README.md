@@ -225,6 +225,7 @@ npm run dev
 ```
 
 Open `http://127.0.0.1:5401` to use the Kandelo UI. The network lab at `http://127.0.0.1:5401/pages/network/` boots multiple local Kandelo machines in one browser session and exercises POSIX UDP/TCP with GNU Netcat (`nc`) and `curl`.
+For peer-to-peer multiplayer DOOM, open `http://127.0.0.1:5401/pages/doom-mp/` in two separate browsers and follow `docs/multiplayer-doom-webrtc.md`.
 
 The browser app routes cross-origin fetches through the service worker and
 defaults to the main WordPress Playground CORS proxy:
