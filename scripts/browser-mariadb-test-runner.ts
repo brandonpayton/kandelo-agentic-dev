@@ -30,6 +30,13 @@ interface TestResult {
 
 let viteAlive = false;
 
+async function launchChromium(): Promise<Browser> {
+  return chromium.launch({
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+    args: ["--enable-features=SharedArrayBuffer"],
+  });
+}
+
 async function startViteServer(): Promise<ChildProcess> {
   return new Promise((resolvePromise, reject) => {
     let outputTail = "";
@@ -148,7 +155,12 @@ async function runTest(page: Page, testName: string, testTimeout: number): Promi
 async function isMariadbReady(page: Page, timeoutMs = 5_000): Promise<boolean> {
   try {
     return await Promise.race([
-      page.evaluate(() => (window as any).__mariadbTestReady === true),
+      page.evaluate(async (timeout) => {
+        if ((window as any).__mariadbTestReady !== true) return false;
+        const probe = (window as any).__probeMariadb;
+        if (typeof probe !== "function") return true;
+        return await probe(timeout);
+      }, timeoutMs),
       new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
     ]);
   } catch {
@@ -161,6 +173,7 @@ async function main() {
   let testTimeout = DEFAULT_TIMEOUT;
   let jsonOutput = false;
   const testNames: string[] = [];
+  const rebootAfterFail = process.env.MARIADB_BROWSER_REBOOT_AFTER_FAIL !== "0";
 
   let batchSize = 0; // 0 = no batching
 
@@ -198,26 +211,60 @@ async function main() {
     }
 
     // Launch browser
-    browser = await chromium.launch({
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
-      args: ["--enable-features=SharedArrayBuffer"],
-    });
+    browser = await launchChromium();
 
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    let context: BrowserContext | null = null;
+    let page: Page | null = null;
 
-    // Forward browser console errors for debugging
-    page.on("console", (msg) => {
-      if (msg.type() === "error") {
-        console.error(`[browser] ${msg.text()}`);
+    const openReadyPage = async (): Promise<Page> => {
+      let lastErr: unknown;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        // A MariaDB timeout or a test that kills mysqld can leave browser
+        // Workers busy even after navigation. Use a fresh context/page for a
+        // real reboot so the kernel worker, VFS image, and dinit tree are all
+        // reconstructed. Intermittent browser boots can also reach port-ready
+        // but fail setup SQL; retry those from a clean Chromium process before
+        // marking a whole chunk as zero-results.
+        await context?.close().catch(() => {});
+        context = null;
+        page = null;
+        // Browser process state can remain unhealthy after a wasm worker
+        // timeout. Close Chromium itself before rebooting the MariaDB page so
+        // the next test starts from a clean JS worker/process tree.
+        await browser?.close().catch(() => {});
+        browser = await launchChromium();
+
+        context = await browser!.newContext();
+        const nextPage = await context.newPage();
+
+        // Forward browser console errors for debugging
+        nextPage.on("console", (msg) => {
+          if (msg.type() === "error") {
+            console.error(`[browser] ${msg.text()}`);
+          }
+        });
+
+        try {
+          await waitForMariadbReady(nextPage);
+          page = nextPage;
+          return nextPage;
+        } catch (err) {
+          lastErr = err;
+          if (!jsonOutput && attempt < 3) {
+            process.stderr.write(`  Browser MariaDB boot failed; retrying (${attempt}/3)...\n`);
+          }
+        }
       }
-    });
+
+      throw lastErr;
+    };
 
     // Navigate and wait for MariaDB to boot
     if (!jsonOutput) {
       console.error("Waiting for MariaDB to boot in browser...");
     }
-    await waitForMariadbReady(page);
+    await openReadyPage();
     if (!jsonOutput) {
       console.error("MariaDB ready. Running tests...\n");
     }
@@ -232,7 +279,7 @@ async function main() {
           process.stderr.write(`  Batch reload (${batchSize} tests done)...\n`);
         }
         try {
-          await waitForMariadbReady(page);
+          await openReadyPage();
           testsSinceBoot = 0;
         } catch {
           // If reload fails, abort remaining
@@ -246,7 +293,7 @@ async function main() {
       }
 
       const testName = testNames[i];
-      const result = await runTest(page, testName, testTimeout);
+      const result = await runTest(page!, testName, testTimeout);
       results.push(result);
       testsSinceBoot++;
 
@@ -273,8 +320,9 @@ async function main() {
       // after the last test only delays process teardown.
       const hasMoreTests = i + 1 < testNames.length;
       const isTimeout = result.error === "TIMEOUT" || result.time_ms > testTimeout * 1.3;
-      const needsReload = hasMoreTests && (
-        isTimeout || !(await isMariadbReady(page))
+      const shouldProbe = result.status === "fail" || isTimeout;
+      const needsReload = rebootAfterFail && hasMoreTests && (
+        isTimeout || (shouldProbe && !(await isMariadbReady(page!)))
       );
 
       if (needsReload) {
@@ -282,7 +330,7 @@ async function main() {
           process.stderr.write("  Rebooting MariaDB...\n");
         }
         try {
-          await waitForMariadbReady(page);
+          await openReadyPage();
           testsSinceBoot = 0;
         } catch {
           for (let j = i + 1; j < testNames.length; j++) {

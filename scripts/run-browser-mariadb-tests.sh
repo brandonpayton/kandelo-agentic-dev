@@ -211,10 +211,27 @@ trap 'rm -f "$RESULTS_FILE" "$STDERR_FILE"' EXIT
 
 TIMEOUT="${TEST_TIMEOUT:-60000}"
 
-set +e
-npx tsx "$RUNNER" --json --timeout "$TIMEOUT" "${TEST_ARGS[@]}" > "$RESULTS_FILE" 2>"$STDERR_FILE"
-RUNNER_EXIT=$?
-set -e
+RUNNER_RETRIES="${MARIADB_BROWSER_RUNNER_RETRIES:-3}"
+RUNNER_EXIT=0
+for ((attempt=1; attempt<=RUNNER_RETRIES; attempt++)); do
+    : > "$RESULTS_FILE"
+    : > "$STDERR_FILE"
+    set +e
+    npx tsx "$RUNNER" --json --timeout "$TIMEOUT" "${TEST_ARGS[@]}" > "$RESULTS_FILE" 2>"$STDERR_FILE"
+    RUNNER_EXIT=$?
+    set -e
+
+    # Browser boots can intermittently fail before producing any JSON result
+    # (usually while the page reaches TCP listen but setup SQL times out).
+    # Retry the whole browser process for that case; once at least one result
+    # exists, preserve it exactly so all test outcomes remain visible.
+    if grep -q '^{' "$RESULTS_FILE" || [ "$attempt" -ge "$RUNNER_RETRIES" ]; then
+        break
+    fi
+    echo "NOTE: MariaDB browser runner produced zero JSON results on attempt $attempt/$RUNNER_RETRIES; retrying" >&2
+    tail -40 "$STDERR_FILE" >&2 || true
+    sleep 1
+done
 
 # Show runner stderr
 cat "$STDERR_FILE" >&2
@@ -239,12 +256,26 @@ try:
     print(d['test'])
     print(d['status'])
     print(d.get('time_ms', 0))
+    import base64
+    print(base64.b64encode((d.get('stderr') or d.get('error') or '').encode()).decode())
 except: pass
 " 2>/dev/null) || continue
 
     test_name=$(echo "$parsed" | sed -n '1p')
     status=$(echo "$parsed" | sed -n '2p')
     time_ms=$(echo "$parsed" | sed -n '3p')
+    stderr_b64=$(echo "$parsed" | sed -n '4p')
+    stderr_summary=""
+    if [ -n "$stderr_b64" ]; then
+        stderr_summary=$(printf '%s' "$stderr_b64" | python3 -c "
+import sys, base64
+try:
+    text = base64.b64decode(sys.stdin.read()).decode('utf-8', 'replace')
+    print(' '.join(text.split())[:240])
+except Exception:
+    pass
+" 2>/dev/null || true)
+    fi
 
     [ -z "$test_name" ] && continue
     [[ "$test_name" == __* ]] && continue
@@ -272,7 +303,11 @@ except: pass
                 RESULTS+=("XFAIL $test_name")
                 XFAIL=$((XFAIL + 1))
             else
-                echo "FAIL  $test_name (${time_ms}ms)"
+                if [ -n "$stderr_summary" ]; then
+                    echo "FAIL  $test_name (${time_ms}ms) -- $stderr_summary"
+                else
+                    echo "FAIL  $test_name (${time_ms}ms)"
+                fi
                 RESULTS+=("FAIL  $test_name")
                 FAIL=$((FAIL + 1))
             fi
@@ -296,7 +331,7 @@ echo "TOTAL:   $TOTAL"
 echo ""
 
 if [ "$RUNNER_EXIT" -ne 0 ]; then
-    echo "ERROR: MariaDB browser harness exited with status $RUNNER_EXIT" >&2
+    echo "NOTE: MariaDB browser harness raw runner exited with status $RUNNER_EXIT; classified results below determine wrapper status" >&2
 fi
 if [ "$TOTAL" -eq 0 ]; then
     echo "ERROR: MariaDB browser harness produced zero test results" >&2
@@ -317,8 +352,10 @@ for status_prefix in "FAIL " "XPASS"; do
     fi
 done
 
-# Exit with error if the harness failed, produced no results, or found
-# unexpected failures.
-if [ "$RUNNER_EXIT" -ne 0 ] || [ "$TOTAL" -eq 0 ] || [ $FAIL -gt 0 ] || [ $XPASS -gt 0 ]; then
+# Exit with error only if result collection failed or unexpected results remain.
+# The browser runner exits non-zero whenever any raw mysqltest invocation fails,
+# including failures intentionally classified here as XFAIL. Treat the wrapper's
+# expected-failure classification as authoritative for shell status.
+if [ "$TOTAL" -eq 0 ] || [ $FAIL -gt 0 ] || [ $XPASS -gt 0 ]; then
     exit 1
 fi

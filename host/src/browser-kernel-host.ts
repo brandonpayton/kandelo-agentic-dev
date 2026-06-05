@@ -118,17 +118,6 @@ export class BrowserKernel {
   private fsSab?: SharedArrayBuffer;
   private shmSab: SharedArrayBuffer;
   private maxPages: number;
-  /**
-   * @internal Legacy spawn() pre-allocates pids on the main thread. New
-   * code uses kernel.boot() which lets the worker allocate, making this
-   * counter irrelevant. Once all demos migrate to boot(), this goes away.
-   *
-   * Starts at 100 to skip the kernel's reserved range (virtual init at
-   * pid 1, future kernel threads). The architectural fix is in the spawn
-   * message protocol where pid is now optional and the worker is the
-   * authority.
-   */
-  nextPid = 100;
   private options: Required<
     Pick<BrowserKernelOptions, "maxWorkers" | "fsSize" | "env">
   > &
@@ -455,18 +444,18 @@ export class BrowserKernel {
       ptyRows?: number;
     },
   ): Promise<number> {
-    const pid = this.nextPid++;
     const requestId = this.nextRequestId++;
-
-    const exitPromise = this.createExitPromise(pid);
 
     // Clone programBytes since it gets transferred (detached)
     const bytesToSend = programBytes.slice(0);
 
-    await this.request(requestId, {
+    const pid = await this.request(requestId, {
       type: "spawn",
       requestId,
-      pid,
+      // No pid — the kernel worker allocates.  A process host must not
+      // pre-pick userspace PIDs after boot, because init/service children may
+      // already occupy the old legacy range.  POSIX process identifiers are
+      // kernel-owned; the host only observes the assigned pid.
       programBytes: bytesToSend,
       argv,
       env: this.mergeEnv(options?.env ?? this.options.env),
@@ -478,7 +467,9 @@ export class BrowserKernel {
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
       maxPages: this.maxPages,
-    }, [bytesToSend]);
+    }, [bytesToSend]) as number;
+
+    const exitPromise = this.createExitPromise(pid);
 
     // Register PTY output callback if pty was requested
     if (options?.pty) {

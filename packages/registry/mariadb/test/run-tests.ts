@@ -115,6 +115,7 @@ function patchIncludeFiles(testDir: string) {
 // Module-level state
 let serverStderr = "";
 let tmpTestDir = "/tmp";
+let mysqlTestDataDir = "";
 const clientExitResolvers = new Map<number, (status: number) => void>();
 let _nextPid = FIRST_CLIENT_PID;
 function nextPid(): number { return _nextPid++; }
@@ -183,6 +184,7 @@ async function main() {
 
     // Create data directory
     const dataDir = resolve(process.env.MARIADB_TEST_DATA_DIR ?? resolve(scriptDir, "test-data"));
+    mysqlTestDataDir = dataDir;
     mkdirSync(resolve(dataDir, "mysql"), { recursive: true });
     mkdirSync(resolve(dataDir, "tmp"), { recursive: true });
     tmpTestDir = resolve(dataDir, "tmp", "mysqltest");
@@ -900,13 +902,18 @@ async function runMysqlTest(
         env: [
             "HOME=/tmp", "PATH=/usr/bin", "TMPDIR=/tmp",
             `MYSQL_TEST_DIR=${mysqlTestDir}`,
-            `MYSQLTEST_VARDIR=${resolve(scriptDir, "test-data")}`,
+            // Keep mysqltest's vardir/datadir variables aligned with the
+            // per-run datadir.  Several upstream tests copy files into
+            // $MYSQLTEST_VARDIR/tmp or inspect $MYSQLD_DATADIR directly; using
+            // the package-level default leaked state across chunks/runs and
+            // produced false EEXIST/stale-file failures.
+            `MYSQLTEST_VARDIR=${mysqlTestDataDir}`,
             `MYSQL_TMP_DIR=${tmpTestDir}`,
             // Standard MTR environment variables expected by test scripts
             `MASTER_MYPORT=${port}`,
             `MASTER_MYPORT1=${port}`,
             `MASTER_MYSOCK=/tmp/mysql.sock`,
-            `MYSQLD_DATADIR=${resolve(scriptDir, "test-data")}`,
+            `MYSQLD_DATADIR=${mysqlTestDataDir}`,
             `MYSQL_BINDIR=${resolve(installDir, "bin")}`,
             `MYSQL_SHAREDIR=${resolve(installDir, "share")}`,
             `MYSQL_LIBDIR=${resolve(installDir, "lib")}`,

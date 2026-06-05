@@ -3335,6 +3335,22 @@ export class CentralizedKernelWorker {
     }
   }
 
+  /**
+   * Host-side network bridges mutate kernel global pipes outside the normal
+   * syscall dispatch path. Pipe operations enqueue wakeup events in the kernel;
+   * if the host does not drain those events here, long TCP transfers can grow
+   * the wakeup queue until unrelated later syscalls fail from allocator
+   * pressure. Draining also preserves normal POSIX pipe readiness behavior:
+   * host writes wake blocked readers, and host reads wake blocked writers.
+   */
+  private afterHostPipeMutation(): void {
+    try {
+      this.drainAndProcessWakeupEvents();
+    } catch (err) {
+      console.error("[kernel-worker] failed to drain wakeups after host pipe mutation:", err);
+    }
+  }
+
   private anyPendingRetryNeedsSignalSafeWake(): boolean {
     for (const entry of this.pendingPollRetries.values()) {
       if (entry.needsSignalSafeWake) return true;
@@ -3715,6 +3731,7 @@ export class CentralizedKernelWorker {
       for (;;) {
         const readN = pipeRead(0, conn.sendPipeIdx, BigInt(conn.scratchOffset), 65536);
         if (readN <= 0) break;
+        this.afterHostPipeMutation();
         const outData = Buffer.from(mem.slice(conn.scratchOffset, conn.scratchOffset + readN));
         if (!conn.clientSocket.destroyed) {
           conn.clientSocket.write(outData);
@@ -8538,6 +8555,7 @@ export class CentralizedKernelWorker {
       // server even started reading. Treat as a hard error for the prototype.
       pipeCloseWrite(GLOBAL_PIPE_PID, recvPipeIdx);
       pipeCloseRead(GLOBAL_PIPE_PID, sendPipeIdx);
+      this.afterHostPipeMutation();
       throw new Error(
         `[in-kernel-http ${label}] partial write ${written}/${rawRequest.length}`,
       );
@@ -8610,6 +8628,7 @@ export class CentralizedKernelWorker {
       mem.set(data.subarray(written, written + chunk), scratchOffset);
       const n = pipeWrite(pid, pipeIdx, BigInt(scratchOffset), chunk);
       if (n <= 0) break;
+      this.afterHostPipeMutation();
       written += n;
     }
     return written;
@@ -8641,6 +8660,7 @@ export class CentralizedKernelWorker {
       const finish = (response: HttpResponse) => {
         pipeCloseRead(pid, sendPipeIdx);
         pipeCloseWrite(pid, recvPipeIdx);
+        this.afterHostPipeMutation();
         this.notifyPipeReadable(recvPipeIdx);
         this.scheduleWakeBlockedRetries();
         resolve(response);
@@ -8663,6 +8683,7 @@ export class CentralizedKernelWorker {
         }
 
         if (gotData) {
+          this.afterHostPipeMutation();
           // Wake any writer blocked filling this pipe (we just freed buffer).
           this.notifyPipeWritable(sendPipeIdx);
         }
@@ -8762,6 +8783,7 @@ export class CentralizedKernelWorker {
         mem.set(chunk.subarray(0, toWrite), scratchOffset);
         const written = pipeWrite(GLOBAL_PIPE_PID, recvPipeIdx, BigInt(scratchOffset), toWrite);
         if (written <= 0) break; // Pipe full, retry next pump
+        this.afterHostPipeMutation();
         if (written >= chunk.length) {
           inboundQueue.shift();
         } else {
@@ -8770,6 +8792,7 @@ export class CentralizedKernelWorker {
       }
       if (clientEnded && inboundQueue.length === 0) {
         pipeCloseWrite(GLOBAL_PIPE_PID, recvPipeIdx);
+        this.afterHostPipeMutation();
       }
     };
 
@@ -8783,6 +8806,7 @@ export class CentralizedKernelWorker {
       for (;;) {
         const readN = pipeRead(GLOBAL_PIPE_PID, sendPipeIdx, BigInt(scratchOffset), 65536);
         if (readN <= 0) break;
+        this.afterHostPipeMutation();
         totalRead += readN;
         const outData = Buffer.from(mem.slice(scratchOffset, scratchOffset + readN));
         if (!clientSocket.destroyed) {
@@ -8877,6 +8901,7 @@ export class CentralizedKernelWorker {
       //   sendPipe: host is the reader → close read end
       pipeCloseWrite(GLOBAL_PIPE_PID, recvPipeIdx);
       pipeCloseRead(GLOBAL_PIPE_PID, sendPipeIdx);
+      this.afterHostPipeMutation();
       connections.delete(clientSocket);
       // Remove from tcpConnections tracking
       const arr = this.tcpConnections?.get(pid);
@@ -8939,6 +8964,7 @@ export class CentralizedKernelWorker {
       cleaned = true;
       pipeCloseWrite(GLOBAL_PIPE_PID, recvPipeIdx);
       pipeCloseRead(GLOBAL_PIPE_PID, sendPipeIdx);
+      this.afterHostPipeMutation();
       peer.close();
       this.notifyPipeReadable(recvPipeIdx, pid);
       this.notifyPipeWritable(sendPipeIdx);
@@ -8957,6 +8983,7 @@ export class CentralizedKernelWorker {
         }
         if (data.length === 0) {
           pipeCloseWrite(GLOBAL_PIPE_PID, recvPipeIdx);
+          this.afterHostPipeMutation();
           this.notifyPipeReadable(recvPipeIdx, pid);
           return;
         }
@@ -8974,6 +9001,7 @@ export class CentralizedKernelWorker {
       for (;;) {
         const n = pipeRead(GLOBAL_PIPE_PID, sendPipeIdx, BigInt(scratchOffset), 65536);
         if (n <= 0) break;
+        this.afterHostPipeMutation();
         try {
           peer.send(mem.slice(scratchOffset, scratchOffset + n), 0);
         } catch {

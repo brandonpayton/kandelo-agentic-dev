@@ -31,6 +31,7 @@ declare global {
   interface Window {
     __mariadbTestReady: boolean;
     __runMariadbTest: (testName: string, timeoutMs?: number) => Promise<TestResult>;
+    __probeMariadb: (timeoutMs?: number) => Promise<boolean>;
   }
 }
 
@@ -50,6 +51,28 @@ let kernel: BrowserKernel | null = null;
 let mysqlTestBytes: ArrayBuffer | null = null;
 let testStderr = "";
 
+async function ensureMysqlTestDirs(): Promise<void> {
+  if (!kernel) return;
+  try {
+    const { exit } = await kernel.spawnFromVfs(
+      "/bin/mkdir",
+      ["mkdir", "-p", "/data/tmp", "/tmp", "/log", "/run"],
+      { env: ["PATH=/bin:/usr/bin"], cwd: "/" },
+    );
+    await exit;
+    const chmod = await kernel.spawnFromVfs(
+      "/bin/chmod",
+      ["chmod", "777", "/data/tmp", "/tmp"],
+      { env: ["PATH=/bin:/usr/bin"], cwd: "/" },
+    );
+    await chmod.exit;
+  } catch {
+    // The actual mysqltest invocation will report a concrete path error if
+    // the VFS helper is unavailable. Keep this best-effort so harness startup
+    // failures still surface through the normal test result path.
+  }
+}
+
 async function runMysqlTestCommand(
   testName: string,
   testFile: string,
@@ -61,6 +84,7 @@ async function runMysqlTestCommand(
 
   const start = performance.now();
   testStderr = "";
+  await ensureMysqlTestDirs();
 
   const argv = [
     "mysqltest", "--no-defaults",
@@ -68,16 +92,25 @@ async function runMysqlTestCommand(
     "--user=root", "--database=test",
     `--test-file=${testFile}`,
     "--basedir=/mysql-test",
-    "--tmpdir=/tmp",
+    "--tmpdir=/data/tmp",
     "--silent",
     "--protocol=tcp",
   ];
 
   const env = [
-    "HOME=/tmp", "PATH=/usr/bin", "TMPDIR=/tmp",
+    "HOME=/tmp", "PATH=/usr/bin", "TMPDIR=/data/tmp",
     "MYSQL_TEST_DIR=/mysql-test",
+    // The upstream MTR tests require MYSQLD_DATADIR to be inside
+    // MYSQLTEST_VARDIR, and many hard-code $MYSQLTEST_VARDIR/tmp. The server
+    // itself still uses /tmp for internal temp tables; before each mysqltest
+    // spawn we recreate /data/tmp because tests may create/drop a database
+    // named `tmp`, which maps to the same datadir path.
     "MYSQLTEST_VARDIR=/data",
-    "MYSQL_TMP_DIR=/tmp",
+    "MYSQL_TMP_DIR=/data/tmp",
+    "MYSQLD_DATADIR=/data/master-data",
+    "MYSQL_BINDIR=/usr/bin",
+    "MYSQL_SHAREDIR=/usr/share/mysql",
+    "MYSQL_LIBDIR=/usr/lib",
   ];
 
   try {
@@ -184,6 +217,11 @@ async function init() {
   } else {
     appendLog("Setup SQL complete.\n", "info");
   }
+
+  window.__probeMariadb = async (timeoutMs = 5000): Promise<boolean> => {
+    const result = await runMysqlTestCommand("__probe", "/mysql-test/main/__probe.test", timeoutMs);
+    return result.exitCode === 0;
+  };
 
   window.__runMariadbTest = async (testName: string, timeoutMs = 60000): Promise<TestResult> => {
     const resetResult = await runMysqlTestCommand("__reset", "/mysql-test/main/__reset.test", 15000);
