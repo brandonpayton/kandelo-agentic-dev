@@ -18,7 +18,6 @@
 import { BrowserKernel } from "@host/browser-kernel-host";
 import kernelWasmUrl from "@kernel-wasm?url";
 import mysqlTestWasmUrl from "@binaries/programs/wasm32/mariadb/mysqltest.wasm?url";
-import VFS_IMAGE_URL from "@binaries/programs/wasm32/mariadb-test.vfs.zst?url";
 
 const MYSQL_PORT = 3306;
 
@@ -108,11 +107,11 @@ async function init() {
 
   const [kernelBytes, vfsImageBuf, mysqlTestBytesResult] = await Promise.all([
     fetch(kernelWasmUrl).then((r) => r.arrayBuffer()),
-    fetch(VFS_IMAGE_URL).then((r) => {
+    fetch("/mariadb-test.vfs.zst").then((r) => {
       if (!r.ok) {
         throw new Error(
-          `Failed to load VFS image from ${VFS_IMAGE_URL} (${r.status}). ` +
-          `Run: bash packages/registry/mariadb-test/build-mariadb-test.sh`,
+          `mariadb-test.vfs.zst not found (${r.status}). ` +
+          `Run: bash images/vfs/scripts/build-mariadb-test-vfs-image.sh`,
         );
       }
       return r.arrayBuffer();
@@ -154,7 +153,7 @@ async function init() {
   const { exit } = await kernel.boot({
     kernelWasm: kernelBytes,
     vfsImage,
-    argv: ["/sbin/dinit", "--container", "-p", "/tmp/dinitctl"],
+    argv: ["/sbin/dinit", "--container", "-p", "/tmp/dinitctl", "mariadb"],
     env: ["HOME=/root", "TERM=xterm-256color", "USER=root", "LOGNAME=root", "PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"],
     cwd: "/root",
     uid: 0,

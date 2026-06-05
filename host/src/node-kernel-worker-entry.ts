@@ -72,6 +72,7 @@ let kernelWorker: CentralizedKernelWorker;
 let workerAdapter: NodeWorkerAdapter;
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
+const THREAD_TRACE = typeof process !== "undefined" && !!process.env.KERNEL_THREAD_TRACE;
 let execPrograms: Record<string, string> = {};
 let vfsExecIO: PlatformIO | null = null;
 let rootfsMemfs: MemoryFileSystem | null = null;
@@ -165,6 +166,36 @@ function reportProcessExit(pid: number, status: number): void {
   if (reportedExits.has(pid)) return;
   reportedExits.add(pid);
   post({ type: "exit", pid, status });
+}
+
+function reclaimExitedThreadWorker(pid: number, tid: number, channelOffset: number): void {
+  const threads = threadWorkers.get(pid);
+  if (!threads) {
+    if (THREAD_TRACE) console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no thread list`);
+    return;
+  }
+  const idx = threads.findIndex((entry) =>
+    entry.channelOffset === channelOffset || (tid > 0 && entry.tid === tid),
+  );
+  if (idx < 0) {
+    if (THREAD_TRACE) console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no entry`);
+    return;
+  }
+
+  const [entry] = threads.splice(idx, 1);
+  if (threads.length === 0) threadWorkers.delete(pid);
+
+  const processInfo = processes.get(pid);
+  if (processInfo) {
+    processInfo.threadAllocator.free(entry.basePage);
+  } else if (THREAD_TRACE) {
+    console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} no process`);
+  }
+  if (THREAD_TRACE) {
+    console.error(`[thread] reclaim pid=${pid} tid=${tid} channel=0x${channelOffset.toString(16)} base=${entry.basePage} remaining=${threads.length}`);
+  }
+  entry.termination = entry.termination ?? terminateTrackedWorker(entry.worker);
+  void entry.termination;
 }
 
 // PTY index per-PID
@@ -514,9 +545,15 @@ async function handleInit(msg: InitMessage) {
       onResolveSpawn: handlePosixSpawnResolve,
       onSpawn: handlePosixSpawn,
       onClone: handleClone,
+      onThreadExit: handleThreadExit,
       onExit: handleExit,
     },
   );
+
+  // Use the polling scheduler in the dedicated kernel worker too. Long,
+  // multi-threaded workloads can otherwise livelock in V8 waitAsync promise
+  // continuations while guest threads are asleep and no channel makes progress.
+  kernelWorker.usePolling = true;
 
   kernelWorker.setOutputCallbacks({
     onStdout: (data: Uint8Array) => {
@@ -768,6 +805,7 @@ async function handleExec(
   kernelWorker.prepareProcessForExec(pid);
 
   const oldInfo = processes.get(pid);
+  await terminateThreadWorkers(pid);
   if (oldInfo?.worker) {
     intentionallyTerminated.add(oldInfo.worker as object);
     await oldInfo.worker.terminate().catch(() => {});
@@ -1026,13 +1064,15 @@ async function handleClone(
   let reclaimed = false;
   const reclaimThread = () => {
     if (reclaimed) return;
+    const threads = threadWorkers.get(pid);
+    const idx = threads?.indexOf(threadEntry) ?? -1;
+    if (idx < 0) {
+      reclaimed = true;
+      return;
+    }
     reclaimed = true;
     processInfo.threadAllocator.free(alloc.basePage);
-    const threads = threadWorkers.get(pid);
-    if (threads) {
-      const idx = threads.indexOf(threadEntry);
-      if (idx >= 0) threads.splice(idx, 1);
-    }
+    threads!.splice(idx, 1);
   };
   const terminateThreadEntry = (): Promise<void> => {
     if (!threadEntry.termination) {
@@ -1059,6 +1099,14 @@ async function handleClone(
   threadWorker.on("error", (err: Error) => failThread(`worker error: ${err.message ?? err}`));
 
   return tid;
+}
+
+function handleThreadExit(pid: number, tid: number, channelOffset: number): void {
+  // Kernel-side SYS_EXIT is the point at which the guest thread is gone and
+  // CLONE_CHILD_CLEARTID has been performed. Reclaim the reserved slot here
+  // and terminate the finished JS Worker so rapid pthread create/join loops do
+  // not exhaust slots while worker messages wait behind more clone syscalls.
+  reclaimExitedThreadWorker(pid, tid, channelOffset);
 }
 
 function handleExit(pid: number, exitStatus: number): void {
@@ -1140,6 +1188,9 @@ async function handleTerminate(msg: TerminateProcessMessage) {
 // --- Destroy ---
 
 async function handleDestroy(msg: { requestId: number }) {
+  if (process.env.WASM_POSIX_PROFILE) {
+    try { kernelWorker.dumpProfile(); } catch {}
+  }
   const processEntries = [...processes.entries()];
   for (const [pid, info] of processEntries) {
     await terminateThreadWorkers(pid);

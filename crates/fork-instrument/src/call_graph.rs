@@ -11,11 +11,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use walrus::ir::{
-    dfs_in_order, Call, CallIndirect, ReturnCall, ReturnCallIndirect, TableCopy, TableFill,
-    TableGrow, TableInit, TableSet, Visitor,
+    Call, CallIndirect, RefFunc, ReturnCall, ReturnCallIndirect, TableCopy, TableFill, TableGrow,
+    TableInit, TableSet, Visitor, dfs_in_order,
 };
 use walrus::{
-    ElementId, ElementItems, ElementKind, FunctionId, ImportKind, Module, TableId, TypeId,
+    ElementId, ElementItems, ElementKind, FunctionId, GlobalKind, ImportKind, Module, TableId,
+    TypeId,
 };
 
 /// Look up a function by its qualified import name (e.g.
@@ -42,6 +43,7 @@ struct CollectCalls {
     table_inits: Vec<(ElementId, TableId)>,
     table_copies: Vec<(TableId, TableId)>,
     dynamic_table_writes: HashSet<TableId>,
+    ref_funcs: HashSet<FunctionId>,
 }
 
 impl<'a> Visitor<'a> for CollectCalls {
@@ -86,6 +88,10 @@ impl<'a> Visitor<'a> for CollectCalls {
     fn visit_table_grow(&mut self, instr: &TableGrow) {
         self.dynamic_table_writes.insert(instr.table);
     }
+
+    fn visit_ref_func(&mut self, instr: &RefFunc) {
+        self.ref_funcs.insert(instr.func);
+    }
 }
 
 /// Per-function analysis: what it directly calls and what
@@ -96,6 +102,7 @@ struct FuncProfile {
     table_inits: Vec<(ElementId, TableId)>,
     table_copies: Vec<(TableId, TableId)>,
     dynamic_table_writes: HashSet<TableId>,
+    ref_funcs: HashSet<FunctionId>,
 }
 
 fn profile_functions(module: &Module) -> HashMap<FunctionId, FuncProfile> {
@@ -111,6 +118,7 @@ fn profile_functions(module: &Module) -> HashMap<FunctionId, FuncProfile> {
                 table_inits: collector.table_inits,
                 table_copies: collector.table_copies,
                 dynamic_table_writes: collector.dynamic_table_writes,
+                ref_funcs: collector.ref_funcs,
             },
         );
     }
@@ -202,16 +210,33 @@ fn const_expr_functions(expr: &walrus::ConstExpr) -> HashSet<FunctionId> {
 #[derive(Default)]
 struct TableTargets {
     funcs_by_table: HashMap<TableId, HashSet<FunctionId>>,
-    unknown_tables: HashSet<TableId>,
+    dynamic_tables: HashSet<TableId>,
+    dynamic_funcs: HashSet<FunctionId>,
 }
 
 impl TableTargets {
-    fn table_can_contain(&self, table: TableId, func: FunctionId) -> bool {
-        self.unknown_tables.contains(&table)
-            || self
-                .funcs_by_table
-                .get(&table)
-                .is_some_and(|funcs| funcs.contains(&func))
+    fn matching_funcs(&self, module: &Module, table: TableId, ty: TypeId) -> HashSet<FunctionId> {
+        let mut result = HashSet::new();
+
+        if let Some(funcs) = self.funcs_by_table.get(&table) {
+            result.extend(
+                funcs
+                    .iter()
+                    .copied()
+                    .filter(|func| types_match(module, function_type_id(module, *func), ty)),
+            );
+        }
+
+        if self.dynamic_tables.contains(&table) {
+            result.extend(
+                self.dynamic_funcs
+                    .iter()
+                    .copied()
+                    .filter(|func| types_match(module, function_type_id(module, *func), ty)),
+            );
+        }
+
+        result
     }
 }
 
@@ -224,10 +249,13 @@ impl TableTargets {
 /// initialize a table, so they are intentionally ignored here.
 ///
 /// Dynamic table writes (`table.set`, `table.fill`, `table.grow`) can place
-/// references this static pass cannot recover. For those tables we preserve
-/// soundness by treating the table as unknown, so any matching-signature
-/// function may be a target. `table.copy` propagates known and unknown target
-/// sets from source to destination.
+/// references this static pass cannot recover. For those tables, the possible
+/// target set is the module's address-taken functions: functions present in
+/// element segments, constant `ref.func` initializers, or executable
+/// `ref.func` instructions. Treating such a table as containing every module
+/// function is too broad for fork instrumentation because it marks ordinary
+/// syscall and allocation paths as fork paths. `table.copy` propagates known
+/// and dynamic target sets from source to destination.
 fn table_targets(module: &Module, profiles: &HashMap<FunctionId, FuncProfile>) -> TableTargets {
     let mut targets = TableTargets::default();
     let mut passive_table_inits: HashMap<ElementId, HashSet<TableId>> = HashMap::new();
@@ -239,18 +267,29 @@ fn table_targets(module: &Module, profiles: &HashMap<FunctionId, FuncProfile>) -
         }
         table_copies.extend(profile.table_copies.iter().copied());
         targets
-            .unknown_tables
+            .dynamic_tables
             .extend(profile.dynamic_table_writes.iter().copied());
+        targets
+            .dynamic_funcs
+            .extend(profile.ref_funcs.iter().copied());
     }
 
     for table in module.tables.iter() {
         if let Some(init) = &table.init {
+            let funcs = const_expr_functions(init);
+            targets.dynamic_funcs.extend(funcs.iter().copied());
             targets
                 .funcs_by_table
                 .entry(table.id())
                 .or_default()
-                .extend(const_expr_functions(init));
+                .extend(funcs);
         }
+    }
+
+    for global in module.globals.iter() {
+        targets
+            .dynamic_funcs
+            .extend(global_kind_functions(&global.kind));
     }
 
     for elem in module.elements.iter() {
@@ -258,6 +297,7 @@ fn table_targets(module: &Module, profiles: &HashMap<FunctionId, FuncProfile>) -
         if funcs.is_empty() {
             continue;
         }
+        targets.dynamic_funcs.extend(funcs.iter().copied());
         match &elem.kind {
             ElementKind::Active { table, .. } => {
                 targets
@@ -285,7 +325,7 @@ fn table_targets(module: &Module, profiles: &HashMap<FunctionId, FuncProfile>) -
     while changed {
         changed = false;
         for &(src, dst) in &table_copies {
-            if targets.unknown_tables.contains(&src) && targets.unknown_tables.insert(dst) {
+            if targets.dynamic_tables.contains(&src) && targets.dynamic_tables.insert(dst) {
                 changed = true;
             }
 
@@ -302,6 +342,13 @@ fn table_targets(module: &Module, profiles: &HashMap<FunctionId, FuncProfile>) -
     }
 
     targets
+}
+
+fn global_kind_functions(kind: &GlobalKind) -> HashSet<FunctionId> {
+    match kind {
+        GlobalKind::Local(expr) => const_expr_functions(expr),
+        GlobalKind::Import(_) => HashSet::new(),
+    }
 }
 
 /// A function's signature, used for comparing against `call_indirect`
@@ -326,7 +373,31 @@ fn types_match(module: &Module, a: TypeId, b: TypeId) -> bool {
     ta.params() == tb.params() && ta.results() == tb.results()
 }
 
+fn is_indirect_trampoline(profile: &FuncProfile) -> bool {
+    profile.direct.is_empty() && profile.indirect.len() == 1
+}
+
 const MAX_INDIRECT_DEPTH: u8 = 2;
+
+#[derive(Debug, Clone)]
+pub enum ReachReason {
+    Seed,
+    DirectCall {
+        callee: FunctionId,
+    },
+    IndirectCall {
+        target: FunctionId,
+        table: TableId,
+        ty: TypeId,
+        indirect_depth: u8,
+    },
+}
+
+#[derive(Debug)]
+pub struct ReachingTrace {
+    pub reached: HashSet<FunctionId>,
+    pub reasons: HashMap<FunctionId, ReachReason>,
+}
 
 /// Compute the transitive closure of functions that reach `seed` via
 /// direct calls, plus a bounded number of table/function-pointer dispatches.
@@ -345,7 +416,23 @@ const MAX_INDIRECT_DEPTH: u8 = 2;
 /// (`JS_CallInternal -> js_call_c_function -> js_os_exec`) while avoiding
 /// whole-runtime closure in dynamic interpreters where a generic dispatcher
 /// can theoretically call thousands of same-table, same-signature callbacks.
+///
+/// Ambiguous table/signature matches are followed for the first indirect hop
+/// out of the direct fork path. That covers real C dispatcher frames such as
+/// Tcl command dispatch (`Dispatch -> Tcl_OpenObjCmd -> fork`) that must be
+/// saved for fork unwind. Ambiguous second-hop matches are only followed
+/// through simple indirect trampolines (no direct calls, exactly one
+/// `call_indirect`), which covers Tcl's NR callback dispatch into `Dispatch`.
+/// Broader ambiguous second-hop matches are not safe without index value-flow:
+/// in large C modules they cross unrelated callback domains (for example
+/// SQLite VFS callbacks into libc signal delivery) and instrument
+/// syscall/allocation paths that do not actually fork. Unambiguous table
+/// matches can still use the bounded two-hop path.
 pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId> {
+    reaching_closure_with_reasons(module, seed).reached
+}
+
+pub fn reaching_closure_with_reasons(module: &Module, seed: FunctionId) -> ReachingTrace {
     let profiles = profile_functions(module);
     let table_targets = table_targets(module, &profiles);
 
@@ -375,13 +462,16 @@ pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId
     // reaches the seed without crossing a function-pointer dispatch, so it
     // is safe to use as an indirect root below.
     let mut result = HashSet::new();
+    let mut reasons = HashMap::new();
     let mut direct_queue = VecDeque::new();
     result.insert(seed);
+    reasons.insert(seed, ReachReason::Seed);
     direct_queue.push_back(seed);
     while let Some(g) = direct_queue.pop_front() {
         if let Some(callers) = reverse_direct.get(&g) {
             for &caller in callers {
                 if result.insert(caller) {
+                    reasons.insert(caller, ReachReason::DirectCall { callee: g });
                     direct_queue.push_back(caller);
                 }
             }
@@ -392,13 +482,16 @@ pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId
     let mut best_indirect_depth: HashMap<FunctionId, u8> =
         direct_roots.iter().map(|&id| (id, 0)).collect();
     let mut worklist: VecDeque<(FunctionId, u8)> = direct_roots.iter().map(|&id| (id, 0)).collect();
+    let mut matching_cache: HashMap<IndirectCall, HashSet<FunctionId>> = HashMap::new();
 
     fn enqueue(
         func: FunctionId,
         indirect_depth: u8,
         best_indirect_depth: &mut HashMap<FunctionId, u8>,
+        reasons: &mut HashMap<FunctionId, ReachReason>,
         result: &mut HashSet<FunctionId>,
         worklist: &mut VecDeque<(FunctionId, u8)>,
+        reason: ReachReason,
     ) {
         let should_enqueue = match best_indirect_depth.get(&func) {
             Some(&old_depth) => indirect_depth < old_depth,
@@ -406,6 +499,7 @@ pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId
         };
         if should_enqueue {
             best_indirect_depth.insert(func, indirect_depth);
+            reasons.insert(func, reason);
             result.insert(func);
             worklist.push_back((func, indirect_depth));
         }
@@ -419,8 +513,10 @@ pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId
                     caller,
                     indirect_depth,
                     &mut best_indirect_depth,
+                    &mut reasons,
                     &mut result,
                     &mut worklist,
+                    ReachReason::DirectCall { callee: g },
                 );
             }
         }
@@ -429,24 +525,40 @@ pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId
         // `call_indirect` with g's signature against a table that can
         // contain g might be reaching g. Add those callers.
         if indirect_depth < MAX_INDIRECT_DEPTH {
-            let g_ty = function_type_id(module, g);
             for &(indirect, caller) in &indirect_callers {
-                if table_targets.table_can_contain(indirect.table, g)
-                    && types_match(module, indirect.ty, g_ty)
+                let matching = matching_cache.entry(indirect).or_insert_with(|| {
+                    table_targets.matching_funcs(module, indirect.table, indirect.ty)
+                });
+                let unambiguous = matching.len() == 1;
+                let first_indirect_hop = indirect_depth == 0;
+                let trampoline_second_hop =
+                    indirect_depth == 1 && profiles.get(&g).is_some_and(is_indirect_trampoline);
+                if matching.contains(&g)
+                    && (unambiguous || first_indirect_hop || trampoline_second_hop)
                 {
                     enqueue(
                         caller,
                         indirect_depth + 1,
                         &mut best_indirect_depth,
+                        &mut reasons,
                         &mut result,
                         &mut worklist,
+                        ReachReason::IndirectCall {
+                            target: g,
+                            table: indirect.table,
+                            ty: indirect.ty,
+                            indirect_depth: indirect_depth + 1,
+                        },
                     );
                 }
             }
         }
     }
 
-    result
+    ReachingTrace {
+        reached: result,
+        reasons,
+    }
 }
 
 /// Human-readable name for a function, for logging and JSON output.

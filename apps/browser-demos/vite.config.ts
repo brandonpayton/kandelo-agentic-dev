@@ -395,6 +395,40 @@ function devCorsProxyMiddleware(): Plugin {
   };
 }
 
+
+const demoInputs = {
+  main: path.resolve(__dirname, "index.html"),
+  kandelo: path.resolve(__dirname, "pages/kandelo/index.html"),
+  network: path.resolve(__dirname, "pages/network/index.html"),
+  "test-runner": path.resolve(__dirname, "pages/test-runner/index.html"),
+  "sqlite-test": path.resolve(__dirname, "pages/sqlite-test/index.html"),
+  "mariadb-test": path.resolve(__dirname, "pages/mariadb-test/index.html"),
+  "php-test": path.resolve(__dirname, "pages/php-test/index.html"),
+  "spidermonkey-test": path.resolve(__dirname, "pages/spidermonkey-test/index.html"),
+  "nodejs-test": path.resolve(__dirname, "pages/nodejs-test/index.html"),
+  "git-test": path.resolve(__dirname, "pages/git-test/index.html"),
+  benchmark: path.resolve(__dirname, "pages/benchmark/index.html"),
+};
+
+function selectedDemoInputs(): typeof demoInputs | Record<string, string> {
+  const requested = process.env.KANDELO_BROWSER_DEMO_INPUTS
+    ?.split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  if (!requested || requested.length === 0) return demoInputs;
+
+  const selected: Record<string, string> = {};
+  for (const name of requested) {
+    if (!(name in demoInputs)) {
+      throw new Error(`Unknown KANDELO_BROWSER_DEMO_INPUTS entry: ${name}`);
+    }
+    selected[name] = demoInputs[name as keyof typeof demoInputs];
+  }
+  return selected;
+}
+
+const disableBrowserTestHmr = process.env.KANDELO_BROWSER_TEST_NO_HMR === "1";
+
 export default defineConfig({
   base: process.env.VITE_BASE || "/",
   resolve: {
@@ -416,6 +450,13 @@ export default defineConfig({
     host: "127.0.0.1",
     port: preferredLocalPort,
     headers: crossOriginIsolationHeaders,
+    hmr: disableBrowserTestHmr ? false : undefined,
+    watch: disableBrowserTestHmr ? {
+      ignored: [
+        "**/test-runs/**",
+        "**/host/dist/**",
+      ],
+    } : undefined,
     fs: {
       allow: [repoRoot],
     },
@@ -433,16 +474,7 @@ export default defineConfig({
     // (Firefox).
     minify: "terser",
     rollupOptions: {
-      input: {
-        main: path.resolve(__dirname, "index.html"),
-        kandelo: path.resolve(__dirname, "pages/kandelo/index.html"),
-        network: path.resolve(__dirname, "pages/network/index.html"),
-        // The perl, python, ruby, erlang, texlive, and redis package entries
-        // are not bundled into this static build while their slow builds
-        // live in kandelo-software. The root gallery fetches that
-        // repo's gallery.json and index.toml at runtime to expose
-        // available third-party VFS builds without adding page inputs.
-      },
+      input: selectedDemoInputs(),
     },
   },
   worker: {

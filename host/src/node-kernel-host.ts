@@ -415,6 +415,7 @@ export class NodeKernelHost {
     }
     await this.worker.terminate();
     this.exitResolvers.clear();
+    this.unclaimedExitStatuses.clear();
     this.pendingRequests.clear();
   }
 

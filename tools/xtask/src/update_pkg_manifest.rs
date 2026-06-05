@@ -477,9 +477,7 @@ headers = []
 
         // Surrounding fields must survive (formatting + co-tenants).
         assert!(after.contains("script_path = \"packages/registry/zlib/build-zlib.sh\""));
-        assert!(after.contains(
-            "repo_url    = \"https://github.com/kandelo/kandelo.git\""
-        ));
+        assert!(after.contains("repo_url    = \"https://github.com/kandelo/kandelo.git\""));
         assert!(after.contains("[binary.wasm32]"));
     }
 
