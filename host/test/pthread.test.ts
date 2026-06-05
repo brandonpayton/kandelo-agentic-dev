@@ -3,17 +3,21 @@ import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runCentralizedProgram } from "./centralized-test-helper";
+import { NodePlatformIO } from "../src/platform/node";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pthreadBinary = join(__dirname, "../../examples/test-pthread.wasm");
 const hasBinary = existsSync(pthreadBinary);
 const threadExitGroupBinary = join(__dirname, "../../examples/thread-exit-group.wasm");
 const hasThreadExitGroupBinary = existsSync(threadExitGroupBinary);
+const threadSlotReuseBinary = join(__dirname, "../../examples/thread-slot-reuse.wasm");
+const hasThreadSlotReuseBinary = existsSync(threadSlotReuseBinary);
 
 describe.skipIf(!hasBinary)("pthread", () => {
   it("creates a thread that modifies shared state and returns a value", async () => {
     const { exitCode, stdout } = await runCentralizedProgram({
       programPath: pthreadBinary,
+      io: new NodePlatformIO(),
       timeout: 30_000,
     });
 
@@ -30,11 +34,28 @@ describe.skipIf(!hasThreadExitGroupBinary)("thread process exit", () => {
       const { exitCode, stderr } = await runCentralizedProgram({
         programPath: threadExitGroupBinary,
         argv: ["thread-exit-group"],
+        io: new NodePlatformIO(),
         timeout: 10_000,
       });
 
       expect(stderr).toBe("");
       expect(exitCode).toBe(0);
     }
+  }, 30_000);
+});
+
+describe.skipIf(!hasThreadSlotReuseBinary)("pthread slot reuse", () => {
+  it("reclaims reserved thread slots across rapid create/join loops", async () => {
+    const { exitCode, stdout, stderr } = await runCentralizedProgram({
+      programPath: threadSlotReuseBinary,
+      argv: ["thread-slot-reuse"],
+      io: new NodePlatformIO(),
+      timeout: 30_000,
+    });
+
+    expect(stderr).toBe("");
+    expect(stdout).toContain("thread slot reuse ok");
+    expect(stdout).toContain("PASS");
+    expect(exitCode).toBe(0);
   }, 30_000);
 });

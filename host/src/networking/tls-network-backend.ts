@@ -136,23 +136,11 @@ function formatHttpResponse(
   return result;
 }
 
-function corsProxyFetchUrl(corsProxyUrl: string, targetUrl: string): string {
-  if (targetUrl.startsWith(corsProxyUrl)) {
-    return targetUrl;
-  }
-  const proxiedTarget = corsProxyUrl.endsWith("?")
-    ? targetUrl
-    : encodeURIComponent(targetUrl);
-  return `${corsProxyUrl}${proxiedTarget}`;
-}
-
 // ------------------------------------------------------------------ backend
 
 export interface TlsNetworkBackendOptions {
-  /** CORS proxy URL prefix.
-   *  Browser demos normally leave this unset and rely on the service worker.
-   *  Prefixes ending in bare `?` receive the raw target URL, matching the
-   *  main proxy; `?url=`-style prefixes receive a percent-encoded target. */
+  /** CORS proxy URL prefix. The target URL (percent-encoded) is appended.
+   *  In dev: "/cors-proxy?url=" (vite middleware). In prod: set via service worker. */
   corsProxyUrl?: string;
   /** Map of in-VFS hostnames → upstream URL, routed through host fetch +
    *  CORS proxy (e.g. proxy.local → registry.npmjs.org). Defaults to that
@@ -173,7 +161,7 @@ export class TlsNetworkBackend implements NetworkIO {
   private initialized = false;
 
   constructor(options?: TlsNetworkBackendOptions) {
-    this.corsProxyUrl = options?.corsProxyUrl?.trim() ?? "";
+    this.corsProxyUrl = options?.corsProxyUrl ?? "";
     this.dnsAliases = options?.dnsAliases ?? { "proxy.local": "https://registry.npmjs.org" };
   }
 
@@ -438,7 +426,7 @@ export class TlsNetworkBackend implements NetworkIO {
     // when corsProxyUrl is configured, every fetch goes through it.
     const upstreamUrl = `https://${host}${path}`;
     const url = this.corsProxyUrl
-      ? corsProxyFetchUrl(this.corsProxyUrl, upstreamUrl)
+      ? `${this.corsProxyUrl}${encodeURIComponent(upstreamUrl)}`
       : upstreamUrl;
 
     const fetchHeaders = new Headers();
@@ -527,7 +515,7 @@ export class TlsNetworkBackend implements NetworkIO {
       ? `${aliasUpstream}${path}`
       : `${scheme}://${host}${path}`;
     const url = this.corsProxyUrl
-      ? corsProxyFetchUrl(this.corsProxyUrl, upstreamUrl)
+      ? `${this.corsProxyUrl}${encodeURIComponent(upstreamUrl)}`
       : upstreamUrl;
     const isNpmRegistry = aliasUpstream === "https://registry.npmjs.org";
 

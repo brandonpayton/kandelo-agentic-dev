@@ -98,6 +98,17 @@ describe("SharedLockTable", () => {
     expect(result).toBe(false);
   });
 
+  it("grows instead of reporting lock conflicts when capacity is exhausted", () => {
+    const table = SharedLockTable.create(2);
+    expect(table.setLock(100, 1, 1, 0n, 10n)).toBe(true);
+    expect(table.setLock(200, 2, 1, 0n, 10n)).toBe(true);
+    expect(table.setLock(300, 3, 1, 0n, 10n)).toBe(true);
+
+    expect(table.getBlockingLock(100, 1, 0n, 10n, 4)?.pid).toBe(1);
+    expect(table.getBlockingLock(200, 1, 0n, 10n, 4)?.pid).toBe(2);
+    expect(table.getBlockingLock(300, 1, 0n, 10n, 4)?.pid).toBe(3);
+  });
+
   it("should removeLocksByPid", () => {
     const table = SharedLockTable.create();
     table.setLock(100, 1, 1, 0n, 50n);

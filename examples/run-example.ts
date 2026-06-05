@@ -44,6 +44,7 @@ const unzipWasm = tryResolveBinary("programs/unzip.wasm");
 const nodeWasm =
     tryResolveBinary("programs/node.wasm") ??
     tryResolveBinary("programs/spidermonkey-node.wasm");
+const sqlite3Wasm = tryResolveBinary("programs/sqlite.wasm");
 const lsofWasm = resolve(repoRoot, "examples/lsof.wasm");
 const rubyWasm = tryResolveBinary("programs/ruby.wasm");
 const vimWasm = tryResolveBinary("programs/vim.zip");
@@ -78,6 +79,7 @@ const builtinPrograms: Record<string, string | null> = {
     "/usr/bin/echo": resolve(repoRoot, "examples/echo.wasm"),
     "sh": dashWasm,
     "/bin/sh": dashWasm,
+    "/usr/bin/sh": dashWasm,
     "dash": dashWasm,
     "/bin/dash": dashWasm,
     "grep": grepWasm,
@@ -235,6 +237,9 @@ const builtinPrograms: Record<string, string | null> = {
     "testfixture": testfixtureWasm,
     "/usr/bin/testfixture": testfixtureWasm,
     "/bin/testfixture": testfixtureWasm,
+    "sqlite3": sqlite3Wasm,
+    "/usr/bin/sqlite3": sqlite3Wasm,
+    "/bin/sqlite3": sqlite3Wasm,
     "mysqltest": mysqltestWasm,
     "/usr/bin/mysqltest": mysqltestWasm,
     "/bin/mysqltest": mysqltestWasm,
@@ -250,6 +255,22 @@ for (const name of coreutilsNames) {
 function loadBytes(path: string): ArrayBuffer {
     const buf = readFileSync(path);
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}
+
+function loadBytesIfGuestExecutable(path: string): ArrayBuffer | null {
+    const buf = readFileSync(path);
+    if (buf.length >= 4 && buf[0] === 0x00 && buf[1] === 0x61 && buf[2] === 0x73 && buf[3] === 0x6d) {
+        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    }
+    // Let the worker's shebang resolver handle guest scripts while still
+    // refusing native host ELFs that happen to exist on PATH.
+    if (buf.length >= 2 && buf[0] === 0x23 && buf[1] === 0x21) {
+        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    }
+    if (process.env.KANDELO_TRACE_EXEC) {
+        console.error(`[run-example] skipping non-guest executable candidate: ${path}`);
+    }
+    return null;
 }
 
 function resolveProgram(path: string): ArrayBuffer | null {
@@ -274,10 +295,21 @@ function resolveProgram(path: string): ArrayBuffer | null {
     ];
     for (const c of candidates) {
         if (existsSync(c)) {
-            return loadBytes(c);
+            const bytes = loadBytesIfGuestExecutable(c);
+            if (bytes) return bytes;
         }
     }
     return null;
+}
+
+function parseOptionalUintEnv(name: string): number | undefined {
+    const value = process.env[name];
+    if (value == null || value === "") return undefined;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 0xffffffff) {
+        throw new Error(`${name} must be an unsigned 32-bit integer`);
+    }
+    return parsed;
 }
 
 async function main() {
@@ -338,14 +370,19 @@ async function main() {
     const processArgv = [programPath, ...process.argv.slice(3)];
 
     const timeoutMs = parseInt(process.env.TIMEOUT || "30000", 10);
+    const inheritedEnv = Object.entries(process.env)
+        .filter(([k, v]) => v !== undefined && k !== "PATH" && k !== "SHELL")
+        .map(([k, v]) => `${k}=${v}`);
     const exitPromise = host.spawn(loadBytes(programPath), processArgv, {
         env: [
-            ...Object.entries(process.env)
-                .filter(([, v]) => v !== undefined)
-                .map(([k, v]) => `${k}=${v}`),
+            "PATH=/bin:/usr/bin:/usr/local/bin:.",
+            "SHELL=/bin/sh",
+            ...inheritedEnv,
             ...gitEnv,
         ],
         cwd: process.env.KERNEL_CWD || process.cwd(),
+        uid: parseOptionalUintEnv("KERNEL_UID"),
+        gid: parseOptionalUintEnv("KERNEL_GID"),
         stdin: stdinData,
     });
 

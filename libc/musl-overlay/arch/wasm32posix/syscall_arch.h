@@ -25,6 +25,10 @@
 #define __scc(X) ((long long) (X))
 typedef long syscall_arg_t;
 
+/* syscall_cp() is not variadic. Keep cancellation-point syscalls on the
+ * cancellable path while preserving 64-bit offsets in the i64 channel slots. */
+#define SYSCALL_CP_ARG_T long long
+
 /*
  * Declare the dispatch functions. Args are long long to match the
  * i64 channel layout — on wasm32, long is 32-bit but long long is

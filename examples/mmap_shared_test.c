@@ -1,4 +1,5 @@
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,10 +45,27 @@ int main(void) {
     }
     printf("read back: %c%c%c\n", buf[0], buf[1], buf[2]);
 
-    // Also test: write more data, munmap (should not auto-flush for our impl),
-    // and verify the previous msync data persists
+    // Also test: write more data, munmap, and verify MAP_SHARED writes remain
+    // coherent with the underlying file once the mapping is torn down.
     ptr[3] = 'w';
-    munmap(ptr, pagesize);
+    if (munmap(ptr, pagesize) < 0) { perror("munmap"); return 1; }
+
+    lseek(fd, 0, SEEK_SET);
+    char buf4[5] = {0};
+    if (read(fd, buf4, 4) != 4) { perror("read after munmap"); return 1; }
+    if (memcmp(buf4, "xyzw", 4) != 0) {
+        fprintf(stderr, "munmap writeback failed: got '%c%c%c%c'\n", buf4[0], buf4[1], buf4[2], buf4[3]);
+        return 1;
+    }
+    printf("read after munmap: %c%c%c%c\n", buf4[0], buf4[1], buf4[2], buf4[3]);
+
+    if (ftruncate(fd, pagesize * 2) < 0) { perror("ftruncate grow"); return 1; }
+    ptr = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) { perror("mmap remap"); return 1; }
+    char *grown = mremap(ptr, pagesize, pagesize * 2, MREMAP_MAYMOVE);
+    if (grown == MAP_FAILED) { perror("mremap"); return 1; }
+    printf("mremap ok\n");
+    if (munmap(grown, pagesize * 2) < 0) { perror("munmap grown"); return 1; }
 
     close(fd);
     unlink(path);

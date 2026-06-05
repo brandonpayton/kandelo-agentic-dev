@@ -53,8 +53,7 @@ pub struct Analysis {
 /// Phase 2 scope: direct-call closure only. Phase 3 extends to
 /// indirect calls.
 pub fn analyze(input: &[u8], opts: &Options) -> Result<Analysis> {
-    let module = walrus::Module::from_buffer(input)
-        .context("failed to parse input wasm module")?;
+    let module = walrus::Module::from_buffer(input).context("failed to parse input wasm module")?;
 
     let Some(entry) = call_graph::find_import_func(&module, &opts.entry_import) else {
         bail!(
@@ -84,8 +83,8 @@ pub fn analyze(input: &[u8], opts: &Options) -> Result<Analysis> {
 /// tool is invoked by build scripts across programs that may or may
 /// not use `fork()`.
 pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
-    let mut module = walrus::Module::from_buffer(input)
-        .context("failed to parse input wasm module")?;
+    let mut module =
+        walrus::Module::from_buffer(input).context("failed to parse input wasm module")?;
 
     // Discover the fork-path closure *before* we mutate the module so
     // the runtime's own injected functions are not mistaken for

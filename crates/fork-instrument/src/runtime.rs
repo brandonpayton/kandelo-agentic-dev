@@ -259,13 +259,9 @@ pub fn inject_runtime(module: &mut Module, b1_scratch_size: u32) -> Runtime {
     let state = emit_state_fn(module, state_global);
 
     // --- Exports ---
-    module
-        .exports
-        .add(names::EXPORT_UNWIND_BEGIN, unwind_begin);
+    module.exports.add(names::EXPORT_UNWIND_BEGIN, unwind_begin);
     module.exports.add(names::EXPORT_UNWIND_END, unwind_end);
-    module
-        .exports
-        .add(names::EXPORT_REWIND_BEGIN, rewind_begin);
+    module.exports.add(names::EXPORT_REWIND_BEGIN, rewind_begin);
     module.exports.add(names::EXPORT_REWIND_END, rewind_end);
     module.exports.add(names::EXPORT_STATE, state);
 
@@ -401,16 +397,14 @@ fn emit_save_globals(
     saved_globals: &[SavedGlobal],
 ) {
     for sg in saved_globals {
-        body.global_get(buf_global)
-            .global_get(sg.id)
-            .store(
-                memory,
-                store_kind_for(sg.ty),
-                MemArg {
-                    align: natural_align(sg.ty),
-                    offset: sg.offset as u64,
-                },
-            );
+        body.global_get(buf_global).global_get(sg.id).store(
+            memory,
+            store_kind_for(sg.ty),
+            MemArg {
+                align: natural_align(sg.ty),
+                offset: sg.offset as u64,
+            },
+        );
     }
 }
 

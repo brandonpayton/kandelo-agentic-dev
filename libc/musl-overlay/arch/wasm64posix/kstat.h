@@ -1,10 +1,7 @@
 /* kstat.h — kernel stat format for wasm64posix.
  *
- * This matches the kernel's WasmStat layout (88 bytes) exactly.
+ * This matches the kernel's WasmStat layout (104 bytes) exactly.
  * musl's fstatat.c copies from kstat fields to struct stat fields.
- *
- * The kernel fills all 88 bytes. The rdev/blksize/blocks fields
- * are appended for musl compatibility but the kernel doesn't fill them.
  */
 struct kstat {
 	unsigned long long st_dev;          /* offset  0, 8 bytes */
@@ -23,8 +20,7 @@ struct kstat {
 	long long          st_ctime_sec;    /* offset 72, 8 bytes */
 	unsigned int       st_ctime_nsec;   /* offset 80, 4 bytes */
 	unsigned int       __ctime_pad;     /* offset 84, 4 bytes */
-	/* --- end of 88-byte WasmStat --- */
-	unsigned long long st_rdev;         /* not from kernel; stays 0 */
-	int                st_blksize;      /* not from kernel; stays 0 */
-	int                st_blocks;       /* not from kernel; stays 0 */
+	unsigned long long st_rdev;         /* offset 88 */
+	int                st_blksize;      /* offset 96 */
+	int                st_blocks;       /* offset 100 */
 };
