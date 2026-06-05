@@ -103,7 +103,7 @@ diff --git a/fbdoom/d_mode.c b/fbdoom/d_mode.c
 index afd84ac..c1969fd 100644
 --- a/fbdoom/d_mode.c
 +++ b/fbdoom/d_mode.c
-@@ -207,3 +207,25 @@ char *D_GameMissionString(GameMission_t mission)
+@@ -207,3 +207,24 @@ char *D_GameMissionString(GameMission_t mission)
      }
  }
  
@@ -128,7 +128,6 @@ index afd84ac..c1969fd 100644
 +            return "unknown";
 +    }
 +}
-+
 diff --git a/fbdoom/d_mode.h b/fbdoom/d_mode.h
 index ebbd0e8..7ec1a72 100644
 --- a/fbdoom/d_mode.h
