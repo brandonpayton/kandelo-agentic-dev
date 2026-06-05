@@ -21,6 +21,7 @@ export function compileFlags(arch: WasmArch): string[] {
 }
 
 export function linkFlags(arch: WasmArch): string[] {
+  const maxMemory = process.env.WASM_POSIX_MAX_MEMORY ?? '2147483648';
   return [
     '-nostdlib',
     '-Wl,--entry=_start',
@@ -28,7 +29,7 @@ export function linkFlags(arch: WasmArch): string[] {
     '-Wl,--export=__heap_base',
     '-Wl,--import-memory',
     '-Wl,--shared-memory',
-    '-Wl,--max-memory=1073741824',
+    `-Wl,--max-memory=${maxMemory}`,
     '-Wl,--allow-undefined',
     '-Wl,--global-base=1114112',
     '-Wl,--table-base=3',

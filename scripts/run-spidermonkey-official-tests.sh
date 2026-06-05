@@ -18,6 +18,8 @@ TIMEOUT="${SPIDERMONKEY_OFFICIAL_TIMEOUT:-60}"
 XUL_INFO="${SPIDERMONKEY_XUL_INFO:-wasm32:Linux:false}"
 WPT_MODE="${SPIDERMONKEY_OFFICIAL_WPT:-disabled}"
 FORMAT="${SPIDERMONKEY_OFFICIAL_FORMAT:-automation}"
+JSTEST_JITFLAGS="${SPIDERMONKEY_OFFICIAL_JSTEST_JITFLAGS:-none}"
+JITFLAGS="${SPIDERMONKEY_OFFICIAL_JITFLAGS:-all}"
 EXTRA_ARGS=()
 JS_SHELL_WRAPPER="$NODE_WRAPPER"
 NODE_SERVER_PID=""
@@ -34,6 +36,8 @@ Options:
   --timeout SECONDS              Upstream per-test timeout (default: 60)
   --smoke                        Run one small test from each selected suite
   --format FORMAT                Upstream output format (default: automation)
+  --jstest-jitflags VARIANT      jstests jitflags variant (default: none)
+  --jitflags VARIANT             jit-tests jitflags variant (default: all)
   --help                         Show this help
 
 Examples:
@@ -79,6 +83,14 @@ while [ $# -gt 0 ]; do
       ;;
     --format)
       FORMAT="${2:-}"
+      shift 2
+      ;;
+    --jstest-jitflags)
+      JSTEST_JITFLAGS="${2:-}"
+      shift 2
+      ;;
+    --jitflags)
+      JITFLAGS="${2:-}"
       shift 2
       ;;
     --help|-h)
@@ -247,6 +259,7 @@ run_jstests() {
     --xul-info "$XUL_INFO" \
     --wpt "$WPT_MODE" \
     --format "$FORMAT" \
+    --jitflags "$JSTEST_JITFLAGS" \
     --worker-count "$JOBS" \
     --timeout "$TIMEOUT" \
     "$JS_SHELL_WRAPPER" \
@@ -274,6 +287,7 @@ run_jit_tests() {
     --worker-count "$JOBS" \
     --timeout "$TIMEOUT" \
     --format "$FORMAT" \
+    --jitflags "$JITFLAGS" \
     ${args[@]+"${args[@]}"} \
     "$JS_SHELL_WRAPPER"
   local status=$?

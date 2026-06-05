@@ -366,13 +366,18 @@ impl MemoryManager {
         true
     }
 
-    /// Lower the upper bound for mmap allocation.
-    /// Used by the host to cap allocations below the channel/TLS region.
-    /// Only lowers the ceiling — never raises it — so that pre-computed safe
-    /// values (accounting for all future thread allocations) are preserved.
+    /// Set the upper bound for mmap allocation.
+    ///
+    /// Modern hosts pass the actual process linear-memory maximum here. Older
+    /// high-control-page hosts passed a lower channel address to reserve host
+    /// control pages. Treat the host-provided value as authoritative rather
+    /// than as a one-way lower cap; otherwise a process whose wasm module
+    /// declares a maximum above the historical 1GiB default still cannot mmap
+    /// or brk past 1GiB.
     pub fn set_max_addr(&mut self, addr: usize) {
-        if addr < self.max_addr {
-            self.max_addr = addr;
+        self.max_addr = addr;
+        if self.brk_limit > addr {
+            self.brk_limit = addr;
         }
     }
 
@@ -388,9 +393,7 @@ impl MemoryManager {
 
     /// Lower the upper bound for brk allocation.
     pub fn set_brk_limit(&mut self, addr: usize) {
-        if addr < self.brk_limit {
-            self.brk_limit = addr;
-        }
+        self.brk_limit = addr;
     }
 
     pub fn layout_metadata(&self) -> MemoryLayoutMetadata {

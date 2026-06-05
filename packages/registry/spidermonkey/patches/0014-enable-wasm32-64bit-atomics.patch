@@ -1,0 +1,24 @@
+--- a/js/src/jit/shared/AtomicOperations-feeling-lucky-gcc.h	2026-06-05 07:07:10.956588203 +0000
++++ b/js/src/jit/shared/AtomicOperations-feeling-lucky-gcc.h	2026-06-05 07:07:10.956588203 +0000
+@@ -70,10 +70,21 @@
+ #if defined(__riscv) && __riscv_xlen == 64
+ #  define HAS_64BIT_ATOMICS
+ #  define HAS_64BIT_LOCKFREE
+ #endif
+ 
++#if defined(__wasm__) && defined(__wasm_atomics__)
++// Kandelo's wasm32 POSIX target is compiled with WebAssembly atomics
++// enabled (-matomics). Clang lowers the GCC/Clang __atomic 64-bit intrinsics
++// used below to wasm i64 atomic instructions, and the toolchain advertises
++// __GCC_HAVE_SYNC_COMPARE_AND_SWAP_8. Without this platform case,
++// BigInt64Array/BigUint64Array Atomics operations hit MOZ_CRASH("No 64-bit
++// atomics") even though the generated wasm target supports them.
++#  define HAS_64BIT_ATOMICS
++#  define HAS_64BIT_LOCKFREE
++#endif
++
+ #if defined(__loongarch64)
+ #  define HAS_64BIT_ATOMICS
+ #  define HAS_64BIT_LOCKFREE
+ #endif
+ 

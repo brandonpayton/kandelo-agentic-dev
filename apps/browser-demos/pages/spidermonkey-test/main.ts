@@ -46,6 +46,93 @@ let officialFs: MemoryFileSystem | null = null;
 let officialKernel: BrowserKernel | null = null;
 let officialStdout = "";
 let officialStderr = "";
+let jsMaxMemoryPages: number | undefined;
+const defaultThreadSlots = Number(
+  new URLSearchParams(window.location.search).get("threadSlots") ?? "64",
+);
+
+function readVarU32(bytes: Uint8Array, offset: { value: number }): number {
+  let result = 0;
+  let shift = 0;
+  for (;;) {
+    if (offset.value >= bytes.length) throw new Error("truncated wasm varuint32");
+    const byte = bytes[offset.value++];
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return result >>> 0;
+    shift += 7;
+    if (shift > 35) throw new Error("invalid wasm varuint32");
+  }
+}
+
+function skipName(bytes: Uint8Array, offset: { value: number }): void {
+  const length = readVarU32(bytes, offset);
+  offset.value += length;
+  if (offset.value > bytes.length) throw new Error("truncated wasm name");
+}
+
+function readMemoryMaximumPages(bytes: Uint8Array, offset: { value: number }): number | undefined {
+  const flags = readVarU32(bytes, offset);
+  readVarU32(bytes, offset); // minimum
+  if ((flags & 0x1) === 0) return undefined;
+  return readVarU32(bytes, offset);
+}
+
+function detectWasmMaximumMemoryPages(wasmBytes: ArrayBuffer): number | undefined {
+  const bytes = new Uint8Array(wasmBytes);
+  if (
+    bytes.length < 8 ||
+    bytes[0] !== 0x00 ||
+    bytes[1] !== 0x61 ||
+    bytes[2] !== 0x73 ||
+    bytes[3] !== 0x6d
+  ) {
+    return undefined;
+  }
+
+  let pos = 8;
+  while (pos < bytes.length) {
+    const sectionId = bytes[pos++];
+    const sectionSizeOffset = { value: pos };
+    const sectionSize = readVarU32(bytes, sectionSizeOffset);
+    const sectionStart = sectionSizeOffset.value;
+    const sectionEnd = sectionStart + sectionSize;
+    if (sectionEnd > bytes.length) return undefined;
+
+    const offset = { value: sectionStart };
+    if (sectionId === 2) {
+      const count = readVarU32(bytes, offset);
+      for (let i = 0; i < count; i++) {
+        skipName(bytes, offset);
+        skipName(bytes, offset);
+        const kind = bytes[offset.value++];
+        switch (kind) {
+          case 0x00:
+            readVarU32(bytes, offset);
+            break;
+          case 0x01: {
+            offset.value++;
+            const flags = readVarU32(bytes, offset);
+            readVarU32(bytes, offset);
+            if ((flags & 0x1) !== 0) readVarU32(bytes, offset);
+            break;
+          }
+          case 0x02:
+            return readMemoryMaximumPages(bytes, offset);
+          case 0x03:
+            offset.value += 2;
+            break;
+          default:
+            return undefined;
+        }
+      }
+    } else if (sectionId === 5) {
+      const count = readVarU32(bytes, offset);
+      if (count > 0) return readMemoryMaximumPages(bytes, offset);
+    }
+    pos = sectionEnd;
+  }
+  return undefined;
+}
 
 function readVfsFile(fs: MemoryFileSystem, path: string): Uint8Array {
   const st = fs.stat(path);
@@ -108,6 +195,7 @@ async function init() {
   const js = readVfsFile(fs, "/usr/bin/js");
   jsBytes = new ArrayBuffer(js.byteLength);
   new Uint8Array(jsBytes).set(js);
+  jsMaxMemoryPages = detectWasmMaximumMemoryPages(jsBytes);
 
   async function getOfficialKernel(): Promise<BrowserKernel> {
     if (officialKernel) return officialKernel;
@@ -115,6 +203,8 @@ async function init() {
     officialKernel = new BrowserKernel({
       memfs: officialFs,
       maxWorkers: 8,
+      defaultThreadSlots,
+      maxMemoryPages: jsMaxMemoryPages,
       onStdout: (data) => {
         officialStdout += new TextDecoder().decode(data);
       },
@@ -204,6 +294,8 @@ async function init() {
     const kernel = new BrowserKernel({
       memfs: fsForRun,
       maxWorkers: 8,
+      defaultThreadSlots,
+      maxMemoryPages: jsMaxMemoryPages,
       onStdout: (data) => {
         stdout += new TextDecoder().decode(data);
       },
