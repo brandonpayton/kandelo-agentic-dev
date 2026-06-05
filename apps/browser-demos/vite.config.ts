@@ -437,6 +437,7 @@ export default defineConfig({
         main: path.resolve(__dirname, "index.html"),
         kandelo: path.resolve(__dirname, "pages/kandelo/index.html"),
         network: path.resolve(__dirname, "pages/network/index.html"),
+        doomMp: path.resolve(__dirname, "pages/doom-mp/index.html"),
         // The perl, python, ruby, erlang, texlive, and redis package entries
         // are not bundled into this static build while their slow builds
         // live in kandelo-software. The root gallery fetches that

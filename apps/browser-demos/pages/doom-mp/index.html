@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multiplayer DOOM over WebRTC — Kandelo</title>
+  <link rel="stylesheet" href="./doom-mp.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="hero">
+      <p class="eyebrow">Kandelo WebRTC demo</p>
+      <h1>Multiplayer DOOM over WebRTC</h1>
+      <p>
+        Run two separate browser instances, exchange SDP manually, then play
+        fbDOOM through normal POSIX UDP sockets bridged over an unreliable
+        <code>RTCDataChannel</code>.
+      </p>
+    </header>
+
+    <section class="panel flow-panel" aria-labelledby="setup-heading">
+      <div class="panel-head">
+        <h2 id="setup-heading">1. Negotiate a peer session</h2>
+        <span class="stun">STUN: <code>stun:stun.l.google.com:19302</code></span>
+      </div>
+
+      <div class="role-row">
+        <strong>Role</strong>
+        <label><input type="radio" name="role" value="host" checked> Host <span>10.99.0.1</span></label>
+        <label><input type="radio" name="role" value="join"> Join <span>10.99.0.2</span></label>
+        <p>Host creates the offer. Joiner pastes it, accepts, and sends the generated answer back.</p>
+      </div>
+
+      <div class="sdp-grid">
+        <label class="sdp-box">
+          <span>Local SDP <button id="copy-local" type="button">Copy</button></span>
+          <textarea id="local-sdp" readonly placeholder="Generated offer/answer appears here"></textarea>
+        </label>
+        <label class="sdp-box">
+          <span>Remote SDP</span>
+          <textarea id="remote-sdp" placeholder="Paste the other browser's SDP JSON here"></textarea>
+        </label>
+      </div>
+
+      <div class="controls">
+        <button id="create-offer" type="button">Create offer</button>
+        <button id="accept-offer" type="button">Accept offer</button>
+        <button id="accept-answer" type="button" disabled>Accept answer</button>
+        <button id="reset" type="button" disabled>Reset</button>
+        <button id="start-doom" type="button" class="primary" disabled>Start DOOM</button>
+      </div>
+    </section>
+
+    <section class="game-grid">
+      <div class="panel status-panel" aria-labelledby="status-heading">
+        <h2 id="status-heading">2. Status</h2>
+        <pre id="status">state: idle</pre>
+        <p class="hint">
+          Start DOOM in both browsers once the peer connection and both data channels are open.
+          Click the framebuffer to focus; pointer lock uses the mouse. Press Ctrl+Shift+Esc to release keyboard capture.
+        </p>
+      </div>
+
+      <div class="panel framebuffer-panel" aria-labelledby="framebuffer-heading">
+        <div class="panel-head">
+          <h2 id="framebuffer-heading">3. Play</h2>
+          <span id="capture-state">waiting</span>
+        </div>
+        <canvas id="fb" tabindex="0" width="640" height="400"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

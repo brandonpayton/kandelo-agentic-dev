@@ -1,0 +1,211 @@
+:root {
+  color-scheme: dark;
+  --bg: #120d0b;
+  --panel: #1e1714;
+  --panel-2: #261d18;
+  --text: #f4ede8;
+  --muted: #c8b8aa;
+  --line: #4b342c;
+  --accent: #ff6b35;
+  --accent-2: #ffd166;
+  --ok: #77d97c;
+  --bad: #ff6b6b;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 20% 0%, rgba(255, 107, 53, 0.18), transparent 32rem),
+    linear-gradient(180deg, #160f0d, var(--bg));
+  color: var(--text);
+}
+
+code, pre, textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+button, textarea, input { font: inherit; }
+
+.page-shell {
+  width: min(1180px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 28px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.hero {
+  padding: 20px 4px 8px;
+}
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2rem, 4vw, 4rem);
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+}
+.hero p {
+  max-width: 760px;
+  color: var(--muted);
+  font-size: 1rem;
+}
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--accent-2) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.75rem !important;
+  font-weight: 700;
+}
+
+.panel {
+  background: linear-gradient(180deg, var(--panel), var(--panel-2));
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28);
+}
+.panel h2 {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.flow-panel {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.stun, .role-row p, .hint {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.role-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.role-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.role-row label span { color: var(--muted); font-size: 0.78rem; }
+.role-row p { flex-basis: 100%; margin: 0; }
+
+.sdp-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.sdp-box { display: flex; flex-direction: column; gap: 6px; }
+.sdp-box > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+textarea {
+  width: 100%;
+  min-height: 150px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0f0c0b;
+  color: var(--text);
+  padding: 10px;
+  font-size: 0.78rem;
+}
+textarea:focus, canvas:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent), transparent 25%);
+  outline-offset: 2px;
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #2a211d;
+  color: var(--text);
+  padding: 9px 14px;
+  cursor: pointer;
+}
+button.primary {
+  background: linear-gradient(180deg, var(--accent), #c7431d);
+  border-color: #ff8a60;
+  color: #160b07;
+  font-weight: 800;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.game-grid {
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+.status-panel { padding: 18px; }
+#status {
+  min-height: 220px;
+  white-space: pre-wrap;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0f0c0b;
+  color: var(--ok);
+  font-size: 0.82rem;
+}
+.hint { margin: 0; line-height: 1.5; }
+
+.framebuffer-panel {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+#capture-state {
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 0.78rem;
+}
+#fb {
+  width: 100%;
+  aspect-ratio: 8 / 5;
+  max-height: min(68vh, 720px);
+  background: #000;
+  image-rendering: pixelated;
+  border-radius: 10px;
+  border: 1px solid #000;
+  cursor: pointer;
+}
+#fb[data-captured] { cursor: none; }
+
+@media (max-width: 880px) {
+  .sdp-grid, .game-grid { grid-template-columns: 1fr; }
+}

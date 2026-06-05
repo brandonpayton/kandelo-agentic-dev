@@ -16,12 +16,33 @@ import type {
 } from "./browser-kernel-protocol";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 
-export type { HttpRequest, HttpResponse };
 import kernelWasmUrl from "@kernel-wasm?url";
 import rootfsVfsUrl from "@rootfs-vfs?url";
 import workerEntryUrl from "./worker-entry-browser.ts?worker&url";
 import kernelWorkerEntryUrl from "./browser-kernel-worker-entry.ts?worker&url";
 import { DEFAULT_MAX_PAGES } from "./constants";
+
+export type { HttpRequest, HttpResponse };
+
+export type BrowserIpv4Address = [number, number, number, number];
+
+/** Outbound host-routed UDP datagram forwarded from the kernel worker. */
+export interface HostSendDgramEvent {
+  srcIp: BrowserIpv4Address;
+  srcPort: number;
+  dstIp: BrowserIpv4Address;
+  dstPort: number;
+  data: Uint8Array;
+}
+
+export interface InjectDatagramOptions {
+  pid: number;
+  dstIp: BrowserIpv4Address;
+  dstPort: number;
+  srcIp: BrowserIpv4Address;
+  srcPort: number;
+  data: Uint8Array;
+}
 
 export interface BrowserKernelOptions {
   /** Maximum concurrent workers (default: 4) */
@@ -76,6 +97,8 @@ export interface BrowserKernelOptions {
   syscallLogPtrWidth?: 4 | 8;
   /** Forwarded to TlsNetworkBackendOptions.dnsAliases. */
   dnsAliases?: Record<string, string>;
+  /** Enable browser-owned UDP relay events for WebRTC/WebSocket-style transports. */
+  enableUdpRelay?: boolean;
 }
 
 /** Options for {@link BrowserKernel.boot}. */
@@ -148,6 +171,7 @@ export class BrowserKernel {
    * happens when `boot()` is awaited (process is running) before
    * PtyTerminal calls onPtyOutput. Drained when a callback registers. */
   private pendingPtyOutput = new Map<number, Uint8Array[]>();
+  private hostSendDgramListeners = new Set<(event: HostSendDgramEvent) => void>();
 
   constructor(options: BrowserKernelOptions = {}) {
     this.maxPages = options.maxMemoryPages ?? DEFAULT_MAX_PAGES;
@@ -374,6 +398,7 @@ export class BrowserKernel {
           enableSyscallLog: this.options.enableSyscallLog,
           syscallLogPtrWidth: this.options.syscallLogPtrWidth,
           dnsAliases: this.options.dnsAliases,
+          enableUdpRelay: this.options.enableUdpRelay,
         },
       };
       this.kernelWorkerHandle.postMessage(initMsg, [transferBuf]);
@@ -670,6 +695,35 @@ export class BrowserKernel {
       peerAddr,
       peerPort,
     }) as Promise<number>;
+  }
+
+  /**
+   * Inject an inbound UDP datagram into a guest process. Fire-and-forget:
+   * the browser transport is UDP-like best-effort, so failed injection is
+   * intentionally indistinguishable from packet loss.
+   */
+  injectDatagram(datagram: InjectDatagramOptions): void {
+    this.sendToKernel({
+      type: "inject_datagram",
+      pid: datagram.pid,
+      dstIp: datagram.dstIp,
+      dstPort: datagram.dstPort,
+      srcIp: datagram.srcIp,
+      srcPort: datagram.srcPort,
+      data: datagram.data,
+    });
+  }
+
+  /**
+   * Subscribe to host-routed UDP datagrams emitted by the kernel worker.
+   * Browser-owned transports such as WebRTC DataChannels use this to move
+   * POSIX UDP traffic out of the worker and onto the browser networking API.
+   */
+  onHostSendDgram(handler: (event: HostSendDgramEvent) => void): () => void {
+    this.hostSendDgramListeners.add(handler);
+    return () => {
+      this.hostSendDgramListeners.delete(handler);
+    };
   }
 
   /** Write data to a kernel pipe. */
@@ -988,6 +1042,23 @@ export class BrowserKernel {
       case "listen_tcp":
         this.options.onListenTcp?.(msg.pid, msg.fd, msg.port);
         break;
+      case "host_send_dgram": {
+        const event: HostSendDgramEvent = {
+          srcIp: msg.srcIp,
+          srcPort: msg.srcPort,
+          dstIp: msg.dstIp,
+          dstPort: msg.dstPort,
+          data: msg.data,
+        };
+        for (const handler of this.hostSendDgramListeners) {
+          try {
+            handler(event);
+          } catch {
+            // Listener failures must not break delivery to other transports.
+          }
+        }
+        break;
+      }
       case "fb_bind":
         this.fbMemoryByPid.set(msg.pid, msg.memory);
         this.framebuffers.bind({

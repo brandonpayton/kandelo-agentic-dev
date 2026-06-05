@@ -58,6 +58,8 @@ export interface InitMessage {
     syscallLogPtrWidth?: 4 | 8;
     /** Forwarded to TlsNetworkBackendOptions.dnsAliases. */
     dnsAliases?: Record<string, string>;
+    /** Enable browser-owned UDP relay events for WebRTC/WebSocket-style transports. */
+    enableUdpRelay?: boolean;
   };
 }
 
@@ -130,6 +132,21 @@ export interface InjectConnectionMessage {
   fd: number;
   peerAddr: [number, number, number, number];
   peerPort: number;
+}
+
+/**
+ * Main → kernel-worker UDP datagram injection. Used by browser-owned
+ * transports such as WebRTC DataChannels to deliver host-routed datagrams
+ * into a guest AF_INET SOCK_DGRAM receive queue.
+ */
+export interface InjectDatagramMessage {
+  type: "inject_datagram";
+  pid: number;
+  dstIp: [number, number, number, number];
+  dstPort: number;
+  srcIp: [number, number, number, number];
+  srcPort: number;
+  data: Uint8Array;
 }
 
 export interface PipeReadMessage {
@@ -308,6 +325,7 @@ export type MainToKernelMessage =
   | PtyWriteMessage
   | PtyResizeMessage
   | InjectConnectionMessage
+  | InjectDatagramMessage
   | PipeReadMessage
   | PipeWriteMessage
   | PipeCloseReadMessage
@@ -377,6 +395,20 @@ export interface ListenTcpMessage {
   pid: number;
   fd: number;
   port: number;
+}
+
+/**
+ * Kernel-worker → main forwarding of an outbound host-routed UDP datagram.
+ * The main thread owns browser transports like RTCDataChannel, so worker-side
+ * NetworkIO implementations report best-effort datagrams through this event.
+ */
+export interface HostSendDgramMessage {
+  type: "host_send_dgram";
+  srcIp: [number, number, number, number];
+  srcPort: number;
+  dstIp: [number, number, number, number];
+  dstPort: number;
+  data: Uint8Array;
 }
 
 /**
@@ -453,6 +485,7 @@ export type KernelToMainMessage =
   | StderrMessage
   | PtyOutputMessage
   | ListenTcpMessage
+  | HostSendDgramMessage
   | FbBindMessage
   | FbUnbindMessage
   | FbRebindMemoryMessage

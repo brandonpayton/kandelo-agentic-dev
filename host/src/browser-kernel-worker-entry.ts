@@ -77,6 +77,7 @@ import {
 } from "./vfs/default-mounts";
 import type { MountConfig } from "./vfs/types";
 import { TlsNetworkBackend } from "./networking/tls-network-backend";
+import { UdpRelayNetworkBackend } from "./networking/udp-relay-backend";
 import { patchWasmForThread } from "./worker-main";
 import { detectPtrWidth, extractHeapBase } from "./constants";
 import type {
@@ -251,6 +252,36 @@ function respond(requestId: number, result: unknown) {
 
 function respondError(requestId: number, error: string) {
   post({ type: "response", requestId, result: null, error });
+}
+
+/**
+ * Worker-side half of browser-owned UDP transports. The kernel calls
+ * NetworkIO.sendDatagram synchronously; the actual browser transport
+ * (RTCDataChannel) lives on the main thread, so this shim snapshots the
+ * datagram and posts it upward as best-effort UDP.
+ */
+class RelayHostShim {
+  sendDatagram(datagram: {
+    srcAddr: Uint8Array;
+    srcPort: number;
+    dstAddr: Uint8Array;
+    dstPort: number;
+    data: Uint8Array;
+  }): number {
+    post({
+      type: "host_send_dgram",
+      srcIp: this.tuple(datagram.srcAddr),
+      srcPort: datagram.srcPort,
+      dstIp: this.tuple(datagram.dstAddr),
+      dstPort: datagram.dstPort,
+      data: new Uint8Array(datagram.data),
+    });
+    return 0;
+  }
+
+  private tuple(addr: Uint8Array): [number, number, number, number] {
+    return [addr[0] ?? 0, addr[1] ?? 0, addr[2] ?? 0, addr[3] ?? 0];
+  }
 }
 
 function createSharedProcessMemory(
@@ -449,7 +480,14 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
     dnsAliases: msg.config.dnsAliases,
   });
   await tlsBackend.init();
-  io.network = tlsBackend;
+  if (msg.config.enableUdpRelay) {
+    const relayHostShim = new RelayHostShim();
+    io.network = new UdpRelayNetworkBackend(tlsBackend, (datagram) =>
+      relayHostShim.sendDatagram(datagram),
+    );
+  } else {
+    io.network = tlsBackend;
+  }
 
   // Install the MITM CA certificate in the VFS so OpenSSL trusts it.
   const caCertPem = tlsBackend.getCACertPEM();
@@ -1326,6 +1364,31 @@ function handleInjectConnection(msg: Extract<MainToKernelMessage, { type: "injec
   respond(msg.requestId, recvPipeIdx);
 }
 
+function handleInjectDatagram(msg: Extract<MainToKernelMessage, { type: "inject_datagram" }>) {
+  if (!kernelInstance || !kernelMemory) return;
+  if (msg.data.length > PAGE_SIZE) return;
+  const scratchOffset = (kernelWorker as any).tcpScratchOffset || (kernelWorker as any).scratchOffset;
+  if (!scratchOffset) return;
+
+  const mem = new Uint8Array(kernelMemory.buffer);
+  mem.set(msg.data, scratchOffset);
+  const injectDatagram = kernelInstance.exports.kernel_inject_datagram as (
+    pid: number,
+    dstA: number, dstB: number, dstC: number, dstD: number, dstPort: number,
+    srcA: number, srcB: number, srcC: number, srcD: number, srcPort: number,
+    dataPtr: bigint, dataLen: number,
+  ) => number;
+  const rc = injectDatagram(
+    msg.pid,
+    msg.dstIp[0], msg.dstIp[1], msg.dstIp[2], msg.dstIp[3], msg.dstPort,
+    msg.srcIp[0], msg.srcIp[1], msg.srcIp[2], msg.srcIp[3], msg.srcPort,
+    BigInt(scratchOffset), msg.data.length,
+  );
+  if (rc === 0) {
+    (kernelWorker as any).scheduleWakeBlockedRetries();
+  }
+}
+
 function handleWakeBlockedReaders(msg: Extract<MainToKernelMessage, { type: "wake_blocked_readers" }>) {
   const kw = kernelWorker as any;
   const readers = kw.pendingPipeReaders?.get(msg.pipeIdx);
@@ -1590,6 +1653,7 @@ sw.onmessage = (e: MessageEvent) => {
     case "pty_resize": handlePtyResize(msg); break;
     case "register_pty_output": handleRegisterPtyOutput(msg); break;
     case "inject_connection": handleInjectConnection(msg); break;
+    case "inject_datagram": handleInjectDatagram(msg); break;
     case "pipe_read": handlePipeRead(msg); break;
     case "pipe_write": handlePipeWrite(msg); break;
     case "pipe_close_read": handlePipeCloseRead(msg); break;
