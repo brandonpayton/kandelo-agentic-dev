@@ -45,7 +45,11 @@ async function startViteServer(port: number): Promise<ChildProcess> {
       {
         cwd: BROWSER_DIR,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, KANDELO_BROWSER_DEMO_INPUTS: "sqlite-test" },
+        env: {
+          ...process.env,
+          KANDELO_BROWSER_DEMO_INPUTS: "sqlite-test",
+          KANDELO_BROWSER_TEST_NO_HMR: "1",
+        },
       },
     );
     let started = false;

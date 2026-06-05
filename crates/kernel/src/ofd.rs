@@ -87,6 +87,11 @@ pub struct OpenFileDesc {
     pub dir_synth_state: u8,
     /// Cumulative entry count across getdents64 calls — used as d_off cookie for seekdir.
     pub dir_entry_offset: i64,
+    /// Host dirent consumed from host_readdir but not yet emitted because the
+    /// caller's getdents64 buffer was full.
+    pub dir_pending_name: Vec<u8>,
+    pub dir_pending_ino: u64,
+    pub dir_pending_type: u32,
 }
 
 #[derive(Clone)]
@@ -121,6 +126,9 @@ impl OfdTable {
             dir_host_handle: -1,
             dir_synth_state: 0,
             dir_entry_offset: 0,
+            dir_pending_name: Vec::new(),
+            dir_pending_ino: 0,
+            dir_pending_type: 0,
         };
 
         // Search for a free (None) slot to reuse.
@@ -350,6 +358,9 @@ mod tests {
                 dir_host_handle: -1,
                 dir_synth_state: 0,
                 dir_entry_offset: 0,
+                dir_pending_name: Vec::new(),
+                dir_pending_ino: 0,
+                dir_pending_type: 0,
             });
         }
 

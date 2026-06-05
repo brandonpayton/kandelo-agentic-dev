@@ -68,6 +68,16 @@ install_local_binary() {
     src_basename="$(basename "$src")"
     local host_target
     host_target="$(rustc -vV 2>/dev/null | awk '/^host/ {print $2}')"
+    local cargo_host_env=()
+    if [ -n "$host_target" ]; then
+        cargo_host_env=(
+            env -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS
+            "CC=${CC_FOR_BUILD:-cc}"
+            "CXX=${CXX_FOR_BUILD:-c++}"
+            "AR=${AR_FOR_BUILD:-ar}"
+            "RANLIB=${RANLIB_FOR_BUILD:-ranlib}"
+        )
+    fi
 
     if ! wasm_require_no_legacy_asyncify "$src"; then
         return 1
@@ -75,8 +85,8 @@ install_local_binary() {
     local fork_instrumentation="${WASM_POSIX_INSTALL_FORK_INSTRUMENTATION:-}"
     if [ -z "$fork_instrumentation" ] && [ -n "$host_target" ]; then
         fork_instrumentation="$(cd "$repo_root" && \
-            env -u CC -u CXX -u AR -u RANLIB -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
-            cargo run -p xtask --target "$host_target" --quiet -- \
+            "${cargo_host_env[@]}" \
+            cargo --config "build.target=\"$host_target\"" run -p xtask --quiet -- \
                 build-deps output-fork-instrumentation "$program" "$src_basename" 2>/dev/null || true)"
     fi
     fork_instrumentation="${fork_instrumentation:-auto}"
@@ -130,8 +140,8 @@ install_local_binary() {
     local rel=""
     if [ -n "$host_target" ]; then
         rel="$(cd "$repo_root" && \
-            env -u CC -u CXX -u AR -u RANLIB -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
-            cargo run -p xtask --target "$host_target" --quiet -- \
+            "${cargo_host_env[@]}" \
+            cargo --config "build.target=\"$host_target\"" run -p xtask --quiet -- \
                 build-deps output-path "$program" "$src_basename" 2>/dev/null || true)"
     fi
 

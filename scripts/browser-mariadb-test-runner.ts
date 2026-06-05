@@ -14,7 +14,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 const REPO_ROOT = resolve(new URL(".", import.meta.url).pathname, "..");
 const BROWSER_DIR = resolve(REPO_ROOT, "apps/browser-demos");
-const VITE_PORT = 5198; // Different from test-runner's 5199
+const VITE_HOST = "127.0.0.1";
+const VITE_PORT = Number(process.env.MARIADB_TEST_VITE_PORT ?? 5198); // Different from test-runner's 5199
 const DEFAULT_TIMEOUT = 60_000;
 const BOOT_TIMEOUT = 180_000; // MariaDB boot can take a while in browser
 
@@ -32,11 +33,17 @@ async function startViteServer(): Promise<ChildProcess> {
   return new Promise((resolvePromise, reject) => {
     const proc = spawn(
       "npx",
-      ["vite", "--config", resolve(BROWSER_DIR, "vite.config.ts"), "--port", String(VITE_PORT)],
+      [
+        "vite",
+        "--config", resolve(BROWSER_DIR, "vite.config.ts"),
+        "--host", VITE_HOST,
+        "--port", String(VITE_PORT),
+        "--strictPort",
+      ],
       {
         cwd: BROWSER_DIR,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env },
+        env: { ...process.env, KANDELO_BROWSER_DEMO_INPUTS: "mariadb-test" },
       },
     );
 
@@ -71,12 +78,26 @@ async function startViteServer(): Promise<ChildProcess> {
 }
 
 async function waitForMariadbReady(page: Page, timeout = BOOT_TIMEOUT): Promise<void> {
-  await page.goto(`http://localhost:${VITE_PORT}/pages/mariadb-test/`);
-  await page.waitForFunction(
-    () => (window as any).__mariadbTestReady === true,
-    {},
-    { timeout },
-  );
+  await page.goto(`http://${VITE_HOST}:${VITE_PORT}/pages/mariadb-test/`);
+  try {
+    await page.waitForFunction(
+      () => (window as any).__mariadbTestReady === true,
+      {},
+      { timeout },
+    );
+  } catch (err) {
+    const diagnostics = await page.evaluate(() => ({
+      status: document.getElementById("status")?.textContent ?? "",
+      log: document.getElementById("log")?.textContent?.slice(-4000) ?? "",
+    })).catch((diagErr) => ({
+      status: "<unavailable>",
+      log: `Failed to read page diagnostics: ${diagErr}`,
+    }));
+    console.error("MariaDB browser page did not become ready.");
+    console.error(`Status: ${diagnostics.status}`);
+    if (diagnostics.log) console.error(`Log tail:\n${diagnostics.log}`);
+    throw err;
+  }
 }
 
 async function runTest(page: Page, testName: string, testTimeout: number): Promise<TestResult> {

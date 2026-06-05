@@ -5,10 +5,13 @@ import { resolveToolchain, type Toolchain } from '../lib/toolchain.ts';
 import {
   compileFlags,
   filterArgs,
+  globalBaseForStackSize,
   inferThreadSlotDeclaration,
   linkFlags,
   needsLinking,
   parseArgs,
+  requestedWasmGlobalBase,
+  requestedWasmStackSize,
   SHARED_LINK_FLAGS,
   THREAD_SLOT_USE_HOST_DEFAULT,
   threadSlotDeclarationDefine,
@@ -22,6 +25,10 @@ export function buildClangArgs(userArgs: string[], toolchain: Toolchain, arch: W
   for (const w of warnings) console.error(w);
 
   const parsed = parseArgs(filtered);
+  const stackSize = requestedWasmStackSize(filtered) ?? undefined;
+  const globalBase = requestedWasmGlobalBase(filtered) ?? (
+    stackSize !== undefined ? globalBaseForStackSize(stackSize) : undefined
+  );
   const linking = needsLinking(parsed);
   const hasSourceFiles = parsed.sourceFiles.length > 0;
 
@@ -85,7 +92,7 @@ export function buildClangArgs(userArgs: string[], toolchain: Toolchain, arch: W
       args.push(
         join(toolchain.sysroot, 'lib', 'crt1.o'),
         join(toolchain.sysroot, 'lib', 'libc.a'),
-        ...linkFlags(arch),
+        ...linkFlags(arch, { stackSize, globalBase }),
       );
     }
   }

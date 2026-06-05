@@ -279,7 +279,10 @@ fn find_func(module: &Module, name: &str) -> FunctionId {
 fn local_func(module: &Module, id: FunctionId) -> &LocalFunction {
     match &module.funcs.get(id).kind {
         FunctionKind::Local(l) => l,
-        _ => panic!("not a local function: {name:?}", name = module.funcs.get(id).name),
+        _ => panic!(
+            "not a local function: {name:?}",
+            name = module.funcs.get(id).name
+        ),
     }
 }
 

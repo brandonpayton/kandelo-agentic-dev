@@ -252,6 +252,20 @@ function loadBytes(path: string): ArrayBuffer {
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 }
 
+function loadWasmBytesIfWasm(path: string): ArrayBuffer | null {
+    const buf = readFileSync(path);
+    if (
+        buf.length < 4 ||
+        buf[0] !== 0x00 ||
+        buf[1] !== 0x61 ||
+        buf[2] !== 0x73 ||
+        buf[3] !== 0x6d
+    ) {
+        return null;
+    }
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}
+
 function resolveProgram(path: string): ArrayBuffer | null {
     const mapped = builtinPrograms[path];
     if (mapped) {
@@ -274,10 +288,21 @@ function resolveProgram(path: string): ArrayBuffer | null {
     ];
     for (const c of candidates) {
         if (existsSync(c)) {
-            return loadBytes(c);
+            const bytes = loadWasmBytesIfWasm(c);
+            if (bytes) return bytes;
         }
     }
     return null;
+}
+
+function parseOptionalUintEnv(name: string): number | undefined {
+    const value = process.env[name];
+    if (value == null || value === "") return undefined;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 0xffffffff) {
+        throw new Error(`${name} must be an unsigned 32-bit integer`);
+    }
+    return parsed;
 }
 
 async function main() {
@@ -338,14 +363,19 @@ async function main() {
     const processArgv = [programPath, ...process.argv.slice(3)];
 
     const timeoutMs = parseInt(process.env.TIMEOUT || "30000", 10);
+    const inheritedEnv = Object.entries(process.env)
+        .filter(([k, v]) => v !== undefined && k !== "PATH" && k !== "SHELL")
+        .map(([k, v]) => `${k}=${v}`);
     const exitPromise = host.spawn(loadBytes(programPath), processArgv, {
         env: [
-            ...Object.entries(process.env)
-                .filter(([, v]) => v !== undefined)
-                .map(([k, v]) => `${k}=${v}`),
+            "PATH=/bin:/usr/bin:/usr/local/bin:.",
+            "SHELL=/bin/sh",
+            ...inheritedEnv,
             ...gitEnv,
         ],
         cwd: process.env.KERNEL_CWD || process.cwd(),
+        uid: parseOptionalUintEnv("KERNEL_UID"),
+        gid: parseOptionalUintEnv("KERNEL_GID"),
         stdin: stdinData,
     });
 
