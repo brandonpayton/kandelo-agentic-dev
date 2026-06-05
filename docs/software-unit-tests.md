@@ -12,7 +12,7 @@ Status date: 2026-06-04.
 | MariaDB | `mysql-test/main/*.test` through `mysqltest` against `mariadbd` | Started full run, stopped after 710 results due Node heap OOM | Browser run reached the harness but failed VFS/init fetch and recorded 1149 failures |
 | SQLite direct | Direct execution of each upstream Tcl `test/*.test` script once through `testfixture` | Completed 1159 scripts: 912 PASS, 36 FAIL, 15 XFAIL, 196 XPASS | Completed 1159 scripts: 876 PASS, 62 FAIL, 38 XFAIL, 173 XPASS, 10 TIME |
 | SQLite official | Upstream `test/testrunner.tcl` permutations `full` and `all` | Completed corrected Node `full --jobs 2`: 1416/1416 official Tcl jobs finalized, 1416 passed, 0 failed, 1,703,255 SQLite internal cases, 0 case errors. The prior `busy2.test` failure was fixed by rebuilding the SQLite artifacts with `SQLITE_ENABLE_SETLK_TIMEOUT=2`, matching SQLite's own official lock-timeout test configuration; see `docs/sqlite-official-test-report.md` | Same inventory: 1416 `full` jobs and 10523 `all` jobs. Current browser iteration is past the earlier `writecrash.test` blocker and reached a timeout/stall checkpoint at 40/1416 jobs, 12,206 cases, 0 case errors, with `test/sort4.test` still running. Node isolated `sort4.test` passes 11/11 in 54s; browser isolated `sort4.test` was still at 0/1 after about 3 minutes before maintenance stop. See `docs/sqlite-official-test-report.md`. |
-| PHP | PHPT runtime tests from the PHP source tree | Completed 19017 tests: 10061 PASS, 6637 FAIL, 2064 SKIP, 11 XFAIL, 229 UNSUPPORTED, 15 TIME | Completed 19017 tests: 9974 PASS, 6739 FAIL, 2047 SKIP, 11 XFAIL, 229 UNSUPPORTED, 17 TIME |
+| PHP | PHPT runtime tests from the PHP source tree | Harness wired for php-src discovery and Node execution. Current PR iteration has smoke/shard results documented in the PR; full run is still memory/time constrained in shared AO workers. | Harness wired for browser execution via the `php-test` Vite page and VFS image. Current PR iteration has smoke/shard results documented in the PR; full run is still memory/time constrained in shared AO workers. |
 | SpiderMonkey smoke | Kandelo-authored shell coverage tests, not Mozilla's official suite | Completed 17/17 PASS | Completed 17/17 PASS |
 | SpiderMonkey official | Mozilla `jstests.py` and `jit_test.py` harnesses using `js.wasm` through a Kandelo shell wrapper | Paused until the process-memory architecture bug is fixed, so Node/browser results stay comparable | Paused until the browser process-memory architecture bug is fixed |
 | Node.js library | Upstream Node.js `test/parallel/test-*.js` and `test/sequential/test-*.js` through the SpiderMonkey-backed Node-compatible runtime | Completed 3925 tests: 336 PASS, 3264 FAIL, 325 TIME | Completed 3925 tests: 339 PASS, 3564 FAIL, 22 TIME |
@@ -336,6 +336,10 @@ scripts/run-php-upstream-tests.sh --host browser --all
 scripts/run-php-upstream-tests.sh --host node --limit 25 --json
 scripts/run-php-upstream-tests.sh --host browser Zend/tests/001.phpt --json
 
+# Split a full sorted discovery set for lower-memory CI or AO shards.
+scripts/run-php-upstream-tests.sh --host node --all --shard 1/16 --json
+scripts/run-php-upstream-tests.sh --host browser --all --offset 500 --limit 100 --json
+
 # Write docs/php-upstream-test-report.md for the selected host/run.
 scripts/run-php-upstream-tests.sh --host node --all --report
 ```
@@ -346,6 +350,13 @@ This matches php-src's `run-tests.php` behavior for tests that assert `__FILE__`
 or exception source locations. Browser runs use the same generated path inside
 the `/php-src` VFS image and start a temporary Vite server; set
 `PHP_TEST_VITE_PORT` if port `5201` is occupied.
+
+The runner also mirrors `run-tests.php` comparison and working-directory
+semantics: CRLF is normalized and both actual and expected output are trimmed
+before comparison, `EXPECTF` placeholders include php-src's `%r...%r` regex and
+`%0` NUL forms, and each PHP process runs with `TEST_PHP_SRCDIR` as its current
+directory so source-root-relative paths such as `./ext/standard/tests/file`
+behave like upstream.
 
 | SpiderMonkey smoke | `scripts/run-spidermonkey-unit-tests.sh --host node` | `scripts/run-spidermonkey-unit-tests.sh --host browser` |
 | SpiderMonkey official | `scripts/run-spidermonkey-official-tests.sh --host node --suite both` | Not implemented |

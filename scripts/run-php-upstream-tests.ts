@@ -229,7 +229,9 @@ function envArgs(env: string | undefined): string[] {
 }
 
 function normalizeOutput(text: string): string {
-  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+  // Upstream php-src run-tests.php normalizes CRLF and compares trim($out)
+  // against trim(EXPECT*). Match that outer-whitespace behavior here.
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
 }
 
 function escapeRegExp(text: string): string {
@@ -239,6 +241,14 @@ function escapeRegExp(text: string): string {
 function expectfToRegExp(expectf: string): RegExp {
   let out = "";
   for (let i = 0; i < expectf.length; i++) {
+    if (expectf.startsWith("%r", i)) {
+      const end = expectf.indexOf("%r", i + 2);
+      if (end !== -1) {
+        out += `(${expectf.slice(i + 2, end)})`;
+        i = end + 1;
+        continue;
+      }
+    }
     if (expectf[i] !== "%") {
       out += escapeRegExp(expectf[i]);
       continue;
@@ -255,10 +265,10 @@ function expectfToRegExp(expectf: string): RegExp {
         out += "[\\s\\S]*";
         break;
       case "s":
-        out += "[^\\r\\n]*";
+        out += "[^\\r\\n]+";
         break;
       case "S":
-        out += "\\S*";
+        out += "[^\\r\\n]*";
         break;
       case "w":
         out += "\\s*";
@@ -278,6 +288,9 @@ function expectfToRegExp(expectf: string): RegExp {
         break;
       case "c":
         out += ".";
+        break;
+      case "0":
+        out += "\\x00";
         break;
       case "e":
         out += "[/\\\\]";
@@ -396,7 +409,10 @@ function browserScriptPath(
 }
 
 class NodePhpRunner implements PhpRunner {
-  constructor(private phpPath: string) {}
+  constructor(
+    private sourceRoot: string,
+    private phpPath: string,
+  ) {}
 
   async runScript(opts: {
     test: PhptTest;
@@ -442,10 +458,14 @@ class NodePhpRunner implements PhpRunner {
         phpBytes,
         [this.phpPath, ...opts.argv, scriptPath, ...(opts.scriptArgs ?? [])],
         {
-          cwd: dirname(opts.test.path),
+          // php-src run-tests.php executes generated test files from the
+          // source root. Several PHPTs intentionally use source-root-relative
+          // paths such as ./ext/standard/tests/file.
+          cwd: this.sourceRoot,
           env: [
             "HOME=/tmp",
             "TMPDIR=/tmp",
+            `TEST_PHP_SRCDIR=${this.sourceRoot}`,
             `TEST_PHP_EXECUTABLE=${this.phpPath}`,
             ...opts.env,
           ],
@@ -645,16 +665,12 @@ class BrowserPhpRunner implements PhpRunner {
     this.runs++;
 
     const scriptPath = browserScriptPath(opts.test, this.sourceRoot, opts.kind);
-    const relDir = relative(this.sourceRoot, dirname(opts.test.path))
-      .split("\\")
-      .join("/");
-    const cwd = relDir ? `/php-src/${relDir}` : "/php-src";
     const request = {
       scriptPath,
       script: opts.script,
       argv: [...opts.argv, scriptPath, ...(opts.scriptArgs ?? [])],
-      cwd,
-      env: opts.env,
+      cwd: "/php-src",
+      env: ["TEST_PHP_SRCDIR=/php-src", ...opts.env],
       stdin: opts.stdin,
       timeoutMs: opts.timeoutMs,
     };
@@ -807,7 +823,7 @@ async function runPhpt(
     detail = compared.detail;
     if (!ok && detail) {
       const snippet = normalizeOutput(actualOutput)
-        .slice(0, 600)
+        .slice(0, 2000)
         .replace(/\n/g, "\\n");
       detail = `${detail}; actual: ${snippet}`;
     }
@@ -851,6 +867,8 @@ Options:
   --host node|browser   Host runtime to use (default: node)
   --all                 Run every .phpt test under php-src (default when no tests are passed)
   --timeout <ms>        Per PHPT section timeout (default: 60000)
+  --shard <i>/<n>       Run 1-based shard i of n after discovery sorting
+  --offset <n>          Skip the first n selected tests
   --limit <n>           Run only the first n discovered tests
   --json                Emit JSON lines
   --report              Write docs/php-upstream-test-report.md
@@ -866,6 +884,8 @@ async function main() {
   const args = process.argv.slice(2);
   let host: HostKind = "node";
   let timeoutMs = 60_000;
+  let shard: { index: number; total: number } | null = null;
+  let offset = 0;
   let limit: number | null = null;
   let json = false;
   let report = false;
@@ -886,8 +906,27 @@ async function main() {
       // Default mode; accepted for clarity.
     } else if (arg === "--timeout" && args[i + 1]) {
       timeoutMs = parseInt(args[++i], 10);
+    } else if (arg === "--shard" && args[i + 1]) {
+      const value = args[++i];
+      const match = /^(\d+)\/(\d+)$/.exec(value);
+      if (!match) throw new Error(`invalid shard: ${value}`);
+      shard = {
+        index: parseInt(match[1], 10),
+        total: parseInt(match[2], 10),
+      };
+      if (shard.total < 1 || shard.index < 1 || shard.index > shard.total) {
+        throw new Error(`invalid shard: ${value}`);
+      }
+    } else if (arg === "--offset" && args[i + 1]) {
+      offset = parseInt(args[++i], 10);
+      if (!Number.isFinite(offset) || offset < 0) {
+        throw new Error(`invalid offset: ${offset}`);
+      }
     } else if (arg === "--limit" && args[i + 1]) {
       limit = parseInt(args[++i], 10);
+      if (!Number.isFinite(limit) || limit < 0) {
+        throw new Error(`invalid limit: ${limit}`);
+      }
     } else if (arg === "--json") {
       json = true;
     } else if (arg === "--report") {
@@ -904,6 +943,10 @@ async function main() {
   const sourceRoot = resolvePhpSource();
   const phpPath = resolvePhpBinary();
   let tests = discoverTests(sourceRoot, selectors);
+  if (shard !== null) {
+    tests = tests.filter((_, idx) => idx % shard!.total === shard!.index - 1);
+  }
+  if (offset > 0) tests = tests.slice(offset);
   if (limit !== null) tests = tests.slice(0, limit);
 
   if (!json) {
@@ -911,6 +954,10 @@ async function main() {
     console.error(`Host: ${host}`);
     console.error(`php-src: ${sourceRoot}`);
     console.error(`PHP wasm: ${phpPath}`);
+    if (shard !== null) {
+      console.error(`Shard: ${shard.index}/${shard.total}`);
+    }
+    if (offset > 0) console.error(`Offset: ${offset}`);
     console.error(`Tests: ${tests.length}`);
     console.error("");
   }
@@ -921,7 +968,7 @@ async function main() {
     await browserRunner.init();
     runner = browserRunner;
   } else {
-    runner = new NodePhpRunner(phpPath);
+    runner = new NodePhpRunner(sourceRoot, phpPath);
   }
 
   const counts: Record<TestStatus, number> = {
