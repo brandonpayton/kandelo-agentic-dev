@@ -152,11 +152,7 @@ fn nested_of(instr: &Instr) -> Vec<InstrSeqId> {
 }
 
 /// Invoke `visit` for every instruction reachable from `seq`.
-fn walk_all<F: FnMut(InstrSeqId, &Instr)>(
-    f: &LocalFunction,
-    seq: InstrSeqId,
-    visit: &mut F,
-) {
+fn walk_all<F: FnMut(InstrSeqId, &Instr)>(f: &LocalFunction, seq: InstrSeqId, visit: &mut F) {
     for (instr, _) in &f.block(seq).instrs {
         visit(seq, instr);
         for child in nested_of(instr) {
@@ -498,14 +494,14 @@ fn multivalue_return_wraps_and_validates() {
 #[test]
 fn instrument_functions_returns_rewritten_set() {
     use fork_instrument::call_graph;
-    use fork_instrument::instrument::{instrument_functions, B1ScratchPlan};
+    use fork_instrument::instrument::{B1ScratchPlan, instrument_functions};
     use fork_instrument::runtime::inject_runtime;
 
     let bytes = wat::parse_str(FIXTURE_TRANSITIVE).unwrap();
     let mut module = Module::from_buffer(&bytes).unwrap();
 
-    let seed = call_graph::find_import_func(&module, "kernel.kernel_fork")
-        .expect("seed import present");
+    let seed =
+        call_graph::find_import_func(&module, "kernel.kernel_fork").expect("seed import present");
     let fork_path = call_graph::reaching_closure(&module, seed);
     let runtime = inject_runtime(&mut module, 0);
     let b1_plan = B1ScratchPlan::default();
@@ -609,17 +605,13 @@ fn non_fork_call_remains_bare_in_chunk_0() {
     // is preserved verbatim).
     let helper = func_by_name(&module, "helper");
     let mut helper_calls = 0usize;
-    walk_all(
-        local_func(&module, caller),
-        unwind_save,
-        &mut |_, instr| {
-            if let Instr::Call(c) = instr {
-                if c.func == helper {
-                    helper_calls += 1;
-                }
+    walk_all(local_func(&module, caller), unwind_save, &mut |_, instr| {
+        if let Instr::Call(c) = instr {
+            if c.func == helper {
+                helper_calls += 1;
             }
-        },
-    );
+        }
+    });
     assert_eq!(
         helper_calls, 1,
         "non-fork-path helper call should survive verbatim (once)",
@@ -737,11 +729,7 @@ fn two_calls_assign_sequential_call_idx() {
     let call_idx_local = call_idx_local.expect("call_idx local discoverable from br_table");
 
     // Now count Const values immediately preceding LocalSet(call_idx).
-    fn walk_seqs<F: FnMut(InstrSeqId)>(
-        f: &LocalFunction,
-        seq: InstrSeqId,
-        visit: &mut F,
-    ) {
+    fn walk_seqs<F: FnMut(InstrSeqId)>(f: &LocalFunction, seq: InstrSeqId, visit: &mut F) {
         visit(seq);
         for (instr, _) in &f.block(seq).instrs {
             for child in nested_of(instr) {
@@ -971,7 +959,11 @@ fn postamble_emits_defaults_for_each_result_type() {
 
     let caller = func_by_name(&module, "caller");
     let kinds = entry_instr_kinds(&module, caller);
-    let trailing_consts = kinds.iter().rev().take_while(|k| **k == InstrKind::Const).count();
+    let trailing_consts = kinds
+        .iter()
+        .rev()
+        .take_while(|k| **k == InstrKind::Const)
+        .count();
     assert_eq!(
         trailing_consts, 2,
         "postamble should emit one Const per result type: {kinds:?}",
@@ -1431,10 +1423,10 @@ fn catch_ref_clause_is_rewritten_with_capture_block() {
     });
     let try_table = try_table.expect("try_table should still exist after 6d");
 
-    let retargeted = try_table.catches.iter().any(|c| matches!(
-        c,
-        ir::TryTableCatch::CatchRef { .. }
-    ));
+    let retargeted = try_table
+        .catches
+        .iter()
+        .any(|c| matches!(c, ir::TryTableCatch::CatchRef { .. }));
     assert!(
         retargeted,
         "try_table should still have a CatchRef clause: {:?}",
@@ -1478,7 +1470,10 @@ fn plain_catch_only_try_table_is_not_6d_rewritten() {
     let try_table = try_table.expect("try_table should still exist");
 
     assert!(
-        try_table.catches.iter().all(|c| matches!(c, ir::TryTableCatch::Catch { .. })),
+        try_table
+            .catches
+            .iter()
+            .all(|c| matches!(c, ir::TryTableCatch::Catch { .. })),
         "plain-catch-only try_tables should not be retargeted by Phase 6d",
     );
 }
@@ -2069,7 +2064,6 @@ fn collect_try_tables(f: &LocalFunction) -> Vec<ir::TryTable> {
     });
     out
 }
-
 
 #[test]
 fn b1_stage_2_plain_catch_arm_retargets_to_capture_block() {

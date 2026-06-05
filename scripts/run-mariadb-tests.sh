@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Run MariaDB mysql-test suite against kandelo.
+# Run MariaDB mysql-test suite against wasm-posix-kernel.
 #
 # Prerequisites:
 #   bash packages/registry/mariadb/build-mariadb.sh   # builds mariadbd + mysqltest
@@ -28,7 +28,7 @@ HARNESS="$REPO_ROOT/packages/registry/mariadb/test/run-tests.ts"
 CURATED_TESTS=()
 
 # ── Expected failures ──────────────────────────────────────
-# Tests known to fail on kandelo (threaded server mode).
+# Tests known to fail on wasm-posix-kernel (threaded server mode).
 # Categories:
 #
 # innodb         — InnoDB storage engine not available (Aria only)
@@ -314,8 +314,8 @@ is_expected_fail() {
 check_prereqs() {
     local missing=0
 
-    if [ ! -f "$INSTALL_DIR/bin/mariadbd.wasm" ]; then
-        echo "ERROR: mariadbd.wasm not found. Run: bash packages/registry/mariadb/build-mariadb.sh" >&2
+    if [ ! -f "$INSTALL_DIR/bin/mariadbd" ]; then
+        echo "ERROR: mariadbd not found. Run: bash packages/registry/mariadb/build-mariadb.sh" >&2
         missing=1
     fi
 
@@ -493,6 +493,13 @@ echo "SKIP:    $SKIP"
 echo "TOTAL:   $TOTAL"
 echo ""
 
+if [ "$HARNESS_EXIT" -ne 0 ]; then
+    echo "ERROR: MariaDB harness exited with status $HARNESS_EXIT" >&2
+fi
+if [ "$TOTAL" -eq 0 ]; then
+    echo "ERROR: MariaDB harness produced zero test results" >&2
+fi
+
 # Show unexpected results
 for status_prefix in "FAIL " "XPASS"; do
     count=0
@@ -553,7 +560,8 @@ if $REPORT_MODE; then
     echo "Report written to: $REPORT"
 fi
 
-# Exit with error if any unexpected failures
-if [ $FAIL -gt 0 ] || [ $XPASS -gt 0 ]; then
+# Exit with error if the harness failed, produced no results, or any unexpected
+# failures were observed.
+if [ "$HARNESS_EXIT" -ne 0 ] || [ "$TOTAL" -eq 0 ] || [ $FAIL -gt 0 ] || [ $XPASS -gt 0 ]; then
     exit 1
 fi

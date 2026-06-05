@@ -102,7 +102,9 @@ const INO_INDIRECT = 88;
 const INO_DOUBLE_INDIRECT = 92;
 const INO_UID = 96; // u32
 const INO_GID = 100; // u32
-// 104-127 reserved for future fields (flags, xattrs, etc.)
+const INO_GENERATION = 104; // uint64, incremented when an inode slot is allocated
+const INO_OPEN_COUNT = 112; // u32, open fd references
+// 116-127 reserved for future fields (flags, xattrs, etc.)
 
 // FD entry layout
 const FD_INO = 4;
@@ -119,6 +121,7 @@ const READER_MASK = 0x7fffffff | 0;
 
 export interface StatResult {
   ino: number;
+  generation: number;
   mode: number;
   linkCount: number;
   size: number;
@@ -266,6 +269,7 @@ export class SharedFS {
     const rootOff = fs.inodeOffset(ROOT_INO);
     fs.w32(rootOff + INO_MODE, S_IFDIR | 0o755);
     fs.w32(rootOff + INO_LINK_COUNT, 2);
+    fs.w64(rootOff + INO_GENERATION, 1);
 
     // Allocate a data block for root's directory entries
     const rootBlock = fs.blockAlloc();
@@ -479,6 +483,7 @@ export class SharedFS {
           // Zero the inode
           const off = this.inodeOffset(ino);
           this.u8.fill(0, off, off + INODE_SIZE);
+          this.w64(off + INO_GENERATION, this.nextInodeGeneration());
           return ino;
         }
         w--;
@@ -486,6 +491,10 @@ export class SharedFS {
       }
     }
     return ENOSPC;
+  }
+
+  private nextInodeGeneration(): number {
+    return Atomics.add(this.i32, SB_GENERATION >> 2, 1) + 1;
   }
 
   private inodeFree(ino: number): void {
@@ -500,6 +509,50 @@ export class SharedFS {
       if (old === word) break;
     }
     Atomics.add(this.i32, SB_FREE_INODES >> 2, 1);
+  }
+
+  private inodeAddOpenRef(ino: number): void {
+    const idx = (this.inodeOffset(ino) + INO_OPEN_COUNT) >> 2;
+    Atomics.add(this.i32, idx, 1);
+  }
+
+  private inodeDropOpenRef(ino: number): void {
+    let shouldFree = false;
+    this.inodeWriteLock(ino);
+    try {
+      const off = this.inodeOffset(ino);
+      const openCount = this.r32(off + INO_OPEN_COUNT);
+      if (openCount > 0) {
+        this.w32(off + INO_OPEN_COUNT, openCount - 1);
+      }
+      if (openCount <= 1 && this.r32(off + INO_LINK_COUNT) === 0) {
+        this.inodeTruncate(ino, 0);
+        shouldFree = true;
+      }
+    } finally {
+      this.inodeWriteUnlock(ino);
+    }
+    if (shouldFree) this.inodeFree(ino);
+  }
+
+  private inodeDropLinkRefLocked(ino: number): boolean {
+    const off = this.inodeOffset(ino);
+    const linkCount = this.r32(off + INO_LINK_COUNT);
+    if (linkCount > 1) {
+      this.w32(off + INO_LINK_COUNT, linkCount - 1);
+      this.w64(off + INO_CTIME, Date.now());
+      return false;
+    }
+    return this.inodeOrphanLocked(ino);
+  }
+
+  private inodeOrphanLocked(ino: number): boolean {
+    const off = this.inodeOffset(ino);
+    this.w32(off + INO_LINK_COUNT, 0);
+    this.w64(off + INO_CTIME, Date.now());
+    if (this.r32(off + INO_OPEN_COUNT) > 0) return false;
+    this.inodeTruncate(ino, 0);
+    return true;
   }
 
   // ── Inode locking ────────────────────────────────────────────────
@@ -675,6 +728,11 @@ export class SharedFS {
     count: number,
   ): number {
     const inoOff = this.inodeOffset(ino);
+    const size = this.r64(inoOff + INO_SIZE);
+    if (offset > size) {
+      this.zeroInodeRange(ino, size, offset);
+    }
+
     let totalWritten = 0;
     let srcPos = 0;
 
@@ -696,11 +754,24 @@ export class SharedFS {
       totalWritten += chunk;
     }
 
-    const size = this.r64(inoOff + INO_SIZE);
-    if (offset > size) {
+    if (offset > this.r64(inoOff + INO_SIZE)) {
       this.w64(inoOff + INO_SIZE, offset);
     }
     return totalWritten;
+  }
+
+  private zeroInodeRange(ino: number, start: number, end: number): void {
+    while (start < end) {
+      const fileBlock = Math.floor(start / BLOCK_SIZE);
+      const blockOff = start % BLOCK_SIZE;
+      const chunk = Math.min(BLOCK_SIZE - blockOff, end - start);
+      const phys = this.inodeBlockMap(ino, fileBlock, false);
+      if (phys > 0) {
+        const abs = phys * BLOCK_SIZE + blockOff;
+        this.u8.fill(0, abs, abs + chunk);
+      }
+      start += chunk;
+    }
   }
 
   private freeBlocksFrom(ino: number, fromBlock: number): void {
@@ -773,8 +844,18 @@ export class SharedFS {
     const inoOff = this.inodeOffset(ino);
     const curSize = this.r64(inoOff + INO_SIZE);
     if (newSize >= curSize) {
+      if (newSize > curSize) {
+        this.zeroInodeRange(ino, curSize, newSize);
+      }
       this.w64(inoOff + INO_SIZE, newSize);
       return;
+    }
+    if (newSize % BLOCK_SIZE !== 0) {
+      this.zeroInodeRange(
+        ino,
+        newSize,
+        Math.ceil(newSize / BLOCK_SIZE) * BLOCK_SIZE,
+      );
     }
     const keepBlocks = Math.ceil(newSize / BLOCK_SIZE);
     this.freeBlocksFrom(ino, keepBlocks);
@@ -1139,6 +1220,7 @@ export class SharedFS {
         this.w64(base + FD_OFFSET, 0);
         this.w32(base + FD_FLAGS, flags);
         this.w32(base + FD_IS_DIR, isDir ? 1 : 0);
+        this.inodeAddOpenRef(ino);
         return i;
       }
     }
@@ -1180,6 +1262,7 @@ export class SharedFS {
     const off = this.inodeOffset(ino);
     return {
       ino,
+      generation: this.r64(off + INO_GENERATION),
       mode: this.r32(off + INO_MODE),
       linkCount: this.r32(off + INO_LINK_COUNT),
       size: this.r64(off + INO_SIZE),
@@ -1272,6 +1355,7 @@ export class SharedFS {
     const entry = this.fdGet(fd);
     if (!entry) throw new SFSError(EBADF);
     this.fdFree(fd);
+    this.inodeDropOpenRef(entry.ino);
   }
 
   read(fd: number, buffer: Uint8Array): number {
@@ -1413,17 +1497,14 @@ export class SharedFS {
       const rc = this.dirRemoveEntry(parentIno, nameBytes);
       if (rc < 0) throw new SFSError(rc);
 
+      let shouldFree = false;
       this.inodeWriteLock(childIno);
-      const linkCount = this.r32(childOff + INO_LINK_COUNT);
-      if (linkCount <= 1) {
-        this.inodeTruncate(childIno, 0);
-        this.w32(childOff + INO_LINK_COUNT, 0);
-        this.inodeWriteUnlock(childIno);
-        this.inodeFree(childIno);
-      } else {
-        this.w32(childOff + INO_LINK_COUNT, linkCount - 1);
+      try {
+        shouldFree = this.inodeDropLinkRefLocked(childIno);
+      } finally {
         this.inodeWriteUnlock(childIno);
       }
+      if (shouldFree) this.inodeFree(childIno);
     } finally {
       this.inodeWriteUnlock(parentIno);
     }
@@ -1450,15 +1531,21 @@ export class SharedFS {
       // Remove any existing entry at destination
       const existingIno = this.dirLookup(newParent, newNameBytes);
       if (existingIno >= 0) {
+        if (existingIno === srcIno) {
+          return;
+        }
         const existOff = this.inodeOffset(existingIno);
         const existMode = this.r32(existOff + INO_MODE);
         if ((existMode & S_IFMT) === S_IFDIR) throw new SFSError(EISDIR);
         this.dirRemoveEntry(newParent, newNameBytes);
+        let shouldFreeExisting = false;
         this.inodeWriteLock(existingIno);
-        this.inodeTruncate(existingIno, 0);
-        this.w32(existOff + INO_LINK_COUNT, 0);
-        this.inodeWriteUnlock(existingIno);
-        this.inodeFree(existingIno);
+        try {
+          shouldFreeExisting = this.inodeDropLinkRefLocked(existingIno);
+        } finally {
+          this.inodeWriteUnlock(existingIno);
+        }
+        if (shouldFreeExisting) this.inodeFree(existingIno);
       }
 
       // Add entry in new directory
@@ -1570,17 +1657,17 @@ export class SharedFS {
       const mode = this.r32(childOff + INO_MODE);
       if ((mode & S_IFMT) !== S_IFDIR) throw new SFSError(ENOTDIR);
 
+      let shouldFree = false;
       this.inodeWriteLock(childIno);
       try {
         if (!this.dirIsEmpty(childIno)) throw new SFSError(ENOTEMPTY);
 
         this.dirRemoveEntry(parentIno, nameBytes);
-        this.inodeTruncate(childIno, 0);
-        this.w32(childOff + INO_LINK_COUNT, 0);
+        shouldFree = this.inodeOrphanLocked(childIno);
       } finally {
         this.inodeWriteUnlock(childIno);
       }
-      this.inodeFree(childIno);
+      if (shouldFree) this.inodeFree(childIno);
 
       // Decrement parent link count
       const pOff = this.inodeOffset(parentIno);

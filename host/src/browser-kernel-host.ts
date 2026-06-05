@@ -134,6 +134,7 @@ export class BrowserKernel {
   > &
     BrowserKernelOptions;
   private exitResolvers = new Map<number, (status: number) => void>();
+  private pendingExitStatuses = new Map<number, number>();
   private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   private nextRequestId = 1;
   private ptyOutputCallbacks = new Map<number, (data: Uint8Array) => void>();
@@ -405,9 +406,7 @@ export class BrowserKernel {
       maxPages: this.maxPages,
     }) as number;
 
-    const exit = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exit = this.createExitPromise(pid);
 
     if (options.pty) {
       this.sendToKernel({ type: "register_pty_output", pid });
@@ -457,9 +456,7 @@ export class BrowserKernel {
     const pid = this.nextPid++;
     const requestId = this.nextRequestId++;
 
-    const exitPromise = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exitPromise = this.createExitPromise(pid);
 
     // Clone programBytes since it gets transferred (detached)
     const bytesToSend = programBytes.slice(0);
@@ -529,15 +526,24 @@ export class BrowserKernel {
       maxPages: this.maxPages,
     }) as number;
 
-    const exit = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exit = this.createExitPromise(pid);
 
     if (options?.pty) {
       this.sendToKernel({ type: "register_pty_output", pid });
     }
 
     return { pid, exit };
+  }
+
+  private createExitPromise(pid: number): Promise<number> {
+    if (this.pendingExitStatuses.has(pid)) {
+      const status = this.pendingExitStatuses.get(pid)!;
+      this.pendingExitStatuses.delete(pid);
+      return Promise.resolve(status);
+    }
+    return new Promise<number>((resolve) => {
+      this.exitResolvers.set(pid, resolve);
+    });
   }
 
   /**
@@ -886,6 +892,7 @@ export class BrowserKernel {
     });
     this.kernelWorkerHandle.terminate();
     this.exitResolvers.clear();
+    this.pendingExitStatuses.clear();
     this.pendingRequests.clear();
     this.ptyOutputCallbacks.clear();
   }
@@ -950,7 +957,11 @@ export class BrowserKernel {
       case "exit": {
         const resolver = this.exitResolvers.get(msg.pid);
         this.exitResolvers.delete(msg.pid);
-        if (resolver) resolver(msg.status);
+        if (resolver) {
+          resolver(msg.status);
+        } else {
+          this.pendingExitStatuses.set(msg.pid, msg.status);
+        }
         this.options.onProcessEvent?.({ kind: "exit", pid: msg.pid, exitStatus: msg.status });
         break;
       }
