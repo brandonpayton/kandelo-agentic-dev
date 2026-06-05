@@ -66,6 +66,15 @@ SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   ext/standard/tests/serialize \
   --timeout 60000 --json
 
+# Full ext/standard strings directory, now clean on both supported hosts:
+# 716 total, 663 pass, 53 skip.
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host node ext/standard/tests/strings --timeout 60000 --json
+
+LD_LIBRARY_PATH=/tmp/pw-deps/root/usr/lib/x86_64-linux-gnu \
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
+  --host browser ext/standard/tests/strings --timeout 60000 --json
+
 # Node host. Shard full runs; SKIP_* vars are upstream PHPT control env.
 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 scripts/run-php-upstream-tests.sh \
   --host node --all --shard 1/16 --timeout 180000 --json
@@ -114,8 +123,10 @@ Kernel/POSIX fixes found by PHPT so far in the current PR:
   and `--CLEAN--`, `--INI--` assignment whitespace is normalized, `{PWD}` in
   `--INI--`/`--ENV--` expands to the guest test directory, PHP-style trim
   removes edge NUL bytes for EXPECT matching, PHPT source/output bytes are
-  preserved instead of UTF-8 decoded, flaky PHPTs retry once, and selected
-  upstream control env vars such as `SKIP_SLOW_TESTS` pass through to guest PHP.
+  preserved instead of UTF-8 decoded, EXPECTF `%r...%r` regex spans and
+  percent placeholders follow upstream substitution ordering, flaky PHPTs retry
+  once, and selected upstream control env vars such as `SKIP_SLOW_TESTS` pass
+  through to guest PHP.
 - Stream/socket behavior now covers the standard cases exercised by PHP's
   stream suite: abstract AF_UNIX addresses are not filesystem-backed, UDP
   `INADDR_ANY` destinations route to loopback, AF_INET6 loopback sockaddrs are

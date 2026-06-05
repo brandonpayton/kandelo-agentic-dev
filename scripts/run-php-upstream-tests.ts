@@ -315,6 +315,39 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function replaceExpectfPlaceholders(text: string): string {
+  return text.replace(/%[easSAwidxfc0]/g, (token) => {
+    switch (token) {
+      case "%e":
+        return "[/\\\\]";
+      case "%s":
+        return "[^\\r\\n]+";
+      case "%S":
+        return "[^\\r\\n]*";
+      case "%a":
+        return ".+";
+      case "%A":
+        return "[\\s\\S]*";
+      case "%w":
+        return "\\s*";
+      case "%i":
+        return "[+-]?\\d+";
+      case "%d":
+        return "\\d+";
+      case "%x":
+        return "[0-9a-fA-F]+";
+      case "%f":
+        return "[+-]?(?:(?:\\d+\\.\\d*)|(?:\\d*\\.\\d+)|(?:\\d+))(?:[Ee][+-]?\\d+)?";
+      case "%c":
+        return ".";
+      case "%0":
+        return "\\x00";
+      default:
+        return escapeRegExp(token);
+    }
+  });
+}
+
 function expectfToRegExp(expectf: string): RegExp {
   let out = "";
   for (let i = 0; i < expectf.length; i++) {
@@ -326,57 +359,13 @@ function expectfToRegExp(expectf: string): RegExp {
         continue;
       }
     }
-    if (expectf[i] !== "%") {
-      out += escapeRegExp(expectf[i]);
-      continue;
-    }
-    const next = expectf[++i];
-    switch (next) {
-      case "%":
-        out += "%";
-        break;
-      case "a":
-        out += ".+";
-        break;
-      case "A":
-        out += "[\\s\\S]*";
-        break;
-      case "s":
-        out += "[^\\r\\n]+";
-        break;
-      case "S":
-        out += "[^\\r\\n]*";
-        break;
-      case "w":
-        out += "\\s*";
-        break;
-      case "i":
-        out += "[+-]?\\d+";
-        break;
-      case "d":
-        out += "\\d+";
-        break;
-      case "x":
-        out += "[0-9a-fA-F]+";
-        break;
-      case "f":
-        out +=
-          "[+-]?(?:(?:\\d+\\.\\d*)|(?:\\d*\\.\\d+)|(?:\\d+))(?:[Ee][+-]?\\d+)?";
-        break;
-      case "c":
-        out += ".";
-        break;
-      case "0":
-        out += "\\x00";
-        break;
-      case "e":
-        out += "[/\\\\]";
-        break;
-      default:
-        out += escapeRegExp(`%${next ?? ""}`);
-    }
+    out += escapeRegExp(expectf[i]);
   }
-  return new RegExp(`^${out}$`, "s");
+  // Upstream run-tests.php first preg_quote()s non-%r sections, leaves %r
+  // regex spans raw, then applies EXPECTF %-placeholder substitutions to the
+  // whole pattern. Do not treat %% specially: literal percent signs remain
+  // literal unless followed by a recognized placeholder character.
+  return new RegExp(`^${replaceExpectfPlaceholders(out)}$`, "s");
 }
 
 function compareExpectation(
