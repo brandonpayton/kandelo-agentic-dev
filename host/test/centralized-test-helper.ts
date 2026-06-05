@@ -278,6 +278,14 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
   let stderr = "";
   const stdoutChunks: Uint8Array[] = [];
   const workers = new Map<number, ReturnType<NodeWorkerAdapter["createWorker"]>>();
+  const threadWorkers = new Map<string, {
+    pid: number;
+    tid: number;
+    channelOffset: number;
+    basePage: number;
+    allocator: ThreadPageAllocator;
+    worker: ReturnType<NodeWorkerAdapter["createWorker"]>;
+  }>();
 
   const io = options.io ?? new NodePlatformIO();
   const workerAdapter = new NodeWorkerAdapter();
@@ -295,6 +303,30 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
   const processPtrWidths = new Map<number, 4 | 8>();
 
   const pid = 100;
+
+  const threadKey = (entryPid: number, channelOffset: number) => `${entryPid}:${channelOffset}`;
+
+  const reclaimThreadWorker = (entryPid: number, tid: number, channelOffset: number) => {
+    const key = threadKey(entryPid, channelOffset);
+    let entry = threadWorkers.get(key);
+    if (!entry && tid > 0) {
+      entry = Array.from(threadWorkers.values()).find(
+        (candidate) => candidate.pid === entryPid && candidate.tid === tid,
+      );
+    }
+    if (!entry) return;
+    threadWorkers.delete(threadKey(entry.pid, entry.channelOffset));
+    entry.allocator.free(entry.basePage);
+    entry.worker.terminate().catch(() => {});
+  };
+
+  const terminateThreadWorkersForPid = (entryPid: number) => {
+    for (const entry of Array.from(threadWorkers.values())) {
+      if (entry.pid !== entryPid) continue;
+      threadWorkers.delete(threadKey(entry.pid, entry.channelOffset));
+      entry.worker.terminate().catch(() => {});
+    }
+  };
 
   const kernelWorker = new CentralizedKernelWorker(
     { maxWorkers: 4, dataBufferSize: 65536, useSharedMemory: true, enableSyscallLog: !!process.env.KERNEL_SYSCALL_LOG },
@@ -437,23 +469,34 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
         };
 
         const threadWorker = workerAdapter.createWorker(threadInitData);
+        threadWorkers.set(threadKey(clonePid, alloc.channelOffset), {
+          pid: clonePid,
+          tid,
+          channelOffset: alloc.channelOffset,
+          basePage: alloc.basePage,
+          allocator: threadAllocator,
+          worker: threadWorker,
+        });
         threadWorker.on("message", (msg: unknown) => {
           const m = msg as WorkerToHostMessage;
           if (m.type === "thread_exit") {
-            threadAllocator.free(alloc.basePage);
-            threadWorker.terminate().catch(() => {});
+            reclaimThreadWorker(clonePid, tid, alloc.channelOffset);
           }
         });
         threadWorker.on("error", () => {
           kernelWorker.notifyThreadExit(clonePid, tid);
           kernelWorker.removeChannel(clonePid, alloc.channelOffset);
-          threadAllocator.free(alloc.basePage);
+          reclaimThreadWorker(clonePid, tid, alloc.channelOffset);
         });
 
         return tid;
       },
+      onThreadExit: (exitPid, tid, channelOffset) => {
+        reclaimThreadWorker(exitPid, tid, channelOffset);
+      },
       onExit: (exitPid, exitStatus) => {
         if (exitPid === pid) {
+          terminateThreadWorkersForPid(exitPid);
           kernelWorker.unregisterProcess(exitPid);
           processProgramBytes.delete(exitPid);
           processLayouts.delete(exitPid);
@@ -466,6 +509,7 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
           }
           resolveExit(exitStatus);
         } else {
+          terminateThreadWorkersForPid(exitPid);
           kernelWorker.deactivateProcess(exitPid);
           processProgramBytes.delete(exitPid);
           processLayouts.delete(exitPid);
@@ -538,6 +582,8 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
 
   const timer = setTimeout(() => {
     for (const [, w] of workers) w.terminate().catch(() => {});
+    for (const entry of threadWorkers.values()) entry.worker.terminate().catch(() => {});
+    threadWorkers.clear();
     rejectExit(new Error(`Program timed out after ${timeout}ms`));
   }, timeout);
 
@@ -556,6 +602,8 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
     if (m.type === "error" && m.pid === pid) {
       clearTimeout(timer);
       for (const [, w] of workers) w.terminate().catch(() => {});
+      for (const entry of threadWorkers.values()) entry.worker.terminate().catch(() => {});
+      threadWorkers.clear();
       rejectExit(new Error(m.message));
     }
   });

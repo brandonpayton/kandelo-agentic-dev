@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { buildClangArgs } from '../src/bin/cc.ts';
+import {
+  DEFAULT_EXECUTABLE_STACK_SIZE,
+  globalBaseForStackSize,
+} from '../src/lib/flags.ts';
 
 describe('buildClangArgs', () => {
   const toolchain = {
@@ -28,6 +32,8 @@ describe('buildClangArgs', () => {
     expect(args).toContain('--target=wasm32-unknown-unknown');
     expect(args).toContain('-Wl,--entry=_start');
     expect(args).toContain('-Wl,--import-memory');
+    expect(args).toContain(`-Wl,-z,stack-size=${DEFAULT_EXECUTABLE_STACK_SIZE}`);
+    expect(args).toContain(`-Wl,--global-base=${globalBaseForStackSize(DEFAULT_EXECUTABLE_STACK_SIZE)}`);
     expect(args.join(' ')).toContain('channel_syscall.c');
     expect(args.join(' ')).toContain('compiler_rt.c');
     expect(args.join(' ')).toContain('crt1.o');
@@ -71,5 +77,12 @@ describe('buildClangArgs', () => {
     const args = buildClangArgs(['--kandelo-thread-slots=2', 'foo.c', '-o', 'foo.wasm'], toolchain);
     expect(args).toContain('-DWASM_POSIX_THREAD_SLOT_DECL=2');
     expect(args).not.toContain('--kandelo-thread-slots=2');
+  });
+
+  it('keeps package-requested wasm stack sizes coherent with global-base', () => {
+    const args = buildClangArgs(['-Wl,-z,stack-size=16777216', 'foo.c', '-o', 'foo.wasm'], toolchain);
+    expect(args).toContain('-Wl,-z,stack-size=16777216');
+    expect(args).toContain('-Wl,--global-base=16842752');
+    expect(args).not.toContain(`-Wl,-z,stack-size=${DEFAULT_EXECUTABLE_STACK_SIZE}`);
   });
 });

@@ -169,6 +169,7 @@ fn synthetic_file_stat(path: &[u8], uid: u32, gid: u32) -> Option<WasmStat> {
         st_ctime_sec: 0,
         st_ctime_nsec: 0,
         _pad: 0,
+        ..WasmStat::default()
     })
 }
 
@@ -547,6 +548,7 @@ fn virtual_device_stat(dev: VirtualDevice, uid: u32, gid: u32) -> WasmStat {
         st_ctime_sec: 0,
         st_ctime_nsec: 0,
         _pad: 0,
+        ..WasmStat::default()
     }
 }
 
@@ -1614,7 +1616,12 @@ pub fn sys_read(
                 return Ok(n);
             }
 
-            let n = host.host_read(host_handle, buf)?;
+            let n = if (0..=2).contains(&host_handle) {
+                host.host_read(host_handle, buf)?
+            } else {
+                let current_offset = proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset);
+                host.host_pread(host_handle, current_offset, buf)?
+            };
             if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
                 ofd.offset += n as i64;
             }
@@ -1963,7 +1970,12 @@ pub fn sys_write(
                     return Err(Errno::EFBIG);
                 }
             }
-            let n = host.host_write(host_handle, buf)?;
+            let n = if (0..=2).contains(&host_handle) {
+                host.host_write(host_handle, buf)?
+            } else {
+                let current_offset = proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset);
+                host.host_pwrite(host_handle, current_offset, buf)?
+            };
             if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
                 ofd.offset += n as i64;
             }
@@ -2012,6 +2024,9 @@ pub fn sys_lseek(
             ofd.dir_host_handle = -1; // will be reopened by next getdents64
             ofd.dir_synth_state = 0;
             ofd.dir_entry_offset = 0;
+            ofd.dir_pending_name.clear();
+            ofd.dir_pending_ino = 0;
+            ofd.dir_pending_type = 0;
             ofd.offset = offset;
 
             if offset > 0 {
@@ -2144,15 +2159,8 @@ pub fn sys_lseek(
     }
 
     let new_offset = match whence {
-        SEEK_SET => {
-            host.host_seek(ofd.host_handle, offset, whence)?;
-            offset
-        }
-        SEEK_CUR => {
-            let pos = ofd.offset + offset;
-            host.host_seek(ofd.host_handle, pos, SEEK_SET)?;
-            pos
-        }
+        SEEK_SET => offset,
+        SEEK_CUR => ofd.offset + offset,
         SEEK_END => host.host_seek(ofd.host_handle, offset, whence)?,
         _ => return Err(Errno::EINVAL),
     };
@@ -2201,7 +2209,6 @@ pub fn sys_pread(
     }
 
     let host_handle = ofd.host_handle;
-    let saved_offset = ofd.offset;
 
     if host_handle == SYNTHETIC_FILE_HANDLE {
         let data = synthetic_file_content(&ofd.path).ok_or(Errno::EBADF)?;
@@ -2214,13 +2221,7 @@ pub fn sys_pread(
         return Ok(n);
     }
 
-    // Seek to the requested offset, read, then restore.
-    // Single-threaded, so save/seek/read/restore is safe.
-    host.host_seek(host_handle, offset, SEEK_SET)?;
-    let n = host.host_read(host_handle, buf)?;
-    host.host_seek(host_handle, saved_offset, SEEK_SET)?;
-
-    Ok(n)
+    host.host_pread(host_handle, offset, buf)
 }
 
 /// Write to a file descriptor at a given offset without modifying the file position.
@@ -2258,13 +2259,7 @@ pub fn sys_pwrite(
     }
 
     let host_handle = ofd.host_handle;
-    let saved_offset = ofd.offset;
-
-    host.host_seek(host_handle, offset, SEEK_SET)?;
-    let n = host.host_write(host_handle, buf)?;
-    host.host_seek(host_handle, saved_offset, SEEK_SET)?;
-
-    Ok(n)
+    host.host_pwrite(host_handle, offset, buf)
 }
 
 /// preadv -- scatter-gather read at offset.
@@ -2692,6 +2687,7 @@ pub fn sys_fstat(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<W
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         })
     } else if ofd.file_type == FileType::CharDevice {
         if let Some(dev) = VirtualDevice::from_host_handle(ofd.host_handle) {
@@ -2715,6 +2711,7 @@ pub fn sys_fstat(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<W
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             });
         }
         // Other char devices — delegate to host. VFS is the source of truth
@@ -2737,6 +2734,7 @@ pub fn sys_fstat(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<W
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         })
     } else if ofd.file_type == FileType::MemFd {
         let memfd_idx = (-(ofd.host_handle + 1)) as usize;
@@ -2760,6 +2758,7 @@ pub fn sys_fstat(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<W
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         })
     } else if ofd.host_handle == SYNTHETIC_FILE_HANDLE {
         synthetic_file_stat(&ofd.path, proc.euid, proc.egid).ok_or(Errno::EBADF)
@@ -2806,6 +2805,7 @@ pub fn sys_fstat(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<W
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             }),
         )
     } else {
@@ -3115,6 +3115,7 @@ fn match_pty_stat(resolved: &[u8], uid: u32, gid: u32) -> Option<WasmStat> {
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         })
     } else {
         None
@@ -3146,6 +3147,7 @@ pub fn sys_stat(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Resul
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         });
     }
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
@@ -3176,6 +3178,7 @@ pub fn sys_stat(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Resul
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             });
         }
     }
@@ -3214,6 +3217,7 @@ pub fn sys_lstat(
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         });
     }
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
@@ -3244,6 +3248,7 @@ pub fn sys_lstat(
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             });
         }
     }
@@ -3902,112 +3907,148 @@ pub fn sys_getdents64(
         reclen
     }
 
-    // Synthesize "." and ".." entries
-    let synth_state = proc
+    // Synthesize "." and ".." entries.
+    let mut synth_state = proc
         .ofd_table
         .get(ofd_idx)
         .ok_or(Errno::EBADF)?
         .dir_synth_state;
-    if synth_state < 2 {
-        let synth_entries: &[&[u8]] = if synth_state == 0 {
-            &[b".", b".."]
-        } else {
-            &[b".."]
-        };
-        for name in synth_entries {
-            entry_offset += 1;
-            let written = write_dirent64(buf, pos, 1, entry_offset, 4 /* DT_DIR */, name);
-            if written == 0 {
-                if pos == 0 {
-                    return Err(Errno::EINVAL);
-                }
-                // Save entry_offset before returning
-                if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-                    ofd.dir_entry_offset = entry_offset - 1; // didn't emit this one
-                }
-                return Ok(pos);
+    while synth_state < 2 {
+        let name: &[u8] = if synth_state == 0 { b"." } else { b".." };
+        let next_offset = entry_offset + 1;
+        let written = write_dirent64(buf, pos, 1, next_offset, 4 /* DT_DIR */, name);
+        if written == 0 {
+            if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                ofd.dir_entry_offset = entry_offset;
+                ofd.dir_synth_state = synth_state;
             }
-            pos += written;
+            if pos == 0 {
+                return Err(Errno::EINVAL);
+            }
+            return Ok(pos);
         }
+        entry_offset = next_offset;
+        synth_state += 1;
+        pos += written;
         if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-            ofd.dir_synth_state = 2;
+            ofd.dir_entry_offset = entry_offset;
+            ofd.dir_synth_state = synth_state;
         }
     }
 
     loop {
-        match host.host_readdir(dir_handle, &mut name_buf)? {
-            Some((d_ino, d_type, name_len)) => {
-                // Skip host "." and ".." entries (we already synthesized them)
-                if (name_len == 1 && name_buf[0] == b'.')
-                    || (name_len == 2 && name_buf[0] == b'.' && name_buf[1] == b'.')
-                {
-                    continue;
-                }
+        let pending = {
+            let ofd = proc.ofd_table.get_mut(ofd_idx).ok_or(Errno::EBADF)?;
+            if ofd.dir_pending_name.is_empty() {
+                None
+            } else {
+                Some((
+                    ofd.dir_pending_ino,
+                    ofd.dir_pending_type,
+                    core::mem::take(&mut ofd.dir_pending_name),
+                ))
+            }
+        };
 
-                entry_offset += 1;
-                let written = write_dirent64(
-                    buf,
-                    pos,
-                    d_ino,
-                    entry_offset,
-                    d_type as u8,
-                    &name_buf[..name_len],
-                );
+        match pending {
+            Some((d_ino, d_type, name)) => {
+                let next_offset = entry_offset + 1;
+                let written = write_dirent64(buf, pos, d_ino, next_offset, d_type as u8, &name);
                 if written == 0 {
+                    if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                        ofd.dir_pending_ino = d_ino;
+                        ofd.dir_pending_type = d_type;
+                        ofd.dir_pending_name = name;
+                    }
                     if pos == 0 {
                         return Err(Errno::EINVAL);
                     }
                     break;
                 }
+                entry_offset = next_offset;
                 pos += written;
             }
-            None => {
-                // Close the host dir handle
-                let _ = host.host_closedir(dir_handle);
-
-                // Inject synthetic entries for virtual filesystems when listing "/"
-                if path == b"/" {
-                    let virtuals: &[&[u8]] = &[b"proc"];
-                    // synth_state tracks how many virtual entries we've emitted (2 = done with . and ..)
-                    let virt_base = proc
-                        .ofd_table
-                        .get(ofd_idx)
-                        .ok_or(Errno::EBADF)?
-                        .dir_synth_state;
-                    let virt_start = if virt_base > 2 {
-                        (virt_base - 2) as usize
-                    } else {
-                        0
-                    };
-                    for (i, name) in virtuals.iter().enumerate() {
-                        if i < virt_start {
-                            continue;
-                        }
-                        entry_offset += 1;
-                        let written =
-                            write_dirent64(buf, pos, 2, entry_offset, 4 /* DT_DIR */, name);
-                        if written == 0 {
-                            // Save progress — we'll resume from here on next call
-                            if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-                                ofd.dir_entry_offset = entry_offset - 1;
-                                ofd.dir_host_handle = -3; // signal: host exhausted, virtuals pending
-                                ofd.dir_synth_state = 2 + i as u8;
-                            }
-                            if pos == 0 {
-                                return Err(Errno::EINVAL);
-                            }
-                            return Ok(pos);
-                        }
-                        pos += written;
+            None => match host.host_readdir(dir_handle, &mut name_buf)? {
+                Some((d_ino, d_type, name_len)) => {
+                    // Skip host "." and ".." entries (we already synthesized them)
+                    if (name_len == 1 && name_buf[0] == b'.')
+                        || (name_len == 2 && name_buf[0] == b'.' && name_buf[1] == b'.')
+                    {
+                        continue;
                     }
-                }
 
-                // Mark as fully exhausted
-                if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-                    ofd.dir_host_handle = -2;
+                    let next_offset = entry_offset + 1;
+                    let name = &name_buf[..name_len];
+                    let written = write_dirent64(buf, pos, d_ino, next_offset, d_type as u8, name);
+                    if written == 0 {
+                        if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                            ofd.dir_pending_ino = d_ino;
+                            ofd.dir_pending_type = d_type;
+                            ofd.dir_pending_name.clear();
+                            ofd.dir_pending_name.extend_from_slice(name);
+                        }
+                        if pos == 0 {
+                            return Err(Errno::EINVAL);
+                        }
+                        break;
+                    }
+                    entry_offset = next_offset;
+                    pos += written;
                 }
-                break;
-            }
+                None => {
+                    // Close the host dir handle
+                    let _ = host.host_closedir(dir_handle);
+
+                    // Inject synthetic entries for virtual filesystems when listing "/"
+                    if path == b"/" {
+                        let virtuals: &[&[u8]] = &[b"proc"];
+                        // synth_state tracks how many virtual entries we've emitted (2 = done with . and ..)
+                        let virt_base = proc
+                            .ofd_table
+                            .get(ofd_idx)
+                            .ok_or(Errno::EBADF)?
+                            .dir_synth_state;
+                        let virt_start = if virt_base > 2 {
+                            (virt_base - 2) as usize
+                        } else {
+                            0
+                        };
+                        for (i, name) in virtuals.iter().enumerate() {
+                            if i < virt_start {
+                                continue;
+                            }
+                            entry_offset += 1;
+                            let written = write_dirent64(
+                                buf,
+                                pos,
+                                2,
+                                entry_offset,
+                                4, /* DT_DIR */
+                                name,
+                            );
+                            if written == 0 {
+                                // Save progress — we'll resume from here on next call
+                                if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                                    ofd.dir_entry_offset = entry_offset - 1;
+                                    ofd.dir_host_handle = -3; // signal: host exhausted, virtuals pending
+                                    ofd.dir_synth_state = 2 + i as u8;
+                                }
+                                if pos == 0 {
+                                    return Err(Errno::EINVAL);
+                                }
+                                return Ok(pos);
+                            }
+                            pos += written;
+                        }
+                    }
+
+                    // Mark as fully exhausted
+                    if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                        ofd.dir_host_handle = -2;
+                    }
+                    break;
+                }
+            },
         }
     }
 
@@ -4611,9 +4652,11 @@ pub fn sys_sigprocmask(proc: &mut Process, how: u32, set: u64) -> Result<u64, Er
 
 /// Exit the process. Closes all fds and dir streams, sets state to Exited.
 pub fn sys_exit(proc: &mut Process, host: &mut dyn HostIO, status: i32) {
-    // Close all file descriptors
-    let max_fd = 1024; // Use a reasonable upper bound
-    for fd in 0..max_fd {
+    // Close every currently-open file descriptor. Do not assume the default
+    // RLIMIT_NOFILE bound: setrlimit() can raise it, and exit must release
+    // the actual fd table contents.
+    let open_fds: Vec<i32> = proc.fd_table.iter().map(|(fd, _)| fd).collect();
+    for fd in open_fds {
         let _ = sys_close(proc, host, fd);
     }
 
@@ -4804,7 +4847,7 @@ pub fn sys_mremap(
     if aligned_new <= aligned_old {
         if aligned_new < aligned_old {
             proc.memory
-                .munmap(old_addr + aligned_new, aligned_old - aligned_new);
+                .munmap(old_addr + aligned_new, aligned_old - aligned_new)?;
         }
         return Ok(old_addr);
     }
@@ -4834,7 +4877,7 @@ pub fn sys_mremap(
         if new_addr == wasm_posix_shared::mmap::MAP_FAILED {
             return Err(Errno::ENOMEM);
         }
-        proc.memory.munmap(old_addr, aligned_old);
+        proc.memory.munmap(old_addr, aligned_old)?;
         return Ok(new_addr);
     }
 
@@ -5044,7 +5087,7 @@ pub fn sys_munmap(
 
     // Linux munmap succeeds (returns 0) even if no mappings overlap the range,
     // as long as the address is valid and page-aligned.
-    proc.memory.munmap(addr, len);
+    proc.memory.munmap(addr, len)?;
     Ok(())
 }
 
@@ -7380,6 +7423,7 @@ pub fn sys_fstatat(
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         });
     }
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
@@ -7411,6 +7455,7 @@ pub fn sys_fstatat(
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             });
         }
     }
@@ -10343,6 +10388,7 @@ mod tests {
             st_ctime_sec: 0,
             st_ctime_nsec: 0,
             _pad: 0,
+            ..WasmStat::default()
         }
     }
 
@@ -10491,6 +10537,7 @@ mod tests {
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             })
         }
 
@@ -10519,6 +10566,7 @@ mod tests {
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             })
         }
 
@@ -10548,6 +10596,7 @@ mod tests {
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             })
         }
 
@@ -11485,6 +11534,66 @@ mod tests {
         assert_eq!(result, Err(Errno::EBADF));
     }
 
+    fn dirent64_names(buf: &[u8], n: usize) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        let mut pos = 0usize;
+        while pos < n {
+            let reclen = u16::from_le_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            assert!(reclen > 0);
+            let name_start = pos + 19;
+            let mut name_end = name_start;
+            while name_end < pos + reclen && buf[name_end] != 0 {
+                name_end += 1;
+            }
+            names.push(buf[name_start..name_end].to_vec());
+            pos += reclen;
+        }
+        names
+    }
+
+    #[test]
+    fn test_getdents64_resumes_synthetic_entries_after_full_buffer() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.dir_entry_count = 1; // test.txt
+
+        let fd = sys_open(&mut proc, &mut host, b"/tmp", O_RDONLY | O_DIRECTORY, 0).unwrap();
+
+        let mut tiny = [0u8; 24];
+        let n1 = sys_getdents64(&mut proc, &mut host, fd, &mut tiny).unwrap();
+        assert_eq!(dirent64_names(&tiny, n1), vec![b".".to_vec()]);
+
+        let mut larger = [0u8; 80];
+        let n2 = sys_getdents64(&mut proc, &mut host, fd, &mut larger).unwrap();
+        assert_eq!(
+            dirent64_names(&larger, n2),
+            vec![b"..".to_vec(), b"test.txt".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_getdents64_keeps_entry_that_does_not_fit() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.dir_entry_count = 3; // test.txt, foo.txt, bar.txt
+
+        let fd = sys_open(&mut proc, &mut host, b"/tmp", O_RDONLY | O_DIRECTORY, 0).unwrap();
+
+        let mut small = [0u8; 80];
+        let n1 = sys_getdents64(&mut proc, &mut host, fd, &mut small).unwrap();
+        assert_eq!(
+            dirent64_names(&small, n1),
+            vec![b".".to_vec(), b"..".to_vec(), b"test.txt".to_vec()]
+        );
+
+        let mut large = [0u8; 256];
+        let n2 = sys_getdents64(&mut proc, &mut host, fd, &mut large).unwrap();
+        assert_eq!(
+            dirent64_names(&large, n2),
+            vec![b"foo.txt".to_vec(), b"bar.txt".to_vec()]
+        );
+    }
+
     #[test]
     fn test_dir_stream_slot_reuse() {
         let mut proc = Process::new(1);
@@ -11654,6 +11763,33 @@ mod tests {
         let mut buf = [0u8; 10];
         let result = sys_read(&mut proc, &mut host, fd, &mut buf);
         assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_exit_closes_high_numbered_fds() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+
+        sys_setrlimit(&mut proc, 7, 2048, 4096).unwrap();
+        let fd = sys_open(
+            &mut proc,
+            &mut host,
+            b"/tmp/high-fd",
+            O_RDWR | O_CREAT,
+            0o644,
+        )
+        .unwrap();
+        let high_fd = sys_dup2(&mut proc, &mut host, fd, 1500).unwrap();
+        assert_eq!(high_fd, 1500);
+        sys_close(&mut proc, &mut host, fd).unwrap();
+
+        sys_exit(&mut proc, &mut host, 0);
+
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            sys_read(&mut proc, &mut host, high_fd, &mut buf),
+            Err(Errno::EBADF)
+        );
     }
 
     #[test]
@@ -14967,6 +15103,7 @@ mod tests {
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             })
         }
         fn host_stat(&mut self, path: &[u8]) -> Result<WasmStat, Errno> {
@@ -14987,6 +15124,7 @@ mod tests {
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             })
         }
         fn host_lstat(&mut self, path: &[u8]) -> Result<WasmStat, Errno> {
@@ -15008,6 +15146,7 @@ mod tests {
                 st_ctime_sec: 0,
                 st_ctime_nsec: 0,
                 _pad: 0,
+                ..WasmStat::default()
             })
         }
         fn host_mkdir(&mut self, path: &[u8], _mode: u32) -> Result<(), Errno> {
@@ -17656,6 +17795,7 @@ mod tests {
                     st_ctime_sec: 0,
                     st_ctime_nsec: 0,
                     _pad: 0,
+                    ..WasmStat::default()
                 })
             }
             fn host_mkdir(&mut self, _p: &[u8], _m: u32) -> Result<(), Errno> {
@@ -17899,6 +18039,7 @@ mod tests {
                     st_ctime_sec: 0,
                     st_ctime_nsec: 0,
                     _pad: 0,
+                    ..WasmStat::default()
                 })
             }
             fn host_mkdir(&mut self, _p: &[u8], _m: u32) -> Result<(), Errno> {
@@ -18143,6 +18284,7 @@ mod tests {
                     st_ctime_sec: 0,
                     st_ctime_nsec: 0,
                     _pad: 0,
+                    ..WasmStat::default()
                 })
             }
             fn host_mkdir(&mut self, _p: &[u8], _m: u32) -> Result<(), Errno> {

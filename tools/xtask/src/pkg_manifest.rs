@@ -2292,10 +2292,12 @@ install_hints = { darwin = "brew install cmake", linux = "apt install cmake" }
 
         // cmake has explicit probe + hints.
         assert_eq!(m.host_tools[1].name, "cmake");
-        assert!(m.host_tools[1]
-            .probe
-            .version_regex
-            .starts_with("cmake version"));
+        assert!(
+            m.host_tools[1]
+                .probe
+                .version_regex
+                .starts_with("cmake version")
+        );
         assert_eq!(
             m.host_tools[1]
                 .install_hints

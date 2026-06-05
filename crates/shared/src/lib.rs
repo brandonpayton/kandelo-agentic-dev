@@ -729,6 +729,47 @@ pub struct WasmStat {
     pub st_ctime_sec: u64,
     pub st_ctime_nsec: u32,
     pub _pad: u32,
+    pub st_rdev: u64,
+    pub st_blksize: i32,
+    pub st_blocks: i32,
+}
+
+impl Default for WasmStat {
+    fn default() -> Self {
+        Self {
+            st_dev: 0,
+            st_ino: 0,
+            st_mode: 0,
+            st_nlink: 0,
+            st_uid: 0,
+            st_gid: 0,
+            st_size: 0,
+            st_atime_sec: 0,
+            st_atime_nsec: 0,
+            st_mtime_sec: 0,
+            st_mtime_nsec: 0,
+            st_ctime_sec: 0,
+            st_ctime_nsec: 0,
+            _pad: 0,
+            st_rdev: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod wasm_stat_tests {
+    use super::WasmStat;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn layout_matches_guest_kstat() {
+        assert_eq!(size_of::<WasmStat>(), 104);
+        assert_eq!(offset_of!(WasmStat, st_rdev), 88);
+        assert_eq!(offset_of!(WasmStat, st_blksize), 96);
+        assert_eq!(offset_of!(WasmStat, st_blocks), 100);
+    }
 }
 
 /// Directory entry structure for the Wasm POSIX interface.

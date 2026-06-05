@@ -1698,7 +1698,8 @@ export function patchWasmForThread(bytes: ArrayBuffer): ArrayBuffer {
  * 2. Allocates TLS for the thread
  * 3. Sets the channel base and stack pointer
  * 4. Calls the thread function via the indirect function table
- * 5. On return: performs CLONE_CHILD_CLEARTID (write 0 + futex wake at ctidPtr)
+ * 5. On return: sends SYS_EXIT so the kernel worker can perform
+ *    CLONE_CHILD_CLEARTID after reclaiming the host thread slot.
  *
  * If the thread function calls fork(), this entry point drives the
  * `wpk_fork_*` unwind/SYS_FORK/rewind loop just like the main process worker,
@@ -1709,7 +1710,7 @@ export async function centralizedThreadWorkerMain(
   port: MessagePort,
   initData: CentralizedThreadInitMessage,
 ): Promise<void> {
-  const { memory, channelOffset, pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr } = initData;
+  const { memory, channelOffset, pid, tid, fnPtr, argPtr, stackPtr, tlsPtr } = initData;
   const tlsOffset = initData.tlsOffset ?? initData.tlsAllocAddr;
   const ptrWidth = initData.ptrWidth ?? 4;
 
@@ -1858,14 +1859,6 @@ export async function centralizedThreadWorkerMain(
       }
     }
 
-    // CLONE_CHILD_CLEARTID: write 0 to ctidPtr and futex-wake it
-    if (ctidPtr !== 0) {
-      const view = new DataView(memory.buffer);
-      view.setInt32(ctidPtr, 0, true);
-      const i32 = new Int32Array(memory.buffer);
-      Atomics.notify(i32, ctidPtr / 4, 1);
-    }
-
     // Send SYS_EXIT through channel to notify kernel of thread exit
     {
       const view = new DataView(memory.buffer);
@@ -1877,7 +1870,6 @@ export async function centralizedThreadWorkerMain(
       Atomics.notify(i32, (base + CH_STATUS) / 4, 1);
       // Wait for kernel to process the exit
       while (Atomics.wait(i32, (base + CH_STATUS) / 4, CHANNEL_STATUS_PENDING) === "ok") { /* */ }
-      Atomics.store(i32, (base + CH_STATUS) / 4, CHANNEL_STATUS_IDLE);
     }
 
     port.postMessage({

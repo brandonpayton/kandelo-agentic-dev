@@ -118,22 +118,12 @@ export class BrowserKernel {
   private fsSab?: SharedArrayBuffer;
   private shmSab: SharedArrayBuffer;
   private maxPages: number;
-  /**
-   * @internal Legacy spawn() pre-allocates pids on the main thread. New
-   * code uses kernel.boot() which lets the worker allocate, making this
-   * counter irrelevant. Once all demos migrate to boot(), this goes away.
-   *
-   * Starts at 100 to skip the kernel's reserved range (virtual init at
-   * pid 1, future kernel threads). The architectural fix is in the spawn
-   * message protocol where pid is now optional and the worker is the
-   * authority.
-   */
-  nextPid = 100;
   private options: Required<
     Pick<BrowserKernelOptions, "maxWorkers" | "fsSize" | "env">
   > &
     BrowserKernelOptions;
   private exitResolvers = new Map<number, (status: number) => void>();
+  private pendingExitStatuses = new Map<number, number>();
   private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   private nextRequestId = 1;
   private ptyOutputCallbacks = new Map<number, (data: Uint8Array) => void>();
@@ -311,8 +301,9 @@ export class BrowserKernel {
       this.handleWorkerMessage(e.data as KernelToMainMessage);
     };
     this.kernelWorkerHandle.onerror = (e: ErrorEvent) => {
-      console.error("[BrowserKernel] Kernel worker error:", e.message);
-      const err = new Error(`Kernel worker error: ${e.message}`);
+      const detail = e.message || e.error?.message || [e.filename, e.lineno, e.colno].filter(Boolean).join(":") || "unknown";
+      console.error("[BrowserKernel] Kernel worker error:", detail, e.error ?? "");
+      const err = new Error(`Kernel worker error: ${detail}`);
       for (const [, { reject }] of this.pendingRequests) {
         reject(err);
       }
@@ -346,7 +337,8 @@ export class BrowserKernel {
         }
       };
       const errorHandler = (e: ErrorEvent) => {
-        settleReject(new Error(`Kernel worker error during init: ${e.message}`));
+        const detail = e.message || e.error?.message || [e.filename, e.lineno, e.colno].filter(Boolean).join(":") || "unknown";
+        settleReject(new Error(`Kernel worker error during init: ${detail}`));
       };
       const messageErrorHandler = () => {
         settleReject(new Error("Kernel worker failed to deserialize an init message"));
@@ -405,9 +397,7 @@ export class BrowserKernel {
       maxPages: this.maxPages,
     }) as number;
 
-    const exit = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exit = this.createExitPromise(pid);
 
     if (options.pty) {
       this.sendToKernel({ type: "register_pty_output", pid });
@@ -454,20 +444,18 @@ export class BrowserKernel {
       ptyRows?: number;
     },
   ): Promise<number> {
-    const pid = this.nextPid++;
     const requestId = this.nextRequestId++;
-
-    const exitPromise = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
 
     // Clone programBytes since it gets transferred (detached)
     const bytesToSend = programBytes.slice(0);
 
-    await this.request(requestId, {
+    const pid = await this.request(requestId, {
       type: "spawn",
       requestId,
-      pid,
+      // No pid — the kernel worker allocates.  A process host must not
+      // pre-pick userspace PIDs after boot, because init/service children may
+      // already occupy the old legacy range.  POSIX process identifiers are
+      // kernel-owned; the host only observes the assigned pid.
       programBytes: bytesToSend,
       argv,
       env: this.mergeEnv(options?.env ?? this.options.env),
@@ -479,7 +467,9 @@ export class BrowserKernel {
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
       maxPages: this.maxPages,
-    }, [bytesToSend]);
+    }, [bytesToSend]) as number;
+
+    const exitPromise = this.createExitPromise(pid);
 
     // Register PTY output callback if pty was requested
     if (options?.pty) {
@@ -529,15 +519,24 @@ export class BrowserKernel {
       maxPages: this.maxPages,
     }) as number;
 
-    const exit = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exit = this.createExitPromise(pid);
 
     if (options?.pty) {
       this.sendToKernel({ type: "register_pty_output", pid });
     }
 
     return { pid, exit };
+  }
+
+  private createExitPromise(pid: number): Promise<number> {
+    if (this.pendingExitStatuses.has(pid)) {
+      const status = this.pendingExitStatuses.get(pid)!;
+      this.pendingExitStatuses.delete(pid);
+      return Promise.resolve(status);
+    }
+    return new Promise<number>((resolve) => {
+      this.exitResolvers.set(pid, resolve);
+    });
   }
 
   /**
@@ -886,6 +885,7 @@ export class BrowserKernel {
     });
     this.kernelWorkerHandle.terminate();
     this.exitResolvers.clear();
+    this.pendingExitStatuses.clear();
     this.pendingRequests.clear();
     this.ptyOutputCallbacks.clear();
   }
@@ -950,7 +950,11 @@ export class BrowserKernel {
       case "exit": {
         const resolver = this.exitResolvers.get(msg.pid);
         this.exitResolvers.delete(msg.pid);
-        if (resolver) resolver(msg.status);
+        if (resolver) {
+          resolver(msg.status);
+        } else {
+          this.pendingExitStatuses.set(msg.pid, msg.status);
+        }
         this.options.onProcessEvent?.({ kind: "exit", pid: msg.pid, exitStatus: msg.status });
         break;
       }
