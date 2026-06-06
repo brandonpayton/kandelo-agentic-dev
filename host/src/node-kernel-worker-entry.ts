@@ -683,6 +683,7 @@ function handleSpawn(msg: SpawnMessage) {
     kernelWorker.registerProcess(pid, memory, [channelOffset], {
       ptrWidth,
       argv: msg.argv,
+      env: msg.env,
       brkBase: layout.brkBase,
       mmapBase: layout.mmapBase,
       maxAddr: layout.maxAddr,
@@ -826,6 +827,8 @@ async function handleFork(
   const forkBufAddr = threadFork
     ? threadFork.forkBufAddr
     : childChannelOffset - FORK_BUF_SIZE;
+  const childArgv = kernelWorker.snapshotProcessArgv(childPid);
+  const childEnv = kernelWorker.snapshotProcessEnv(childPid);
 
   const childInitData: CentralizedWorkerInitMessage = {
     type: "centralized_init",
@@ -835,6 +838,8 @@ async function handleFork(
     programModule: parentInfo.programModule,
     memory: childMemory,
     channelOffset: childChannelOffset,
+    argv: childArgv,
+    env: childEnv,
     isForkChild: true,
     forkBufAddr,
     forkChildThreadFnPtr: threadFork?.fnPtr,
@@ -922,6 +927,7 @@ async function handleExec(
     brkBase: newLayout.brkBase,
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
+    env: envp,
     // Refresh kernel-side Process.argv so /proc/<pid>/cmdline reflects
     // the post-exec image, not the parent's argv. Mirrors the browser
     // handleExec fix.
@@ -1053,6 +1059,8 @@ async function handlePosixSpawn(
     brkBase: layout.brkBase,
     mmapBase: layout.mmapBase,
     maxAddr: layout.maxAddr,
+    argv,
+    env: envp,
   });
 
   const initData: CentralizedWorkerInitMessage = {

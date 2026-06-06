@@ -25,47 +25,14 @@ KERNEL_WASM="$("$REPO_ROOT/scripts/resolve-binary.sh" kernel.wasm)"
 MATH_EXPECTED_FAIL=(acosh asinh erfc j0 jn jnf lgamma lgammaf lgammaf_r sinh tgamma y0 y0f ynf)
 MATH_RELAXED_EXPECTED_FAIL=(tgamma j0 y0 y0f)  # Tests with inline checks that bypass checkulp
 
-# Tests blocked by fundamental Wasm limitations (no cancel-point asm, opaque stack,
-# no file-backed mmap for sem_open).
+# Tests blocked by fundamental Wasm limitations (no cancel-point asm).
 FUNCTIONAL_EXPECTED_FAIL=(
-    fcntl                       # advisory locking/fcntl edge cases still incomplete
-    fdopen                      # stdio descriptor-mode edge cases still incomplete
-    fscanf                      # scanf/stdio edge cases still incomplete on current musl build
-    fwscanf                     # wide scanf/stdio edge cases still incomplete on current musl build
-    ipc_msg                     # SysV message queues are not implemented
-    ipc_sem                     # SysV semaphores are not implemented
-    ipc_shm                     # SysV shared memory is not implemented
-    popen                       # popen/proc pipe lifecycle can still hang under the node runner
     pthread_cancel              # no cancel-point asm (__syscall_cp_asm) for Wasm
-    pthread_cancel-points       # no cancel-point asm (__syscall_cp_asm) for Wasm
-    pthread_cond                # pthread condition-variable edge cases still incomplete
-    pthread_mutex               # pthread mutex edge cases still incomplete
-    pthread_robust              # robust mutex owner-death semantics are not implemented
-    pthread_tsd                 # pthread TSD destructor ordering edge cases still incomplete
-    sem_init                    # POSIX semaphore wake/cancel edge cases still incomplete
-    sem_open                    # named semaphores need file-backed mmap/persistence semantics
-    socket                      # libc socket torture coverage still has unsupported socket options/edges
-    spawn                       # posix_spawn process-attribute/file-action edges still incomplete
-    tls_init                    # TLS initialization edge cases still incomplete
-    vfork                       # vfork is implemented as fork-like behavior on Wasm
 )
 REGRESSION_EXPECTED_FAIL=(
-    daemon-failure              # daemon/session controlling-terminal behavior is not implemented
-    fflush-exit                 # stdio flush-on-exit edge case still incomplete
-    ftello-unflushed-append     # stdio append-position edge case still incomplete
-    getpwnam_r-crash            # passwd database NSS compatibility is incomplete
-    getpwnam_r-errno            # passwd database NSS compatibility is incomplete
     malloc-brk-fail             # OOM behavior differs in Wasm linear memory
     malloc-oom                  # OOM behavior differs in Wasm linear memory
-    pthread_cancel-sem_wait     # no cancel-point asm (__syscall_cp_asm) for Wasm
-    pthread_cond_wait-cancel_ignored # no cancel-point asm (__syscall_cp_asm) for Wasm
-    pthread_condattr_setclock   # alternate pthread condvar clocks are not implemented
     pthread_create-oom          # not a kernel gap — see docs/compromising-xfails.md "Not compromising"
-    pthread_exit-cancel         # no cancel-point asm (__syscall_cp_asm) for Wasm
-    pthread_exit-dtor           # pthread destructor ordering edge case still incomplete
-    pthread_once-deadlock       # pthread_once deadlock edge case still incomplete
-    pthread_rwlock-ebusy        # pthread rwlock busy-state edge case still incomplete
-    rewind-clear-error          # stdio error-state edge case still incomplete
     setenv-oom                  # OOM behavior differs in Wasm linear memory
     tls_get_new-dtv             # requires dlopen TLS (dynamic TLS not supported)
     # raise-race is skipped on CI in discover_regression (the

@@ -24,44 +24,9 @@ BUILD_DIR="$POSIX_TEST/build"
 # Tests that fail due to Wasm limitations or unimplemented features.
 
 EXPECTED_FAIL=(
-    fsync/4-1                   # fsync error reporting/order still differs on Kandelo VFS backends
-    fsync/5-1                   # fsync error reporting/order still differs on Kandelo VFS backends
-    fsync/7-1                   # fsync error reporting/order still differs on Kandelo VFS backends
-    kill/1-2                    # queued/synchronous signal delivery semantics not fully implemented
-    killpg/1-2                  # process-group signal delivery semantics not fully implemented
     munmap/1-1                  # wasm can't revoke page access — see docs/wasm-limitations.md §6
     munmap/1-2                  # wasm can't revoke page access — see docs/wasm-limitations.md §6
-    munmap/2-1                  # wasm can't revoke page access — see docs/wasm-limitations.md §6
-    munmap/3-1                  # wasm can't revoke page access — see docs/wasm-limitations.md §6
-    munmap/4-1                  # wasm can't revoke page access — see docs/wasm-limitations.md §6
-    munmap/9-1                  # wasm can't revoke page access — see docs/wasm-limitations.md §6
     mlock/12-1                  # needs pwd.h (getpwnam)
-    raise/1-2                   # queued/synchronous signal delivery semantics not fully implemented
-    raise/2-1                   # queued/synchronous signal delivery semantics not fully implemented
-    sched_getparam/4-1          # POSIX scheduler policy/parameter support is stubbed
-    sched_getscheduler/5-1      # POSIX scheduler policy/parameter support is stubbed
-    sched_rr_get_interval/3-1   # POSIX scheduler policy/parameter support is stubbed
-    sighold/1-1                 # legacy signal-hold semantics not fully implemented
-    sigqueue/1-1                # queued signal metadata/delivery semantics not fully implemented
-    sigqueue/9-1                # queued signal metadata/delivery semantics not fully implemented
-    sigrelse/1-1                # legacy signal-release semantics not fully implemented
-    sigsuspend/1-1              # synchronous signal wait/mask semantics not fully implemented
-    sigsuspend/3-1              # synchronous signal wait/mask semantics not fully implemented
-    sigsuspend/4-1              # synchronous signal wait/mask semantics not fully implemented
-    sigsuspend/6-1              # synchronous signal wait/mask semantics not fully implemented
-    sigtimedwait/1-1            # synchronous signal wait/mask semantics not fully implemented
-    sigtimedwait/2-1            # synchronous signal wait/mask semantics not fully implemented
-    sigtimedwait/4-1            # synchronous signal wait/mask semantics not fully implemented
-    sigtimedwait/5-1            # synchronous signal wait/mask semantics not fully implemented
-    sigtimedwait/6-1            # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/1-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/2-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/3-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/5-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/6-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/7-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/8-1             # synchronous signal wait/mask semantics not fully implemented
-    sigwaitinfo/9-1             # synchronous signal wait/mask semantics not fully implemented
 )
 
 # ── Auto-detect LLVM ──────────────────────────────────────

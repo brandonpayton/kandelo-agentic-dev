@@ -982,6 +982,7 @@ async function handleSpawn(
     kernelWorker.registerProcess(pid, memory, [channelOffset], {
       ptrWidth,
       argv: msg.argv,
+      env: msg.env,
       brkBase: layout.brkBase,
       mmapBase: layout.mmapBase,
       maxAddr: layout.maxAddr,
@@ -1190,6 +1191,8 @@ async function handleFork(
   const forkBufAddr = threadFork
     ? threadFork.forkBufAddr
     : childChannelOffset - FORK_BUF_SIZE;
+  const childArgv = kernelWorker.snapshotProcessArgv(childPid);
+  const childEnv = kernelWorker.snapshotProcessEnv(childPid);
   const childInitData: CentralizedWorkerInitMessage = {
     type: "centralized_init",
     pid: childPid,
@@ -1198,6 +1201,8 @@ async function handleFork(
     programModule: parentInfo.programModule,
     memory: childMemory,
     channelOffset: childChannelOffset,
+    argv: childArgv,
+    env: childEnv,
     isForkChild: true,
     forkBufAddr,
     forkChildThreadFnPtr: threadFork?.fnPtr,
@@ -1285,6 +1290,7 @@ async function handleExec(
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
     channelErrorTraps,
+    env: envp,
     // Refresh the kernel's Process.argv so /proc/<pid>/cmdline and
     // host-side enumeration (Kandelo Inspector → Procs) show the new
     // program's argv after exec, not the parent's pre-exec argv.
@@ -1398,6 +1404,8 @@ async function handlePosixSpawn(
     mmapBase: newLayout.mmapBase,
     maxAddr: newLayout.maxAddr,
     channelErrorTraps,
+    argv,
+    env: envp,
   });
 
   const initData: CentralizedWorkerInitMessage = {
