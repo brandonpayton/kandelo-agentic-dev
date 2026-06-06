@@ -2505,7 +2505,7 @@ fn validate_channel_cstring_arg(args: &[i64; 6], index: usize, base: usize) -> R
 fn validate_channel_cstrings(nr: u32, args: &[i64; 6], base: usize) -> Result<(), Errno> {
     match nr {
         1 | 11 | 12 | 13 | 14 | 15 | 19 | 20 | 21 | 22 | 24 | 25 | 43 | 45 | 85 | 109 | 129
-        | 140 | 211 | 271 | 331 | 332 => validate_channel_cstring_arg(args, 0, base),
+        | 140 | 211 | 271 | 299 | 331 | 332 => validate_channel_cstring_arg(args, 0, base),
         16 | 17 | 18 | 44 => {
             validate_channel_cstring_arg(args, 0, base)?;
             validate_channel_cstring_arg(args, 1, base)
