@@ -222,16 +222,20 @@ if [ ! -f Makefile ]; then
     # The debug-trace value is worth keeping. CLI inherits the same
     # flags; it just produces a slightly larger binary.
 
-    # Patch config.h: disable features that pass link-time checks (--allow-undefined)
-    # but don't actually exist in our musl sysroot
+    # Patch config.h: disable features that pass link-time checks
+    # (--allow-undefined) but are not currently usable through Kandelo's PHP
+    # runtime. In particular, the musl resolver exposes res_search(3), but
+    # PHP's DNS record APIs can block on external DNS record queries in generic
+    # arginfo probes. Disable the DNS search-family feature macros together so
+    # PHP does not register dns_get_record()/dns_get_mx() without a usable
+    # resolver backend.
     echo "==> Patching main/php_config.h for Wasm..."
     sed -i.bak \
         -e 's/^#define HAVE_DNS_SEARCH 1/\/* #undef HAVE_DNS_SEARCH *\//' \
         -e 's/^#define HAVE_DNS_SEARCH_FUNC 1/\/* #undef HAVE_DNS_SEARCH_FUNC *\//' \
         -e 's/^#define HAVE_RES_NSEARCH 1/\/* #undef HAVE_RES_NSEARCH *\//' \
         -e 's/^#define HAVE_RES_NDESTROY 1/\/* #undef HAVE_RES_NDESTROY *\//' \
-        -e 's/^#define HAVE_DN_EXPAND 1/\/* #undef HAVE_DN_EXPAND *\//' \
-        -e 's/^#define HAVE_DN_SKIPNAME 1/\/* #undef HAVE_DN_SKIPNAME *\//' \
+        -e 's/^#define HAVE_RES_SEARCH 1/\/* #undef HAVE_RES_SEARCH *\//' \
         -e 's/^#define HAVE_FOPENCOOKIE 1/\/* #undef HAVE_FOPENCOOKIE *\//' \
         -e 's/^#define HAVE_FUNOPEN 1/\/* #undef HAVE_FUNOPEN *\//' \
         -e 's/^#define HAVE_STD_SYSLOG 1/\/* #undef HAVE_STD_SYSLOG *\//' \
@@ -336,6 +340,8 @@ mv "$SCRIPT_DIR/bin/php.wasm.instr" "$SCRIPT_DIR/bin/php.wasm"
 echo "==> Applying fork instrumentation to FPM..."
 "$FORK_INSTRUMENT" "$SCRIPT_DIR/bin/php-fpm.wasm" -o "$SCRIPT_DIR/bin/php-fpm.wasm.instr"
 mv "$SCRIPT_DIR/bin/php-fpm.wasm.instr" "$SCRIPT_DIR/bin/php-fpm.wasm"
+
+chmod 0755 "$SCRIPT_DIR/bin/php.wasm" "$SCRIPT_DIR/bin/php-fpm.wasm"
 
 ls -la "$SCRIPT_DIR/bin/php.wasm" "$SCRIPT_DIR/bin/php-fpm.wasm"
 

@@ -1028,6 +1028,7 @@ fn new_fork_child_shell(child_pid: u32, scalars: ForkScalars) -> Box<Process> {
         ptr::addr_of_mut!((*child_ptr).is_session_leader).write(false);
         ptr::addr_of_mut!((*child_ptr).state).write(ProcessState::Running);
         ptr::addr_of_mut!((*child_ptr).exit_status).write(0);
+        ptr::addr_of_mut!((*child_ptr).exit_signal).write(0);
         ptr::addr_of_mut!((*child_ptr).fd_table).write(FdTable::new());
         ptr::addr_of_mut!((*child_ptr).ofd_table).write(OfdTable::new());
         ptr::addr_of_mut!((*child_ptr).lock_table).write(LockTable::new());
@@ -1298,6 +1299,7 @@ fn apply_exec_scalars(proc: &mut Process, scalars: ExecScalars) {
     proc.is_session_leader = scalars.is_session_leader;
     proc.state = ProcessState::Running;
     proc.exit_status = 0;
+    proc.exit_signal = 0;
     proc.umask = scalars.umask;
     proc.nice = scalars.nice;
 }

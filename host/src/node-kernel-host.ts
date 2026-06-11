@@ -106,6 +106,8 @@ export interface SpawnOptions {
   /** Initial real/effective group ID for the process. */
   gid?: number;
   stdin?: Uint8Array;
+  /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
+  pipeStdio?: number[];
   /** Optional pre-compiled module for the supplied program bytes. */
   programModule?: WebAssembly.Module;
   pty?: boolean;
@@ -231,6 +233,7 @@ export class NodeKernelHost {
       ptyCols: options?.ptyCols,
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
+      pipeStdio: options?.pipeStdio,
       maxAddr: options?.maxAddr,
     })) as number;
 

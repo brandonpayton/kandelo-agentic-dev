@@ -68,6 +68,11 @@ describe("centralized select/pselect timeout retries", () => {
 function createWorkerHarness(exports: Record<string, unknown>): any {
   return Object.assign(Object.create(CentralizedKernelWorker.prototype), {
     kernelInstance: { exports },
+    kernel: {
+      toKernelPtr(value: number | bigint): number {
+        return Number(value);
+      },
+    },
     kernelMemory: createSharedMemory(),
     scratchOffset: 128,
     config: {},

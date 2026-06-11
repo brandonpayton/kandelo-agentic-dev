@@ -13,13 +13,16 @@ import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
 import {
   existsSync,
+  cpSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -41,6 +44,7 @@ const PHP_TEST_VFS = join(
 const BROWSER_DIR = join(REPO_ROOT, "apps/browser-demos");
 const VITE_HOST = "127.0.0.1";
 const VITE_PORT = Number(process.env.PHP_TEST_VITE_PORT ?? 5201);
+const BROWSER_EXTENSION_DIR = "/usr/lib/php/extensions";
 
 type HostKind = "node" | "browser";
 type TestStatus =
@@ -62,6 +66,7 @@ interface PhpRunResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  output?: string;
   error?: string;
   durationMs: number;
 }
@@ -75,6 +80,7 @@ interface TestResult {
 }
 
 interface PhpRunner {
+  loadExtensionIniArgs(requiredExtensions: string[]): string[];
   runScript(opts: {
     test: PhptTest;
     kind: "skipif" | "file" | "clean";
@@ -83,6 +89,7 @@ interface PhpRunner {
     scriptArgs?: string[];
     env: string[];
     stdin?: string;
+    pipeStdio?: number[];
     timeoutMs: number;
   }): Promise<PhpRunResult>;
   close(): Promise<void>;
@@ -92,6 +99,7 @@ let tempCounter = 0;
 
 const PASSTHROUGH_ENV_NAMES = [
   "NO_INTERACTION",
+  "RES_OPTIONS",
   "SKIP_IO_CAPTURE_TESTS",
   "SKIP_ONLINE_TESTS",
   "SKIP_PERF_SENSITIVE",
@@ -111,6 +119,31 @@ function forceNodeGc(): void {
 function loadBytes(path: string): ArrayBuffer {
   const buf = readFileSync(path);
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error(`${label} timed out after ${ms}ms`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 }
 
 function resolvePhpBinary(): string {
@@ -226,7 +259,11 @@ function guestTestDir(test: PhptTest): string {
 }
 
 function expandSectionPlaceholders(value: string, test: PhptTest): string {
-  return value.replaceAll("{PWD}", guestTestDir(test));
+  return value
+    .replaceAll("{PWD}", guestTestDir(test))
+    .replaceAll("{TMP}", "/tmp")
+    .replace(/\{MAIL:([^}]+)\}/g, (_match, path) => `tee ${path} >/dev/null`)
+    .replace(/\{ENV:([^}]+)\}/g, (_match, name) => process.env[name] ?? "");
 }
 
 function iniArgs(ini: string | undefined, test: PhptTest): string[] {
@@ -236,6 +273,7 @@ function iniArgs(ini: string | undefined, test: PhptTest): string[] {
     let line = raw.trim();
     if (!line || line.startsWith(";") || line.startsWith("#")) continue;
     const eq = line.indexOf("=");
+    if (eq < 0) continue;
     if (eq >= 0) {
       const key = line.slice(0, eq).trim();
       const value = line.slice(eq + 1).trim();
@@ -261,6 +299,16 @@ function envArgs(env: string | undefined, test: PhptTest): string[] {
     args.push(line);
   }
   return args;
+}
+
+function captureStdioFds(test: PhptTest): number[] {
+  const capture = test.sections.CAPTURE_STDIO;
+  if (capture === undefined) return [];
+  const fds: number[] = [];
+  if (/\bSTDIN\b/i.test(capture)) fds.push(0);
+  if (/\bSTDOUT\b/i.test(capture)) fds.push(1);
+  if (/\bSTDERR\b/i.test(capture)) fds.push(2);
+  return fds;
 }
 
 function passthroughEnvArgs(): string[] {
@@ -291,6 +339,43 @@ function extensionArgs(extensions: string | undefined): string[] {
     .filter((line) => line && !line.startsWith("#"));
 }
 
+function normalizeExtensionName(extension: string): string {
+  const name = extension.trim().toLowerCase();
+  if (name === "zend opcache") return "opcache";
+  return name.replace(/^(?:php_)?(.+?)(?:\.so)?$/, "$1");
+}
+
+function sharedExtensionsForPhp(phpPath: string): Set<string> {
+  const out = new Set<string>();
+  const opcachePath =
+    process.env.PHP_OPCACHE_SO ??
+    tryResolveBinary("programs/php/opcache.so") ??
+    join(dirname(phpPath), "opcache.so");
+  if (opcachePath && existsSync(opcachePath)) out.add("opcache");
+  return out;
+}
+
+function loadExtensionIniArgs(
+  requiredExtensions: string[],
+  availableSharedExtensions: Set<string>,
+  guestExtensionDir: string,
+): string[] {
+  const args: string[] = [];
+  let emittedExtensionDir = false;
+  for (const extension of requiredExtensions) {
+    const name = normalizeExtensionName(extension);
+    if (!availableSharedExtensions.has(name)) continue;
+    if (!emittedExtensionDir) {
+      args.push("-d", `extension_dir=${guestExtensionDir}`);
+      emittedExtensionDir = true;
+    }
+    const directive =
+      name === "opcache" || name === "xdebug" ? "zend_extension" : "extension";
+    args.push("-d", `${directive}=${guestExtensionDir}/${name}.so`);
+  }
+  return args;
+}
+
 function extensionSkipScript(extensions: string[]): string {
   return `<?php
 $required = ${JSON.stringify(extensions)};
@@ -300,7 +385,11 @@ foreach ($required as $extension) {
     if ($name === "zend opcache") {
         $name = "opcache";
     }
-    if (!extension_loaded($extension) && !extension_loaded($name)) {
+    $loaded = extension_loaded($extension) || extension_loaded($name);
+    if (!$loaded && $name === "opcache") {
+        $loaded = extension_loaded("Zend OPcache");
+    }
+    if (!$loaded) {
         $missing[] = $extension;
     }
 }
@@ -414,6 +503,26 @@ function compareExpectation(
 function unsupportedReason(test: PhptTest): string | null {
   if (test.sections.REDIRECTTEST !== undefined)
     return "REDIRECTTEST is not supported by the Kandelo PHPT harness yet";
+  if (
+    test.sections.PHPDBG !== undefined &&
+    !process.env.TEST_PHPDBG_EXECUTABLE
+  ) {
+    return "phpdbg not available";
+  }
+  const source = `${test.sections.SKIPIF ?? ""}\n${test.sections.FILE ?? ""}\n${test.sections.FILEEOF ?? ""}`;
+  if (
+    /\b(?:dns_get_record|dns_get_mx|getmxrr|checkdnsrr|dns_check_record)\s*\(/.test(
+      source,
+    )
+  ) {
+    return "PHP DNS record-query functions are not enabled in the Kandelo PHP build";
+  }
+  if (
+    test.rel.startsWith("Zend/tests/fibers/") ||
+    /\b(?:new\s+Fiber|Fiber::)/.test(source)
+  ) {
+    return "PHP Fibers require ucontext/boost context switching, which the Kandelo PHP build does not support yet";
+  }
   const sapiOnly = [
     "POST",
     "POST_RAW",
@@ -477,50 +586,53 @@ function phptGeneratedScriptName(test: PhptTest, kind: string): string {
   return `.kandelo-phpt-${process.pid}-${tempCounter++}-${kind}.php`;
 }
 
-function nodeTempPath(test: PhptTest, scriptName: string): string {
-  return join(dirname(test.path), scriptName);
+function hostTestDir(test: PhptTest, sourceRoot: string): string {
+  const relDir = dirname(test.rel);
+  return relDir === "." ? sourceRoot : join(sourceRoot, relDir);
+}
+
+function nodeTempPath(test: PhptTest, sourceRoot: string, scriptName: string): string {
+  return join(hostTestDir(test, sourceRoot), scriptName);
 }
 
 function guestScriptPath(
   test: PhptTest,
-  sourceRoot: string,
+  _sourceRoot: string,
   scriptName: string,
 ): string {
-  const relDir = relative(sourceRoot, dirname(test.path)).split("\\").join("/");
-  return relDir ? `/php-src/${relDir}/${scriptName}` : `/php-src/${scriptName}`;
+  const relDir = dirname(test.rel).split("\\").join("/");
+  return relDir && relDir !== "."
+    ? `/php-src/${relDir}/${scriptName}`
+    : `/php-src/${scriptName}`;
 }
 
 class NodePhpRunner implements PhpRunner {
   private virtualPhpPath: string;
+  private host: NodeKernelHost | null = null;
+  private phpBytes: ArrayBuffer | null = null;
+  private activeOutput: { stdout: string; stderr: string; output: string } | null =
+    null;
 
   constructor(
     private sourceRoot: string,
     private phpPath: string,
+    private availableSharedExtensions: Set<string>,
+    private ownsSourceRoot = false,
   ) {
     this.virtualPhpPath = `/kandelo-bin/${basename(phpPath)}`;
   }
 
-  async runScript(opts: {
-    test: PhptTest;
-    kind: "skipif" | "file" | "clean";
-    script: string;
-    argv: string[];
-    scriptArgs?: string[];
-    env: string[];
-    stdin?: string;
-    timeoutMs: number;
-  }): Promise<PhpRunResult> {
-    const scriptName = phptGeneratedScriptName(opts.test, opts.kind);
-    const hostScriptPath = nodeTempPath(opts.test, scriptName);
-    const scriptPath = guestScriptPath(opts.test, this.sourceRoot, scriptName);
-    const previousScript = existsSync(hostScriptPath)
-      ? readFileSync(hostScriptPath)
-      : null;
-    writeFileSync(hostScriptPath, opts.script, "latin1");
-    const start = performance.now();
-    let stdout = "";
-    let stderr = "";
-    const phpBytes = loadBytes(this.phpPath);
+  loadExtensionIniArgs(requiredExtensions: string[]): string[] {
+    return loadExtensionIniArgs(
+      requiredExtensions,
+      this.availableSharedExtensions,
+      "/kandelo-bin",
+    );
+  }
+
+  private async ensureHost(): Promise<NodeKernelHost> {
+    if (this.host) return this.host;
+    this.phpBytes = loadBytes(this.phpPath);
     const host = new NodeKernelHost({
       maxWorkers: 4,
       rootfsImage: "default",
@@ -533,26 +645,88 @@ class NodePhpRunner implements PhpRunner {
         },
       ],
       onStdout: (_pid, data) => {
-        stdout += Buffer.from(data).toString("latin1");
+        if (this.activeOutput) {
+          const text = Buffer.from(data).toString("latin1");
+          this.activeOutput.stdout += text;
+          this.activeOutput.output += text;
+        }
       },
       onStderr: (_pid, data) => {
-        stderr += Buffer.from(data).toString("latin1");
+        if (this.activeOutput) {
+          const text = Buffer.from(data).toString("latin1");
+          this.activeOutput.stderr += text;
+          this.activeOutput.output += text;
+        }
       },
       onResolveExec: (path) => {
         const base = path.split("/").pop();
-        if (base === "php" || base === "php.wasm")
-          return loadBytes(this.phpPath);
+        if (base === "php" || base === "php.wasm") return this.phpBytes;
         return null;
       },
     });
     await host.init();
+    this.host = host;
+    return host;
+  }
+
+  private async resetHost(host: NodeKernelHost): Promise<void> {
+    if (this.host === host) this.host = null;
+    await host.destroy().catch(() => {});
+    await delay(0);
+  }
+
+  private async terminateLiveProcesses(host: NodeKernelHost): Promise<void> {
+    let processes: Array<{ pid: number }> = [];
+    try {
+      processes = await withTimeout(host.enumProcs(), 1_000, "enumProcs");
+    } catch {
+      await this.resetHost(host);
+      return;
+    }
+    const results = await Promise.allSettled(
+      processes.map((process) =>
+        withTimeout(
+          host.terminateProcess(process.pid),
+          1_000,
+          `terminate pid ${process.pid}`,
+        ),
+      ),
+    );
+    if (results.some((result) => result.status === "rejected")) {
+      await this.resetHost(host);
+    }
+  }
+
+  async runScript(opts: {
+    test: PhptTest;
+    kind: "skipif" | "file" | "clean";
+    script: string;
+    argv: string[];
+    scriptArgs?: string[];
+    env: string[];
+    stdin?: string;
+    pipeStdio?: number[];
+    timeoutMs: number;
+  }): Promise<PhpRunResult> {
+    const scriptName = phptGeneratedScriptName(opts.test, opts.kind);
+    const hostScriptPath = nodeTempPath(opts.test, this.sourceRoot, scriptName);
+    const scriptPath = guestScriptPath(opts.test, this.sourceRoot, scriptName);
+    const previousScript = existsSync(hostScriptPath)
+      ? readFileSync(hostScriptPath)
+      : null;
+    writeFileSync(hostScriptPath, opts.script, "latin1");
+    const start = performance.now();
+    const host = await this.ensureHost();
+    if (!this.phpBytes) throw new Error("PHP wasm bytes not loaded");
+    const output = { stdout: "", stderr: "", output: "" };
+    this.activeOutput = output;
     const stdin =
       opts.stdin == null ? undefined : Buffer.from(opts.stdin, "latin1");
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     let pid: number | null = null;
     try {
       const exitPromise = host.spawn(
-        phpBytes,
+        this.phpBytes,
         [
           this.virtualPhpPath,
           ...opts.argv,
@@ -571,14 +745,14 @@ class NodePhpRunner implements PhpRunner {
             `TEST_PHP_SRCDIR=/php-src`,
             `TEST_PHP_EXECUTABLE=${this.virtualPhpPath}`,
             `TEST_PHP_EXECUTABLE_ESCAPED=${shellEscape(this.virtualPhpPath)}`,
-            // Kandelo's PHP build reports PHP_BINARY as an empty string.
-            // php-src helpers such as ServerClientTestCase.inc build worker
-            // commands as "PHP_BINARY TEST_PHP_EXTRA_ARGS ..."; supplying the
-            // executable here makes those generic helpers spawn PHP workers.
-            `TEST_PHP_EXTRA_ARGS=${this.virtualPhpPath}`,
+            // Upstream run-tests.php uses this for additional CLI switches,
+            // not for the executable path. PHP_BINARY supplies the executable
+            // once the wasm artifact has execute permissions.
+            "TEST_PHP_EXTRA_ARGS=",
             ...opts.env,
           ],
           stdin,
+          pipeStdio: opts.pipeStdio,
           onStarted: (startedPid) => {
             pid = startedPid;
           },
@@ -591,27 +765,36 @@ class NodePhpRunner implements PhpRunner {
         );
       });
       const exitCode = await Promise.race([exitPromise, timeoutPromise]);
+      // Process exit and stdio notifications are delivered over separate host
+      // messages. Yield once before freezing the captured output so data that
+      // was written immediately before _exit() is not lost.
+      await delay(10);
       return {
         exitCode,
-        stdout,
-        stderr,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        output: output.output,
         durationMs: Math.round(performance.now() - start),
       };
     } catch (err: any) {
       const message = err?.message || String(err);
       if (message.includes("TIMEOUT") && pid !== null) {
-        await host.terminateProcess(pid).catch(() => {});
+        await this.resetHost(host);
       }
       return {
         exitCode: -1,
-        stdout,
-        stderr,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        output: output.output,
         error: message.includes("TIMEOUT") ? "TIMEOUT" : message,
         durationMs: Math.round(performance.now() - start),
       };
     } finally {
+      if (this.host === host) {
+        await this.terminateLiveProcesses(host);
+      }
+      this.activeOutput = null;
       if (timeoutId) clearTimeout(timeoutId);
-      await host.destroy().catch(() => {});
       forceNodeGc();
       if (previousScript) {
         writeFileSync(hostScriptPath, previousScript);
@@ -621,7 +804,28 @@ class NodePhpRunner implements PhpRunner {
     }
   }
 
-  async close(): Promise<void> {}
+  async close(): Promise<void> {
+    const host = this.host;
+    this.host = null;
+    if (host) await host.destroy().catch(() => {});
+    if (this.ownsSourceRoot) {
+      rmSync(this.sourceRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+function copySourceRootForNodeRunner(sourceRoot: string, index: number): string {
+  const copyRoot = mkdtempSync(join(tmpdir(), `kandelo-php-src-${index}-`));
+  rmSync(copyRoot, { recursive: true, force: true });
+  cpSync(sourceRoot, copyRoot, {
+    recursive: true,
+    dereference: false,
+    filter: (path) => {
+      const base = basename(path);
+      return base !== ".git" && base !== ".deps" && base !== ".libs";
+    },
+  });
+  return copyRoot;
 }
 
 async function startViteServer(): Promise<ChildProcess> {
@@ -647,6 +851,7 @@ async function startViteServer(): Promise<ChildProcess> {
       },
     );
     let started = false;
+    let stdout = "";
     let stderr = "";
     const timeout = setTimeout(() => {
       if (!started) {
@@ -654,9 +859,9 @@ async function startViteServer(): Promise<ChildProcess> {
         reject(
           new Error(
             `Vite server did not start within 30s${
-              stderr
+              stdout || stderr
                 ? `:
-${stderr}`
+${stdout}${stderr}`
                 : ""
             }`,
           ),
@@ -667,7 +872,11 @@ ${stderr}`
       stderr += data.toString();
     });
     proc.stdout!.on("data", (data: Buffer) => {
-      if (!started && data.toString().includes("Local:")) {
+      stdout += data.toString();
+      if (
+        !started &&
+        (stdout.includes("Local:") || stdout.includes("ready in"))
+      ) {
         started = true;
         clearTimeout(timeout);
         setTimeout(() => resolvePromise(proc), 500);
@@ -700,7 +909,16 @@ class BrowserPhpRunner implements PhpRunner {
   constructor(
     private sourceRoot: string,
     private rebuildVfs: boolean,
+    private availableSharedExtensions: Set<string>,
   ) {}
+
+  loadExtensionIniArgs(requiredExtensions: string[]): string[] {
+    return loadExtensionIniArgs(
+      requiredExtensions,
+      this.availableSharedExtensions,
+      BROWSER_EXTENSION_DIR,
+    );
+  }
 
   async init(): Promise<void> {
     if (this.rebuildVfs || !existsSync(PHP_TEST_VFS)) {
@@ -722,6 +940,7 @@ class BrowserPhpRunner implements PhpRunner {
   private async launchBrowser(): Promise<void> {
     await this.browser?.close().catch(() => {});
     this.browser = await chromium.launch({
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
       args: ["--enable-features=SharedArrayBuffer"],
     });
   }
@@ -764,6 +983,7 @@ class BrowserPhpRunner implements PhpRunner {
     scriptArgs?: string[];
     env: string[];
     stdin?: string;
+    pipeStdio?: number[];
     timeoutMs: number;
   }): Promise<PhpRunResult> {
     if (!this.page) throw new Error("browser page not ready");
@@ -785,9 +1005,11 @@ class BrowserPhpRunner implements PhpRunner {
         "TEST_PHP_SRCDIR=/php-src",
         "TEST_PHP_EXECUTABLE=/usr/local/bin/php",
         "TEST_PHP_EXECUTABLE_ESCAPED='/usr/local/bin/php'",
+        "TEST_PHP_EXTRA_ARGS=",
         ...opts.env,
       ],
       stdin: opts.stdin,
+      pipeStdio: opts.pipeStdio,
       timeoutMs: opts.timeoutMs,
     };
 
@@ -886,15 +1108,18 @@ async function runPhpt(
   const commonEnv = [...passthroughEnvArgs(), ...envArgs(test.sections.ENV, test)];
   const testArgv = iniArgs(test.sections.INI, test);
   const args = splitArgs(test.sections.ARGS);
+  const pipeStdio = captureStdioFds(test);
 
   const requiredExtensions = extensionArgs(test.sections.EXTENSIONS);
+  const extensionIniArgs = runner.loadExtensionIniArgs(requiredExtensions);
   if (requiredExtensions.length > 0) {
     const extensionSkip = await runner.runScript({
       test,
       kind: "skipif",
       script: extensionSkipScript(requiredExtensions),
-      argv: [],
+      argv: extensionIniArgs,
       env: commonEnv,
+      pipeStdio,
       timeoutMs,
     });
     const extensionOutput = normalizeOutput(
@@ -926,8 +1151,9 @@ async function runPhpt(
       // Upstream run-tests.php executes SKIPIF before applying the test's
       // --INI-- block. Keep that ordering so resource-probing SKIPIF sections
       // are not distorted by settings meant only for the main FILE body.
-      argv: [],
+      argv: extensionIniArgs,
       env: commonEnv,
+      pipeStdio,
       timeoutMs,
     });
     const skipOutput = normalizeOutput(`${skip.stdout}${skip.stderr}`);
@@ -962,10 +1188,11 @@ async function runPhpt(
       test,
       kind: "file",
       script: testScript(test),
-      argv: testArgv,
+      argv: [...extensionIniArgs, ...testArgv],
       scriptArgs: args,
       env: commonEnv,
       stdin: test.sections.STDIN,
+      pipeStdio,
       timeoutMs,
     });
 
@@ -973,7 +1200,7 @@ async function runPhpt(
 
   let ok = false;
   let detail = main.error;
-  let actualOutput = `${main.stdout}${main.stderr}`;
+  let actualOutput = main.output ?? `${main.stdout}${main.stderr}`;
   if (main.error !== "TIMEOUT") {
     const compared = compareExpectation(test, actualOutput);
     // PHPTs often intentionally trigger fatal errors; upstream run-tests.php
@@ -995,7 +1222,7 @@ async function runPhpt(
     (isFlakyTest(test) || isFlakyOutput(actualOutput))
   ) {
     main = await runMain();
-    actualOutput = `${main.stdout}${main.stderr}`;
+    actualOutput = main.output ?? `${main.stdout}${main.stderr}`;
     detail = main.error;
     if (main.error !== "TIMEOUT") {
       const compared = compareExpectation(test, actualOutput);
@@ -1018,8 +1245,9 @@ async function runPhpt(
         kind: "clean",
         script: test.sections.CLEAN,
         // CLEAN runs with the same pre-test INI baseline as SKIPIF upstream.
-        argv: [],
+        argv: extensionIniArgs,
         env: commonEnv,
+        pipeStdio,
         timeoutMs: Math.min(timeoutMs, 30_000),
       })
       .catch(() => {});
@@ -1053,6 +1281,7 @@ Options:
   --shard <i>/<n>       Run 1-based shard i of n after discovery sorting
   --offset <n>          Skip the first n selected tests
   --limit <n>           Run only the first n discovered tests
+  --jobs <n>            Number of PHPTs to run concurrently (Node host only; default: 1)
   --json                Emit JSON lines
   --report              Write docs/php-upstream-test-report.md
   --rebuild-vfs         Rebuild php-test.vfs.zst before browser runs
@@ -1070,6 +1299,7 @@ async function main() {
   let shard: { index: number; total: number } | null = null;
   let offset = 0;
   let limit: number | null = null;
+  let jobs = 1;
   let json = false;
   let report = false;
   let rebuildVfs = false;
@@ -1110,6 +1340,11 @@ async function main() {
       if (!Number.isFinite(limit) || limit < 0) {
         throw new Error(`invalid limit: ${limit}`);
       }
+    } else if (arg === "--jobs" && args[i + 1]) {
+      jobs = parseInt(args[++i], 10);
+      if (!Number.isFinite(jobs) || jobs < 1) {
+        throw new Error(`invalid jobs: ${jobs}`);
+      }
     } else if (arg === "--json") {
       json = true;
     } else if (arg === "--report") {
@@ -1125,33 +1360,58 @@ async function main() {
 
   const sourceRoot = resolvePhpSource();
   const phpPath = resolvePhpBinary();
+  const availableSharedExtensions = sharedExtensionsForPhp(phpPath);
   let tests = discoverTests(sourceRoot, selectors);
   if (shard !== null) {
     tests = tests.filter((_, idx) => idx % shard!.total === shard!.index - 1);
   }
   if (offset > 0) tests = tests.slice(offset);
   if (limit !== null) tests = tests.slice(0, limit);
+  if (host === "browser" && jobs !== 1) {
+    throw new Error("--jobs is currently supported only by the node host");
+  }
 
   if (!json) {
     console.error("===== PHP PHPT runtime tests =====");
     console.error(`Host: ${host}`);
     console.error(`php-src: ${sourceRoot}`);
     console.error(`PHP wasm: ${phpPath}`);
+    if (availableSharedExtensions.size > 0) {
+      console.error(
+        `Shared extensions: ${[...availableSharedExtensions].join(", ")}`,
+      );
+    }
     if (shard !== null) {
       console.error(`Shard: ${shard.index}/${shard.total}`);
     }
     if (offset > 0) console.error(`Offset: ${offset}`);
+    if (jobs > 1) console.error(`Jobs: ${jobs}`);
     console.error(`Tests: ${tests.length}`);
     console.error("");
   }
 
-  let runner: PhpRunner;
+  const runners: PhpRunner[] = [];
   if (host === "browser") {
-    const browserRunner = new BrowserPhpRunner(sourceRoot, rebuildVfs);
-    await browserRunner.init();
-    runner = browserRunner;
+    const runner = new BrowserPhpRunner(
+      sourceRoot,
+      rebuildVfs,
+      availableSharedExtensions,
+    );
+    await runner.init();
+    runners.push(runner);
   } else {
-    runner = new NodePhpRunner(sourceRoot, phpPath);
+    for (let i = 0; i < jobs; i++) {
+      const runnerSourceRoot =
+        jobs === 1 ? sourceRoot : copySourceRootForNodeRunner(sourceRoot, i + 1);
+      runners.push(
+        new NodePhpRunner(
+          runnerSourceRoot,
+          phpPath,
+          availableSharedExtensions,
+          runnerSourceRoot !== sourceRoot,
+        ),
+      );
+    }
   }
 
   const counts: Record<TestStatus, number> = {
@@ -1163,24 +1423,58 @@ async function main() {
     unsupported: 0,
     time: 0,
   };
-  const results: TestResult[] = [];
+  const results: TestResult[] = new Array(tests.length);
+  let nextTest = 0;
+  let completed = 0;
 
   try {
+    await Promise.all(
+      runners.map(async (runner) => {
+        while (true) {
+          const index = nextTest++;
+          if (index >= tests.length) break;
+          const result = await runPhpt(tests[index], runner, timeoutMs);
+          counts[result.status]++;
+          results[index] = result;
+          completed++;
+          if (json) {
+            console.log(JSON.stringify(result));
+          } else {
+            const label = result.status.toUpperCase().padEnd(11);
+            console.error(
+              `[${completed}/${tests.length}] ${label} ${result.test} (${result.time_ms}ms)`,
+            );
+          }
+        }
+      }),
+    );
+  } finally {
+    await Promise.all(
+      runners.map((runner) =>
+        runner.close().catch(() => {
+          // Keep shutdown best-effort so one wedged worker does not hide
+          // already-recorded PHPT results.
+        }),
+      ),
+    );
+  }
+
+  const completedResults = results.filter((result): result is TestResult => {
+    return result !== undefined;
+  });
+  if (completedResults.length !== tests.length) {
     for (let i = 0; i < tests.length; i++) {
-      const result = await runPhpt(tests[i], runner, timeoutMs);
-      counts[result.status]++;
-      results.push(result);
-      if (json) {
-        console.log(JSON.stringify(result));
-      } else {
-        const label = result.status.toUpperCase().padEnd(11);
-        console.error(
-          `[${i + 1}/${tests.length}] ${label} ${result.test} (${result.time_ms}ms)`,
-        );
+      if (results[i] === undefined) {
+        const result: TestResult = {
+          test: tests[i].rel,
+          status: "time",
+          time_ms: 0,
+          reason: "harness did not record a result",
+        };
+        results[i] = result;
+        counts.time++;
       }
     }
-  } finally {
-    await runner.close();
   }
 
   if (report) {

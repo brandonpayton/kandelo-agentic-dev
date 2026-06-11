@@ -3,7 +3,7 @@
 This project proves Kandelo by running real upstream/project test suites for
 large guest software on both Node.js and browser hosts where possible.
 
-Status date: 2026-06-05.
+Status date: 2026-06-11.
 
 ## Current Status
 
@@ -18,6 +18,116 @@ Status date: 2026-06-05.
 | Node.js library | Upstream Node.js `test/parallel/test-*.js` and `test/sequential/test-*.js` through the SpiderMonkey-backed Node-compatible runtime | Completed 3925 tests: 336 PASS, 3264 FAIL, 325 TIME | Completed 3925 tests: 339 PASS, 3564 FAIL, 22 TIME |
 
 Logs from the 2026-05-28 full runs are under `test-runs/software-unit-tests/`.
+
+
+## 2026-06-11 PHP PHPT Handoff Status
+
+php-src discovery currently finds **19,017** `.phpt` files from PHP **8.3.15**.
+
+Latest full/partial run evidence from this AO worker:
+
+| Host | Run | Pass | Fail | Time | Skip | Unsupported | XFAIL | Untested | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Node | `SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 SKIP_PERF_SENSITIVE=1 scripts/run-php-upstream-tests.sh --host node --all --jobs 6 --timeout 120000 --json` | 12,589 | 71 | 7 | 5,880 | 462 | 8 | 0 | Complete pre-isolation baseline in `/tmp/kad-1-test-logs/php-node-full-current-detached-20260611062754.jsonl`. Some failures were false negatives from parallel workers sharing one writable `/php-src`. |
+| Node | Same command after per-worker source-root isolation | 8,532 | 29 | 6 | 4,714 | 272 | 6 | 5,458 | Run was killed by the worker with exit 137 at 13,559/19,017 in `/tmp/kad-1-test-logs/php-node-full-isolated-current-20260611103236.jsonl`; rerun is required. |
+| Browser | Four concurrent shards, Nix Chromium, partial | 1,172 | 17 | 0 | 17 | 0 | 0 | 17,811 | Partial logs under `/tmp/kad-1-test-logs/php-browser-shards4-current/`; the run was stopped before completion to continue Node/kernel iteration. |
+
+Important interpretation of the Node skip count: the 5,880 skips are upstream
+PHPT `SKIPIF` decisions, not harness failures. The largest groups are missing
+optional PHP extensions/services in this build or environment: `soap` (552),
+`intl` (524), `opcache` (500 in the old run), MySQL connection refused (391),
+`oci8` (330), `gd` (292), `zend_test` (162), PDO MySQL connection refused
+(145), `curl` (142), 64-bit-only tests (140), Windows-only tests (124), and
+FPM/root guards (123).
+
+The `opcache` skips in the complete Node baseline were a harness configuration
+gap. Kandelo ships opcache as the separate Zend extension side module
+`opcache.so`; it is not statically loaded into `php.wasm`. The harness now loads
+known available shared extensions requested by `--EXTENSIONS--` with the proper
+`zend_extension=` directive, recognizes PHP's loaded extension name
+`Zend OPcache` as satisfying `opcache`, and writes `opcache.so` into the browser
+PHPT VFS image. Targeted verification after this fix:
+
+```bash
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 SKIP_PERF_SENSITIVE=1 \
+  scripts/run-php-upstream-tests.sh --host node --timeout 60000 --json \
+  ext/opcache/tests/bool_cp_in_pass1.phpt
+# => PASS
+```
+
+Current WIP kernel/host fixes in this handoff:
+
+- POSIX wait status encoding now distinguishes normal exits from signal deaths.
+  Normal `_exit(status)` is masked to 8 bits and reported to `waitpid(2)` as
+  `(status & 0xff) << 8`; signal termination records a separate signal number
+  and reports the low 7-bit signal status. Host-side process scans still expose
+  shell-style `128 + signal` where that API expects it.
+- Hosts can mark captured stdio descriptors as pipes. The descriptor keeps its
+  host stdio handle for I/O, but `fstat(2)` reports FIFO metadata and
+  `isatty(3)` observes non-terminal behavior. This is needed for PHPT
+  `--CAPTURE_STDIO--` cases and is a general POSIX metadata correction.
+- Centralized `fork(2)` retries host PID allocation when the kernel still owns a
+  zombie/limbo PID. The kernel remains the source of truth for PID occupancy;
+  `fork(2)` callers should not observe an internal `EEXIST` collision.
+- Thread exit now clears `CLONE_CHILD_CLEARTID` storage and wakes the futex wait
+  word, matching Linux pthread join expectations.
+- Centralized host/kernel calls that pass guest pointers now route through the
+  host pointer-width helper instead of hard-coded `BigInt` arguments.
+
+Current WIP PHP harness fixes in this handoff:
+
+- Node `--jobs N` uses one copied php-src tree per worker, avoiding cross-test
+  contamination from generated `.php`/`.clean.php` files and tests that mutate
+  source-adjacent fixtures. Targeted rerun of failures caused by shared source
+  state passed 7/7 after this change.
+- Node runner reuses a host for throughput but resets it after section timeouts;
+  timeout handling no longer leaves the worker stuck for later PHPTs.
+- Combined stdout/stderr ordering is captured from host callbacks so PHPT
+  expectations that intentionally interleave warnings and output compare
+  correctly.
+- PHPT placeholder handling now includes `{TMP}`, `{MAIL:...}`, and `{ENV:...}`
+  in addition to `{PWD}`.
+- `TEST_PHP_EXTRA_ARGS` is kept empty, matching upstream use as extra switches
+  rather than an executable path.
+- Browser PHPT runs can use `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`; on this AO
+  runner a Nix Chromium binary was used because Playwright's downloaded browser
+  lacked system shared libraries.
+
+Local checks run before this handoff commit:
+
+- `git diff --check`
+- `npm --prefix host run typecheck`
+- `npm --prefix host test -- --run test/multi-worker.test.ts test/select-timeout-retry.test.ts` — 12 pass
+- `cargo test -p kandelo --target x86_64-unknown-linux-gnu poll_waitable_child --lib` — 5 pass
+- Targeted Node PHPT opcache side-module check above — 1 pass
+
+Recommended resume commands:
+
+```bash
+# Fast targeted verification for the opcache side-module harness fix.
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 SKIP_PERF_SENSITIVE=1 \
+  scripts/run-php-upstream-tests.sh --host node --timeout 60000 --json \
+  ext/opcache/tests/bool_cp_in_pass1.phpt
+
+# Full Node rerun; use --jobs on a machine with enough memory.
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 SKIP_PERF_SENSITIVE=1 \
+  scripts/run-php-upstream-tests.sh --host node --all --jobs 6 \
+  --timeout 120000 --json
+
+# Browser smoke after rebuilding the VFS with opcache.so included.
+CHROMIUM=$(nix shell nixpkgs#chromium --command sh -lc 'command -v chromium')
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" \
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 SKIP_PERF_SENSITIVE=1 \
+  scripts/run-php-upstream-tests.sh --host browser --rebuild-vfs \
+  --limit 3 --timeout 90000 --json
+
+# Browser full run should be sharded to reduce memory pressure.
+CHROMIUM=$(nix shell nixpkgs#chromium --command sh -lc 'command -v chromium')
+PHP_TEST_VITE_PORT=5231 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" \
+SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1 SKIP_PERF_SENSITIVE=1 \
+  scripts/run-php-upstream-tests.sh --host browser --all --shard 1/4 \
+  --timeout 90000 --json
+```
 
 ## 2026-06-05 PHP PHPT Harness Notes
 

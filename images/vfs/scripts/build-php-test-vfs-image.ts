@@ -27,6 +27,8 @@ const LOCAL_PHP_SRC = join(REPO_ROOT, "packages/registry/php/php-src");
 const PHP_WASM = process.env.PHP_WASM
   ?? tryResolveBinary("programs/php/php.wasm")
   ?? join(LOCAL_PHP_SRC, "sapi/cli/php");
+const OPCACHE_SO = process.env.PHP_OPCACHE_SO
+  ?? tryResolveBinary("programs/php/opcache.so");
 const DASH_WASM = process.env.DASH_WASM
   ?? tryResolveBinary("programs/dash.wasm");
 const COREUTILS_WASM = process.env.COREUTILS_WASM
@@ -118,6 +120,7 @@ async function main() {
   const fs = MemoryFileSystem.create(sab, FS_MAX_BYTES);
   for (const dir of [
     "/tmp", "/home", "/root", "/dev", "/etc", "/bin", "/usr", "/usr/bin",
+    "/usr/lib", "/usr/lib/php", "/usr/lib/php/extensions",
     "/usr/local", "/usr/local/bin", "/php-src",
   ]) {
     ensureDir(fs, dir);
@@ -140,6 +143,13 @@ async function main() {
   symlink(fs, "/usr/bin/sed", "/bin/sed");
 
   writeVfsBinary(fs, "/usr/local/bin/php", new Uint8Array(readFileSync(PHP_WASM)));
+  if (OPCACHE_SO && existsSync(OPCACHE_SO)) {
+    writeVfsBinary(
+      fs,
+      "/usr/lib/php/extensions/opcache.so",
+      new Uint8Array(readFileSync(OPCACHE_SO)),
+    );
+  }
 
   const phptDirs = collectPhptDirs(phpSrc);
   console.log(`  Writing ${phptDirs.length} PHPT directories...`);

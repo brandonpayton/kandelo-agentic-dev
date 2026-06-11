@@ -18,6 +18,7 @@ import {
   CH_DATA,
   CH_ERRNO,
   CH_RETURN,
+  HOST_INTERCEPTED_SYSCALLS,
 } from "../src/generated/abi";
 
 const MAX_PAGES = 1024; // 64 MiB: enough to prove initial < maximum.
@@ -57,6 +58,24 @@ function registerProcess(
 }
 
 describe("CentralizedKernelWorker Process Management", () => {
+  it("marks selected stdio descriptors as host-backed pipes", () => {
+    const setStdioPipe = vi.fn(() => 0);
+    const kw = Object.assign(Object.create(CentralizedKernelWorker.prototype), {
+      kernelInstance: {
+        exports: {
+          kernel_set_stdio_pipe: setStdioPipe,
+        },
+      },
+    });
+
+    kw.setStdioPipes(321, [0, 1, 2, -1, 3]);
+
+    expect(setStdioPipe).toHaveBeenCalledTimes(3);
+    expect(setStdioPipe).toHaveBeenNthCalledWith(1, 321, 0);
+    expect(setStdioPipe).toHaveBeenNthCalledWith(2, 321, 1);
+    expect(setStdioPipe).toHaveBeenNthCalledWith(3, 321, 2);
+  });
+
   it("lets the host terminate pthread workers without waking SYS_EXIT back into guest code", () => {
     const pid = 123;
     const mainChannelOffset = WASM_PAGE_SIZE;
@@ -173,6 +192,7 @@ describe("CentralizedKernelWorker Process Management", () => {
         resolveClone = resolve;
       });
     });
+    const channel = { pid, channelOffset: mainChannelOffset, memory };
 
     const kw = Object.assign(Object.create(CentralizedKernelWorker.prototype), {
       callbacks: { onClone },
@@ -185,8 +205,9 @@ describe("CentralizedKernelWorker Process Management", () => {
       scratchOffset: 0,
       currentHandlePid: 0,
       processes: new Map([
-        [pid, { channels: [{ channelOffset: mainChannelOffset }] }],
+        [pid, { channels: [channel] }],
       ]),
+      activeChannels: [channel],
       threadCtidPtrs,
       completeChannel: vi.fn(),
       bindKernelTidForChannel: vi.fn(),
@@ -202,7 +223,7 @@ describe("CentralizedKernelWorker Process Management", () => {
     });
 
     (kw as any).handleClone(
-      { pid, channelOffset: mainChannelOffset, memory },
+      channel,
       [0, stackPtr, 0, tlsPtr, ctidPtr, 0],
     );
 
@@ -318,6 +339,57 @@ describe("CentralizedKernelWorker Process Management", () => {
     const proc = createProcessMemory();
     registerProcess(kw, 100, proc);
     kw.unregisterProcess(100);
+  });
+
+  it("retries fork pid allocation when the kernel still owns a zombie pid", async () => {
+    const parentPid = 77;
+    const memory = new WebAssembly.Memory({
+      initial: 4,
+      maximum: 4,
+      shared: true,
+    });
+    const channel = {
+      pid: parentPid,
+      channelOffset: WASM_PAGE_SIZE,
+      memory,
+    };
+    const kernelForkProcess = vi.fn((_parent: number, child: number) =>
+      child === 100 ? -17 : 0,
+    );
+    const completeChannel = vi.fn();
+    const onFork = vi.fn(() => Promise.resolve([WASM_PAGE_SIZE]));
+    const kw = Object.assign(Object.create(CentralizedKernelWorker.prototype), {
+      callbacks: { onFork },
+      nextChildPid: 100,
+      processes: new Map([[parentPid, { channels: [channel] }]]),
+      threadForkContexts: new Map(),
+      tcpListenerTargets: new Map(),
+      epollInterests: new Map(),
+      inheritSharedMappings: vi.fn(),
+      completeChannel,
+      kernelInstance: {
+        exports: {
+          kernel_fork_process: kernelForkProcess,
+          kernel_clear_fork_child: vi.fn(() => 0),
+          kernel_reset_signal_mask: vi.fn(() => 0),
+        },
+      },
+    });
+
+    (kw as any).handleFork(channel, [0]);
+    await Promise.resolve();
+
+    expect(kernelForkProcess).toHaveBeenNthCalledWith(1, parentPid, 100);
+    expect(kernelForkProcess).toHaveBeenNthCalledWith(2, parentPid, 101);
+    expect(onFork).toHaveBeenCalledWith(parentPid, 101, memory, undefined);
+    expect(completeChannel).toHaveBeenCalledWith(
+      channel,
+      HOST_INTERCEPTED_SYSCALLS.SYS_FORK,
+      [0],
+      undefined,
+      101,
+      0,
+    );
   });
 
   it("should throw when registering duplicate PID", async () => {

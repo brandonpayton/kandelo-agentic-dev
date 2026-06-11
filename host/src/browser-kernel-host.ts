@@ -106,6 +106,8 @@ export interface BrowserKernelBootOptions {
   pty?: boolean;
   /** Initial stdin bytes (with implicit EOF). */
   stdin?: Uint8Array;
+  /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
+  pipeStdio?: number[];
 }
 
 export class BrowserKernel {
@@ -403,6 +405,7 @@ export class BrowserKernel {
       gid: options.gid,
       pty: options.pty,
       stdin: options.stdin,
+      pipeStdio: options.pipeStdio,
       maxPages: this.maxPages,
     }) as number;
 
@@ -445,6 +448,7 @@ export class BrowserKernel {
       env?: string[];
       cwd?: string;
       stdin?: Uint8Array;
+      pipeStdio?: number[];
       pty?: boolean;
       uid?: number;
       gid?: number;
@@ -475,6 +479,7 @@ export class BrowserKernel {
       ptyCols: options?.ptyCols,
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
+      pipeStdio: options?.pipeStdio,
       maxPages: this.maxPages,
     }, [bytesToSend]);
 
@@ -509,7 +514,7 @@ export class BrowserKernel {
   async spawnFromVfs(
     programPath: string,
     argv: string[],
-    options?: { env?: string[]; cwd?: string; uid?: number; gid?: number; pty?: boolean; stdin?: Uint8Array },
+    options?: { env?: string[]; cwd?: string; uid?: number; gid?: number; pty?: boolean; stdin?: Uint8Array; pipeStdio?: number[] },
   ): Promise<{ pid: number; exit: Promise<number> }> {
     const requestId = this.nextRequestId++;
     const pid = await this.request(requestId, {
@@ -523,6 +528,7 @@ export class BrowserKernel {
       gid: options?.gid,
       pty: options?.pty,
       stdin: options?.stdin,
+      pipeStdio: options?.pipeStdio,
       maxPages: this.maxPages,
     }) as number;
 
