@@ -357,6 +357,47 @@ function isFlakyTest(test: PhptTest): boolean {
   return /\b(?:disk_free_space|hrtime|microtime|sleep|usleep)\s*\(/i.test(file);
 }
 
+function phptConflictTokens(test: PhptTest): string[] {
+  const tokens = new Set<string>();
+  const conflicts = test.sections.CONFLICTS ?? "";
+  for (const token of conflicts.split(/[\s,]+/)) {
+    const normalized = token.trim();
+    if (normalized) tokens.add(normalized);
+  }
+
+  const source = [
+    test.sections.SKIPIF,
+    test.sections.FILE,
+    test.sections.FILEEOF,
+    test.sections.CLEAN,
+  ]
+    .filter((section): section is string => section !== undefined)
+    .join("\n");
+
+  // Upstream run-tests.php uses --CONFLICTS-- to keep server-style PHPTs from
+  // running concurrently. Some php-src tests do not declare it even though
+  // they start helper servers or bind fixed loopback ports. Mirror the
+  // important resource constraints here so `--jobs` remains usable without
+  // producing false failures from EADDRINUSE or competing php_cli_server
+  // instances.
+  if (
+    /\b(?:php_cli_server_start|php_cli_server_connect|PHP_CLI_SERVER_)/.test(
+      source,
+    ) ||
+    /\bServerClientTestCase\.inc\b/.test(source)
+  ) {
+    tokens.add("server");
+  }
+
+  const loopbackPort =
+    /\b(?:127\.0\.0\.1|localhost|\[::1\]|::1):([0-9]{2,5})\b/g;
+  for (const match of source.matchAll(loopbackPort)) {
+    tokens.add(`tcp-port:${match[1]}`);
+  }
+
+  return [...tokens];
+}
+
 function isFlakyOutput(output: string): boolean {
   return /\b(?:404: page not found|address already in use|connection refused|deadlock|mailbox already exists|timed out)\b/i.test(output);
 }
@@ -1496,21 +1537,55 @@ async function main() {
     time: 0,
   };
   const results: TestResult[] = new Array(tests.length);
-  let nextTest = 0;
   let completed = 0;
+  const pendingTests = new Set(tests.map((_test, index) => index));
+  const activeConflicts = new Set<string>();
+  let schedulerWaiters: Array<() => void> = [];
+
+  async function acquireTest(): Promise<{
+    index: number;
+    conflicts: string[];
+  } | null> {
+    while (true) {
+      if (pendingTests.size === 0) return null;
+      for (const index of pendingTests) {
+        const conflicts = phptConflictTokens(tests[index]);
+        if (conflicts.some((conflict) => activeConflicts.has(conflict))) {
+          continue;
+        }
+        pendingTests.delete(index);
+        for (const conflict of conflicts) activeConflicts.add(conflict);
+        return { index, conflicts };
+      }
+      await new Promise<void>((resolve) => schedulerWaiters.push(resolve));
+    }
+  }
+
+  function releaseTest(conflicts: string[]) {
+    for (const conflict of conflicts) activeConflicts.delete(conflict);
+    const waiters = schedulerWaiters;
+    schedulerWaiters = [];
+    for (const wake of waiters) wake();
+  }
 
   try {
     await Promise.all(
       runners.map(async (runner) => {
         while (true) {
-          const index = nextTest++;
-          if (index >= tests.length) break;
-          const result = await runPhpt(
-            tests[index],
-            runner,
-            availableExtensions,
-            timeoutMs,
-          );
+          const acquired = await acquireTest();
+          if (acquired === null) break;
+          const { index, conflicts } = acquired;
+          let result: TestResult;
+          try {
+            result = await runPhpt(
+              tests[index],
+              runner,
+              availableExtensions,
+              timeoutMs,
+            );
+          } finally {
+            releaseTest(conflicts);
+          }
           counts[result.status]++;
           results[index] = result;
           completed++;
