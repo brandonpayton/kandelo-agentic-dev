@@ -33,6 +33,7 @@ import {
 } from "node:path";
 import { NodeKernelHost } from "../host/src/node-kernel-host";
 import { tryResolveBinary } from "../host/src/binary-resolver";
+import { ABI_SYSCALL_NAMES } from "../host/src/generated/abi";
 import { ensureSourceExtract } from "../images/vfs/scripts/source-extract-helper";
 
 const REPO_ROOT = resolve(new URL(".", import.meta.url).pathname, "..");
@@ -701,6 +702,21 @@ class NodePhpRunner implements PhpRunner {
       },
     });
     await host.init();
+    if (process.env.PHP_TEST_SYSCALL_TRACE) {
+      const filters = new Set(
+        process.env.PHP_TEST_SYSCALL_TRACE.split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      );
+      host.subscribeSyscalls((event) => {
+        const name = ABI_SYSCALL_NAMES[event.nr] ?? `syscall_${event.nr}`;
+        if (filters.size === 0 || filters.has(name) || filters.has(String(event.nr))) {
+          console.error(
+            `[php-phpt-syscall] pid=${event.pid} ${name}(${event.args.join(",")})`,
+          );
+        }
+      });
+    }
     this.host = host;
     return host;
   }
@@ -1247,6 +1263,12 @@ async function runPhpt(
   let ok = false;
   let detail = main.error;
   let actualOutput = main.output ?? `${main.stdout}${main.stderr}`;
+  if (main.error === "TIMEOUT" && actualOutput) {
+    const snippet = normalizeOutput(actualOutput)
+      .slice(0, 2000)
+      .replace(/\n/g, "\\n");
+    detail = `TIMEOUT; partial actual: ${snippet}`;
+  }
   if (main.error !== "TIMEOUT") {
     const compared = compareExpectation(test, actualOutput);
     // PHPTs often intentionally trigger fatal errors; upstream run-tests.php
