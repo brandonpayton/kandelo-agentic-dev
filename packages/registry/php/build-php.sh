@@ -268,6 +268,18 @@ if [ ! -f Makefile ]; then
         && rm -f libtool.bak
 fi
 
+# SQLite's feature probes can be distorted by cross-linker behavior even when
+# the resolved library has the symbol. Keep the PHP build config aligned with
+# the Kandelo SQLite package: sqlite3_expanded_sql() is always present in our
+# SQLite 3.49.x build, and column metadata is enabled by the SQLite package so
+# pdo_sqlite can expose table names without leaving unresolved imports.
+if [ -f main/php_config.h ]; then
+    sed -i.bak \
+        -e 's|^/\* #undef HAVE_SQLITE3_EXPANDED_SQL \*/|#define HAVE_SQLITE3_EXPANDED_SQL 1|' \
+        -e 's|^/\* #undef HAVE_SQLITE3_COLUMN_TABLE_NAME \*/|#define HAVE_SQLITE3_COLUMN_TABLE_NAME 1|' \
+        main/php_config.h && rm -f main/php_config.h.bak
+fi
+
 # `make` per-file rules embed `INCLUDES` from configure but ignore
 # `CPPFLAGS` (which only contains `-D_GNU_SOURCE`); `INCLUDES` for
 # our libxml2 ends up as `-I.../include/libxml` because PHP's

@@ -45,6 +45,39 @@ const BROWSER_DIR = join(REPO_ROOT, "apps/browser-demos");
 const VITE_HOST = "127.0.0.1";
 const VITE_PORT = Number(process.env.PHP_TEST_VITE_PORT ?? 5201);
 const BROWSER_EXTENSION_DIR = "/usr/lib/php/extensions";
+const RUN_TESTS_BASE_INI = [
+  "output_handler=",
+  "open_basedir=",
+  "disable_functions=",
+  "output_buffering=Off",
+  "error_reporting=32767",
+  "display_errors=1",
+  "display_startup_errors=1",
+  "log_errors=0",
+  "html_errors=0",
+  "track_errors=0",
+  "report_memleaks=1",
+  "report_zend_debug=0",
+  "docref_root=",
+  "docref_ext=.html",
+  "error_prepend_string=",
+  "error_append_string=",
+  "auto_prepend_file=",
+  "auto_append_file=",
+  "ignore_repeated_errors=0",
+  "precision=14",
+  "serialize_precision=-1",
+  "memory_limit=128M",
+  "opcache.fast_shutdown=0",
+  "opcache.file_update_protection=0",
+  "opcache.revalidate_freq=0",
+  "opcache.jit_hot_loop=1",
+  "opcache.jit_hot_func=1",
+  "opcache.jit_hot_return=1",
+  "opcache.jit_hot_side_exit=1",
+  "zend.assertions=1",
+  "zend.exception_ignore_args=0",
+];
 
 type HostKind = "node" | "browser";
 type TestStatus =
@@ -331,6 +364,14 @@ function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function shellArgs(args: string[]): string {
+  return args.map(shellEscape).join(" ");
+}
+
+function baseIniArgs(): string[] {
+  return RUN_TESTS_BASE_INI.flatMap((setting) => ["-d", setting]);
+}
+
 function extensionArgs(extensions: string | undefined): string[] {
   if (!extensions) return [];
   return extensions
@@ -355,6 +396,17 @@ function sharedExtensionsForPhp(phpPath: string): Set<string> {
   return out;
 }
 
+function staticExtensionsForPhpSource(sourceRoot: string): Set<string> {
+  const out = new Set<string>();
+  const internalFunctions = join(sourceRoot, "main/internal_functions.c");
+  if (!existsSync(internalFunctions)) return out;
+  const text = readFileSync(internalFunctions, "utf8");
+  for (const match of text.matchAll(/\bphpext_([A-Za-z0-9_]+)_ptr\b/g)) {
+    out.add(normalizeExtensionName(match[1]));
+  }
+  return out;
+}
+
 function loadExtensionIniArgs(
   requiredExtensions: string[],
   availableSharedExtensions: Set<string>,
@@ -372,31 +424,15 @@ function loadExtensionIniArgs(
     const directive =
       name === "opcache" || name === "xdebug" ? "zend_extension" : "extension";
     args.push("-d", `${directive}=${guestExtensionDir}/${name}.so`);
+    if (name === "opcache") {
+      // The Kandelo PHP package builds opcache as a shared Zend extension but
+      // defaults opcache.enable to 0 for demos that do not opt in. Upstream
+      // php-src PHPTs that request --EXTENSIONS-- opcache assume the upstream
+      // default active extension unless a test's --INI-- overrides it.
+      args.push("-d", "opcache.enable=1");
+    }
   }
   return args;
-}
-
-function extensionSkipScript(extensions: string[]): string {
-  return `<?php
-$required = ${JSON.stringify(extensions)};
-$missing = [];
-foreach ($required as $extension) {
-    $name = strtolower($extension);
-    if ($name === "zend opcache") {
-        $name = "opcache";
-    }
-    $loaded = extension_loaded($extension) || extension_loaded($name);
-    if (!$loaded && $name === "opcache") {
-        $loaded = extension_loaded("Zend OPcache");
-    }
-    if (!$loaded) {
-        $missing[] = $extension;
-    }
-}
-if ($missing) {
-    echo "skip required extension(s) not loaded: " . implode(", ", $missing);
-}
-?>`;
 }
 
 function normalizeOutput(text: string): string {
@@ -519,7 +555,7 @@ function unsupportedReason(test: PhptTest): string | null {
   }
   if (
     test.rel.startsWith("Zend/tests/fibers/") ||
-    /\b(?:new\s+Fiber|Fiber::)/.test(source)
+    /\b(?:new\s+\\?Fiber|\\?Fiber::|ReflectionFiber)\b/.test(source)
   ) {
     return "PHP Fibers require ucontext/boost context switching, which the Kandelo PHP build does not support yet";
   }
@@ -675,14 +711,15 @@ class NodePhpRunner implements PhpRunner {
     await delay(0);
   }
 
-  private async terminateLiveProcesses(host: NodeKernelHost): Promise<void> {
+  private async terminateLiveProcesses(host: NodeKernelHost): Promise<boolean> {
     let processes: Array<{ pid: number }> = [];
     try {
       processes = await withTimeout(host.enumProcs(), 1_000, "enumProcs");
     } catch {
       await this.resetHost(host);
-      return;
+      return true;
     }
+    if (processes.length === 0) return false;
     const results = await Promise.allSettled(
       processes.map((process) =>
         withTimeout(
@@ -694,7 +731,9 @@ class NodePhpRunner implements PhpRunner {
     );
     if (results.some((result) => result.status === "rejected")) {
       await this.resetHost(host);
+      return true;
     }
+    return true;
   }
 
   async runScript(opts: {
@@ -766,9 +805,21 @@ class NodePhpRunner implements PhpRunner {
       });
       const exitCode = await Promise.race([exitPromise, timeoutPromise]);
       // Process exit and stdio notifications are delivered over separate host
-      // messages. Yield once before freezing the captured output so data that
-      // was written immediately before _exit() is not lost.
-      await delay(10);
+      // messages. Wait for output to quiesce before freezing the capture so
+      // data written immediately before _exit() is not lost. A fixed short
+      // sleep still flaked on buffered CLI/file PHPTs under full-suite load.
+      let lastOutputLength = -1;
+      let stablePolls = 0;
+      for (let waitedMs = 0; waitedMs < 500 && stablePolls < 3; waitedMs += 25) {
+        await delay(25);
+        const outputLength = output.output.length;
+        if (waitedMs >= 100 && outputLength === lastOutputLength) {
+          stablePolls++;
+        } else {
+          stablePolls = 0;
+        }
+        lastOutputLength = outputLength;
+      }
       return {
         exitCode,
         stdout: output.stdout,
@@ -791,7 +842,14 @@ class NodePhpRunner implements PhpRunner {
       };
     } finally {
       if (this.host === host) {
-        await this.terminateLiveProcesses(host);
+        const hadLiveProcesses = await this.terminateLiveProcesses(host);
+        // A PHPT that leaves children behind can also leave pipes, sockets, or
+        // stdio delivery state behind. Upstream run-tests.php gets a fresh OS
+        // process tree for every PHP invocation; mirror that isolation when
+        // Kandelo reports leftover processes after a section completes.
+        if (hadLiveProcesses && this.host === host) {
+          await this.resetHost(host);
+        }
       }
       this.activeOutput = null;
       if (timeoutId) clearTimeout(timeoutId);
@@ -1092,6 +1150,7 @@ class BrowserPhpRunner implements PhpRunner {
 async function runPhpt(
   test: PhptTest,
   runner: PhpRunner,
+  availableExtensions: Set<string>,
   timeoutMs: number,
 ): Promise<TestResult> {
   const start = performance.now();
@@ -1106,43 +1165,30 @@ async function runPhpt(
   }
 
   const commonEnv = [...passthroughEnvArgs(), ...envArgs(test.sections.ENV, test)];
-  const testArgv = iniArgs(test.sections.INI, test);
+  const defaultIniArgs = baseIniArgs();
+  const testIniArgs = iniArgs(test.sections.INI, test);
   const args = splitArgs(test.sections.ARGS);
   const pipeStdio = captureStdioFds(test);
 
   const requiredExtensions = extensionArgs(test.sections.EXTENSIONS);
   const extensionIniArgs = runner.loadExtensionIniArgs(requiredExtensions);
-  if (requiredExtensions.length > 0) {
-    const extensionSkip = await runner.runScript({
-      test,
-      kind: "skipif",
-      script: extensionSkipScript(requiredExtensions),
-      argv: extensionIniArgs,
-      env: commonEnv,
-      pipeStdio,
-      timeoutMs,
-    });
-    const extensionOutput = normalizeOutput(
-      `${extensionSkip.stdout}${extensionSkip.stderr}`,
-    );
-    if (/^skip\b/i.test(extensionOutput)) {
-      return {
-        test: test.rel,
-        status: "skip",
-        time_ms: Math.round(performance.now() - start),
-        reason: extensionOutput,
-      };
-    }
-    if (extensionSkip.error === "TIMEOUT") {
-      return {
-        test: test.rel,
-        status: "time",
-        time_ms: extensionSkip.durationMs,
-        reason: "EXTENSIONS check timed out",
-      };
-    }
+  const missingRequiredExtensions = requiredExtensions.filter(
+    (extension) => !availableExtensions.has(normalizeExtensionName(extension)),
+  );
+  if (missingRequiredExtensions.length > 0) {
+    return {
+      test: test.rel,
+      status: "skip",
+      time_ms: Math.round(performance.now() - start),
+      reason: `skip required extension(s) not loaded: ${missingRequiredExtensions.join(", ")}`,
+    };
   }
-
+  const preTestArgv = [...extensionIniArgs, ...defaultIniArgs];
+  const testArgv = [...preTestArgv, ...testIniArgs];
+  const envWithExtraArgs = [
+    ...commonEnv,
+    `TEST_PHP_EXTRA_ARGS=${shellArgs(testArgv)}`,
+  ];
   if (test.sections.SKIPIF !== undefined) {
     const skip = await runner.runScript({
       test,
@@ -1151,8 +1197,8 @@ async function runPhpt(
       // Upstream run-tests.php executes SKIPIF before applying the test's
       // --INI-- block. Keep that ordering so resource-probing SKIPIF sections
       // are not distorted by settings meant only for the main FILE body.
-      argv: extensionIniArgs,
-      env: commonEnv,
+      argv: preTestArgv,
+      env: envWithExtraArgs,
       pipeStdio,
       timeoutMs,
     });
@@ -1188,9 +1234,9 @@ async function runPhpt(
       test,
       kind: "file",
       script: testScript(test),
-      argv: [...extensionIniArgs, ...testArgv],
+      argv: testArgv,
       scriptArgs: args,
-      env: commonEnv,
+      env: envWithExtraArgs,
       stdin: test.sections.STDIN,
       pipeStdio,
       timeoutMs,
@@ -1245,8 +1291,8 @@ async function runPhpt(
         kind: "clean",
         script: test.sections.CLEAN,
         // CLEAN runs with the same pre-test INI baseline as SKIPIF upstream.
-        argv: extensionIniArgs,
-        env: commonEnv,
+        argv: preTestArgv,
+        env: envWithExtraArgs,
         pipeStdio,
         timeoutMs: Math.min(timeoutMs, 30_000),
       })
@@ -1361,6 +1407,10 @@ async function main() {
   const sourceRoot = resolvePhpSource();
   const phpPath = resolvePhpBinary();
   const availableSharedExtensions = sharedExtensionsForPhp(phpPath);
+  const availableExtensions = new Set([
+    ...staticExtensionsForPhpSource(sourceRoot),
+    ...availableSharedExtensions,
+  ]);
   let tests = discoverTests(sourceRoot, selectors);
   if (shard !== null) {
     tests = tests.filter((_, idx) => idx % shard!.total === shard!.index - 1);
@@ -1433,7 +1483,12 @@ async function main() {
         while (true) {
           const index = nextTest++;
           if (index >= tests.length) break;
-          const result = await runPhpt(tests[index], runner, timeoutMs);
+          const result = await runPhpt(
+            tests[index],
+            runner,
+            availableExtensions,
+            timeoutMs,
+          );
           counts[result.status]++;
           results[index] = result;
           completed++;

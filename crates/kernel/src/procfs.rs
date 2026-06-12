@@ -285,9 +285,16 @@ pub fn generate_stat(proc: &Process) -> Vec<u8> {
     // pid (comm) state ppid pgrp session tty_nr tpgid flags
     // minflt cminflt majflt cmajflt utime stime cutime cstime
     // priority nice num_threads itrealvalue starttime vsize rss ...
+    //
+    // Keep both scheduling fields distinct.  Several user-space tools (ps,
+    // procps-compatible libraries, PHP's proc_nice() tests) read the nice
+    // value from field 19; field 18 is the scheduler priority.  Kandelo does
+    // not have a host CPU scheduler, but exposing the stored POSIX nice value
+    // in the Linux-compatible procfs slot is observable process metadata.
+    let priority = 20 + proc.nice;
     let line = format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        proc.pid, name, state, proc.ppid, proc.pgid, proc.sid, proc.nice,
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        proc.pid, name, state, proc.ppid, proc.pgid, proc.sid, priority, proc.nice,
     );
     line.into_bytes()
 }
@@ -1049,7 +1056,10 @@ mod tests {
         let stat = generate_stat(&proc);
         let stat_str = core::str::from_utf8(&stat).unwrap();
         assert!(stat_str.starts_with("42 (test_program) R 1 42 1"));
-        assert!(stat_str.contains(" 5 ")); // nice value
+        let after_comm = stat_str.split(") ").nth(1).unwrap();
+        let mut fields = after_comm.split_whitespace();
+        assert_eq!(fields.nth(15).unwrap(), "25"); // field 18: scheduler priority
+        assert_eq!(fields.next().unwrap(), "5"); // field 19: nice value
     }
 
     #[test]
