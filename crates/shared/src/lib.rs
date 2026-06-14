@@ -356,6 +356,7 @@ pub enum Errno {
     EBUSY = 16,
     EEXIST = 17,
     EXDEV = 18,
+    ENODEV = 19,
     ENOTDIR = 20,
     EISDIR = 21,
     EINVAL = 22,
@@ -384,6 +385,7 @@ pub enum Errno {
     EPROTOTYPE = 91,
     ENOPROTOOPT = 92,
     EPROTONOSUPPORT = 93,
+    ESOCKTNOSUPPORT = 94,
     EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
     EADDRINUSE = 98,
@@ -420,6 +422,7 @@ impl Errno {
             16 => Some(Errno::EBUSY),
             17 => Some(Errno::EEXIST),
             18 => Some(Errno::EXDEV),
+            19 => Some(Errno::ENODEV),
             20 => Some(Errno::ENOTDIR),
             21 => Some(Errno::EISDIR),
             22 => Some(Errno::EINVAL),
@@ -448,6 +451,7 @@ impl Errno {
             91 => Some(Errno::EPROTOTYPE),
             92 => Some(Errno::ENOPROTOOPT),
             93 => Some(Errno::EPROTONOSUPPORT),
+            94 => Some(Errno::ESOCKTNOSUPPORT),
             95 => Some(Errno::EOPNOTSUPP),
             97 => Some(Errno::EAFNOSUPPORT),
             98 => Some(Errno::EADDRINUSE),
@@ -558,6 +562,7 @@ pub mod socket {
     pub const SOCK_CLOEXEC: u32 = 0o2000000;
     pub const SOL_SOCKET: u32 = 1;
     pub const SCM_RIGHTS: u32 = 1;
+    pub const SCM_CREDENTIALS: u32 = 2;
     pub const SO_REUSEADDR: u32 = 2;
     pub const SO_ERROR: u32 = 4;
     pub const SO_KEEPALIVE: u32 = 9;
@@ -566,6 +571,11 @@ pub mod socket {
     pub const SO_TYPE: u32 = 3;
     pub const SO_DOMAIN: u32 = 39;
     pub const SO_ACCEPTCONN: u32 = 30;
+    pub const SO_REUSEPORT: u32 = 15;
+    pub const SO_PASSCRED: u32 = 16;
+    pub const SO_BINDTODEVICE: u32 = 25;
+    pub const SO_ATTACH_REUSEPORT_CBPF: u32 = 51;
+    pub const SO_ZEROCOPY: u32 = 60;
     pub const SHUT_RD: u32 = 0;
     pub const SHUT_WR: u32 = 1;
     pub const SHUT_RDWR: u32 = 2;
@@ -574,7 +584,18 @@ pub mod socket {
     // time64 values used by musl on wasm32 (where __LONG_MAX == 0x7fffffff)
     pub const SO_RCVTIMEO: u32 = 66;
     pub const SO_SNDTIMEO: u32 = 67;
+    pub const IPPROTO_IP: u32 = 0;
     pub const IPPROTO_TCP: u32 = 6;
+    pub const IPPROTO_UDP: u32 = 17;
+    pub const IPPROTO_IPV6: u32 = 41;
+    pub const IP_TOS: u32 = 1;
+    pub const IP_PKTINFO: u32 = 8;
+    pub const IP_MTU_DISCOVER: u32 = 10;
+    pub const IP_MTU: u32 = 14;
+    pub const IP_MULTICAST_IF: u32 = 32;
+    pub const IP_MULTICAST_TTL: u32 = 33;
+    pub const IP_MULTICAST_LOOP: u32 = 34;
+    pub const MCAST_JOIN_GROUP: u32 = 42;
     pub const TCP_NODELAY: u32 = 1;
     pub const TCP_CORK: u32 = 3;
     pub const TCP_KEEPIDLE: u32 = 4;
@@ -582,8 +603,17 @@ pub mod socket {
     pub const TCP_KEEPCNT: u32 = 6;
     pub const TCP_DEFER_ACCEPT: u32 = 9;
     pub const TCP_INFO: u32 = 11;
+    pub const TCP_CONGESTION: u32 = 13;
     pub const TCP_QUICKACK: u32 = 12;
     pub const TCP_USER_TIMEOUT: u32 = 18;
+    pub const IPV6_MULTICAST_IF: u32 = 17;
+    pub const IPV6_MULTICAST_HOPS: u32 = 18;
+    pub const IPV6_MULTICAST_LOOP: u32 = 19;
+    pub const IPV6_RECVPKTINFO: u32 = 49;
+    pub const IPV6_PKTINFO: u32 = 50;
+    pub const IPV6_DONTFRAG: u32 = 62;
+    pub const IPV6_RECVTCLASS: u32 = 66;
+    pub const IPV6_TCLASS: u32 = 67;
     pub const MSG_OOB: u32 = 1;
     pub const MSG_PEEK: u32 = 2;
     pub const MSG_DONTWAIT: u32 = 64;

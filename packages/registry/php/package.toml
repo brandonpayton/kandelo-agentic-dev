@@ -48,3 +48,17 @@ wasm = "php-fpm.wasm"
 [[outputs]]
 name = "opcache"
 wasm = "opcache.so"
+
+# Phar ships as a normal shared PHP extension. PHPT tests and real
+# applications can opt in with the standard `extension=phar.so` mechanism
+# instead of relying on a test-only static module or harness special case.
+[[outputs]]
+name = "phar"
+wasm = "phar.so"
+
+# zend_test is php-src's own engine-test extension. It is not loaded by
+# default, but is available to PHPTs and callers that explicitly request
+# `extension=zend_test.so`.
+[[outputs]]
+name = "zend_test"
+wasm = "zend_test.so"

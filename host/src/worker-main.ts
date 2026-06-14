@@ -264,12 +264,19 @@ function buildDlopenImports(
       "memory", "__indirect_function_table",
       "__memory_base", "__table_base", "__stack_pointer",
     ]);
-    const globalSymbols = new Map<string, Function | WebAssembly.Global>();
+    const globalSymbols = new Map<string, WebAssembly.ExportValue>();
     const inst = getInstance();
     if (inst) {
+      const TagCtor = (WebAssembly as typeof WebAssembly & {
+        Tag?: new (descriptor: { parameters: string[] }) => WebAssembly.ExportValue;
+      }).Tag;
       for (const [name, exp] of Object.entries(inst.exports)) {
         if (RESERVED.has(name)) continue;
-        if (typeof exp === "function" || exp instanceof WebAssembly.Global) {
+        if (
+          typeof exp === "function" ||
+          exp instanceof WebAssembly.Global ||
+          (TagCtor && exp instanceof TagCtor)
+        ) {
           globalSymbols.set(name, exp);
         }
       }
@@ -451,6 +458,11 @@ function buildImportObject(
   dlopenImports?: Record<string, WebAssembly.ExportValue>,
   getInstance?: () => WebAssembly.Instance | undefined,
   ptrWidth: 4 | 8 = 4,
+  scheduleVmInterruptTimer?: (
+    timedOutPtr: number,
+    vmInterruptPtr: number,
+    seconds: number,
+  ) => void,
 ): WebAssembly.Imports {
   const envImports: Record<string, WebAssembly.ExportValue> = { memory };
   /** Convert wasm64 BigInt pointer to number (safe since addresses < 4GB) */
@@ -485,6 +497,22 @@ function buildImportObject(
   // Add dlopen imports if provided
   if (dlopenImports) {
     Object.assign(envImports, dlopenImports);
+  }
+
+  // Some language runtimes (PHP's max_execution_time is the motivating case)
+  // implement asynchronous timeouts by setting a VM interrupt flag from a
+  // signal/timer callback. A JS timer inside this worker cannot fire while the
+  // Wasm VM is in a CPU-bound loop, so delegate the timer to the kernel worker,
+  // which shares this process memory and can update the runtime's cooperative
+  // interrupt flags.
+  if (scheduleVmInterruptTimer) {
+    envImports.__wasm_posix_vm_interrupt_after = (
+      timedOutPtr: number | bigint,
+      vmInterruptPtr: number | bigint,
+      seconds: number | bigint,
+    ): void => {
+      scheduleVmInterruptTimer(n(timedOutPtr), n(vmInterruptPtr), n(seconds));
+    };
   }
 
   // C++ operator new/delete fallbacks — delegate to the wasm instance's malloc/free.
@@ -918,8 +946,24 @@ export async function centralizedWorkerMain(
         () => processInstance ?? undefined,
         ptrWidth,
       );
-      const importObject = buildImportObject(module, memory, kernelImports, channelOffset, dlopenSupport.imports,
-        () => processInstance ?? undefined, ptrWidth);
+      const importObject = buildImportObject(
+        module,
+        memory,
+        kernelImports,
+        channelOffset,
+        dlopenSupport.imports,
+        () => processInstance ?? undefined,
+        ptrWidth,
+        (timedOutPtr, vmInterruptPtr, seconds) => {
+          port.postMessage({
+            type: "vm_interrupt_timer",
+            pid,
+            timedOutPtr,
+            vmInterruptPtr,
+            seconds,
+          } satisfies WorkerToHostMessage);
+        },
+      );
       const instance = await WebAssembly.instantiate(module, importObject);
       processInstance = instance;
       verifyProgramAbi(programBytes, initData.kernelAbiVersion, pid);
@@ -1069,8 +1113,24 @@ export async function centralizedWorkerMain(
         () => processInstance ?? undefined,
         ptrWidth,
       );
-      const importObject = buildImportObject(module, memory, kernelImports, channelOffset, dlopenSupport.imports,
-        () => processInstance ?? undefined, ptrWidth);
+      const importObject = buildImportObject(
+        module,
+        memory,
+        kernelImports,
+        channelOffset,
+        dlopenSupport.imports,
+        () => processInstance ?? undefined,
+        ptrWidth,
+        (timedOutPtr, vmInterruptPtr, seconds) => {
+          port.postMessage({
+            type: "vm_interrupt_timer",
+            pid,
+            timedOutPtr,
+            vmInterruptPtr,
+            seconds,
+          } satisfies WorkerToHostMessage);
+        },
+      );
       const instance = await WebAssembly.instantiate(module, importObject);
       processInstance = instance;
       verifyProgramAbi(programBytes, initData.kernelAbiVersion, pid);
@@ -1757,8 +1817,24 @@ export async function centralizedThreadWorkerMain(
         );
       };
     }
-    const importObject = buildImportObject(module, memory, kernelImports, channelOffset, undefined,
-      () => threadInstance, ptrWidth);
+    const importObject = buildImportObject(
+      module,
+      memory,
+      kernelImports,
+      channelOffset,
+      undefined,
+      () => threadInstance,
+      ptrWidth,
+      (timedOutPtr, vmInterruptPtr, seconds) => {
+        port.postMessage({
+          type: "vm_interrupt_timer",
+          pid,
+          timedOutPtr,
+          vmInterruptPtr,
+          seconds,
+        } satisfies WorkerToHostMessage);
+      },
+    );
     const instance = new WebAssembly.Instance(module, importObject);
     threadInstance = instance;
 

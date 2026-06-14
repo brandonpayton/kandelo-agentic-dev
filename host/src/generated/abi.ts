@@ -555,6 +555,7 @@ export interface SyscallArgDesc {
   direction: SyscallArgDirection;
   size: SyscallArgSizeSpec;
   copyRetvalAdd?: number;
+  copyRetvalLimit?: boolean;
 }
 
 export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
@@ -683,13 +684,13 @@ export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
     { argIndex: 3, direction: "out", size: { type: "fixed", size: 8 } },
   ],
   62: [
-    { argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } },
     { argIndex: 4, direction: "in", size: { type: "arg", argIndex: 5 } },
+    { argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } },
   ],
   63: [
-    { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } },
     { argIndex: 4, direction: "out", size: { type: "deref", argIndex: 5 } },
     { argIndex: 5, direction: "inout", size: { type: "fixed", size: 4 } },
+    { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } },
   ],
   64: [
     { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } },
@@ -769,6 +770,9 @@ export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
   110: [
     { argIndex: 0, direction: "in", size: { type: "fixed", size: 8 } },
   ],
+  112: [
+    { argIndex: 0, direction: "in", size: { type: "cstring" } },
+  ],
   114: [
     { argIndex: 1, direction: "out", size: { type: "deref", argIndex: 2 } },
     { argIndex: 2, direction: "inout", size: { type: "fixed", size: 4 } },
@@ -813,6 +817,9 @@ export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
     { argIndex: 1, direction: "out", size: { type: "fixed", size: 4 } },
     { argIndex: 2, direction: "out", size: { type: "fixed", size: 4 } },
   ],
+  135: [
+    { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 0, multiplier: 4 }, copyRetvalLimit: false },
+  ],
   137: [
     { argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } },
   ],
@@ -844,9 +851,6 @@ export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {
   ],
   211: [
     { argIndex: 0, direction: "in", size: { type: "cstring" } },
-  ],
-  223: [
-    { argIndex: 1, direction: "inout", size: { type: "fixed", size: 16 } },
   ],
   224: [
     { argIndex: 1, direction: "out", size: { type: "fixed", size: 16 } },

@@ -1176,6 +1176,16 @@ fn deliver_pending_signals(proc: &mut Process, host: &mut WasmHostIO) {
                         DefaultAction::Terminate | DefaultAction::CoreDump => {
                             terminate_process_by_signal(proc, host, signum);
                         }
+                        DefaultAction::Stop => {
+                            proc.state = crate::process::ProcessState::Stopped;
+                            proc.stop_signal = signum & 0x7f;
+                        }
+                        DefaultAction::Continue => {
+                            if proc.state == crate::process::ProcessState::Stopped {
+                                proc.state = crate::process::ProcessState::Running;
+                                proc.stop_signal = 0;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1695,6 +1705,22 @@ pub extern "C" fn kernel_get_process_exit_status(pid: u32) -> i32 {
     }
 }
 
+/// Return process lifecycle state for host-side signal stop/continue handling.
+/// 0=running, 1=stopped, 2=exited, 3=limbo, negative errno if absent.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_process_state(pid: u32) -> i32 {
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    match table.get(pid) {
+        Some(proc) => match proc.state {
+            crate::process::ProcessState::Running => 0,
+            crate::process::ProcessState::Stopped => 1,
+            crate::process::ProcessState::Exited => 2,
+            crate::process::ProcessState::Limbo => 3,
+        },
+        None => -(Errno::ESRCH as i32),
+    }
+}
+
 /// Return the recorded parent pid for a process, or -ESRCH if absent.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_get_parent_pid(pid: u32) -> i32 {
@@ -1703,6 +1729,34 @@ pub extern "C" fn kernel_get_parent_pid(pid: u32) -> i32 {
         Some(parent_pid) => parent_pid as i32,
         None => -(Errno::ESRCH as i32),
     }
+}
+
+/// Apply child-side effects for a process that has just exited.
+///
+/// This covers Linux-compatible PR_SET_PDEATHSIG delivery and general orphan
+/// reparenting. Returns the number of parent-death signals queued/delivered,
+/// or a negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_handle_parent_exit(parent_pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    if !table.has_process(parent_pid) {
+        return -(Errno::ESRCH as i32);
+    }
+
+    let recipients = table.prepare_parent_exit(parent_pid);
+    let delivered = recipients.len() as i32;
+    let mut host = WasmHostIO;
+
+    for (child_pid, sig) in recipients {
+        if let Some(child) = table.get_mut(child_pid) {
+            if child.state == crate::process::ProcessState::Running && sig > 0 {
+                child.signals.raise(sig);
+                deliver_pending_signals(child, &mut host);
+            }
+        }
+    }
+
+    delivered
 }
 
 /// Mark a process as signal-terminated without removing it from the table.
@@ -1748,9 +1802,14 @@ pub extern "C" fn kernel_mark_process_exited(pid: u32, status: i32) -> i32 {
 /// zombie matches, 0 when a matching child is still running, or negative
 /// errno when no matching child exists.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_wait4_poll(parent_pid: u32, target_pid: i32, status_ptr: *mut i32) -> i32 {
+pub extern "C" fn kernel_wait4_poll(
+    parent_pid: u32,
+    target_pid: i32,
+    status_ptr: *mut i32,
+    options: u32,
+) -> i32 {
     let table = unsafe { &*PROCESS_TABLE.0.get() };
-    match table.poll_waitable_child(parent_pid, target_pid) {
+    match table.poll_waitable_child(parent_pid, target_pid, options) {
         Ok(Some((child_pid, wait_status))) => {
             if !status_ptr.is_null() {
                 unsafe {
@@ -1762,6 +1821,47 @@ pub extern "C" fn kernel_wait4_poll(parent_pid: u32, target_pid: i32, status_ptr
         Ok(None) => 0,
         Err(e) => -(e as i32),
     }
+}
+
+/// Queue SIGCHLD on a parent with child-specific siginfo.
+///
+/// POSIX sigwaitinfo()/sigtimedwait() report `si_code` as CLD_* and `si_pid`
+/// as the child process that changed state. A plain kill(parent, SIGCHLD)
+/// loses that metadata, so host-side process-exit notification uses this
+/// export instead of the generic signal path.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_queue_sigchld(parent_pid: u32, child_pid: u32) -> i32 {
+    const SIGCHLD: u32 = 17;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let Some(child) = table.get(child_pid) else {
+        return -(Errno::ECHILD as i32);
+    };
+    if child.ppid != parent_pid || child.state != crate::process::ProcessState::Exited {
+        return -(Errno::ECHILD as i32);
+    }
+    let wait_status = if child.exit_signal != 0 {
+        (child.exit_signal as i32) & 0x7f
+    } else {
+        (child.exit_status & 0xff) << 8
+    };
+    let si_code = if (wait_status & 0x7f) != 0 {
+        CLD_KILLED
+    } else {
+        CLD_EXITED
+    };
+
+    let Some(parent) = table.get_mut(parent_pid) else {
+        return -(Errno::ESRCH as i32);
+    };
+    parent
+        .signals
+        .raise_with_info(SIGCHLD, child_pid as i32, si_code);
+    let mut host = WasmHostIO;
+    deliver_pending_signals(parent, &mut host);
+    0
 }
 
 /// Reap an exited direct child after wait/waitid consumes it.
@@ -2177,7 +2277,12 @@ pub extern "C" fn kernel_dequeue_signal(pid: u32, out_ptr: *mut u8) -> i32 {
                 buf[12..16].copy_from_slice(&si_value.to_le_bytes());
                 buf[16..24].copy_from_slice(&old_mask.to_le_bytes());
                 buf[24..28].copy_from_slice(&si_code.to_le_bytes());
-                buf[28..32].copy_from_slice(&proc.pid.to_le_bytes());
+                let si_pid = if signum == 17 && si_value > 0 {
+                    si_value as u32
+                } else {
+                    proc.pid
+                };
+                buf[28..32].copy_from_slice(&si_pid.to_le_bytes());
                 buf[32..36].copy_from_slice(&proc.uid.to_le_bytes());
                 if switch_to_alt_stack {
                     buf[36..40].copy_from_slice(&(proc.alt_stack_sp as u32).to_le_bytes());
@@ -2190,11 +2295,21 @@ pub extern "C" fn kernel_dequeue_signal(pid: u32, out_ptr: *mut u8) -> i32 {
             SignalHandler::Default => {
                 use crate::signal::{DefaultAction, default_action};
                 let _ = dequeue_signal_for(proc, tid, signum);
-                match default_action(signum) {
+                    match default_action(signum) {
                     DefaultAction::Terminate | DefaultAction::CoreDump => {
                         let mut host = WasmHostIO;
                         terminate_process_by_signal(proc, &mut host, signum);
                         return 0;
+                    }
+                    DefaultAction::Stop => {
+                        proc.state = crate::process::ProcessState::Stopped;
+                        proc.stop_signal = signum & 0x7f;
+                    }
+                    DefaultAction::Continue => {
+                        if proc.state == crate::process::ProcessState::Stopped {
+                            proc.state = crate::process::ProcessState::Running;
+                            proc.stop_signal = 0;
+                        }
                     }
                     _ => continue,
                 }
@@ -2914,6 +3029,10 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
                 }
                 let sec = i64::from_le_bytes(sec_bytes);
                 let nsec = i64::from_le_bytes(nsec_bytes);
+                if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                    deliver_pending_signals(proc, &mut host);
+                    return -(Errno::EINVAL as i32);
+                }
                 (sec * 1000 + nsec / 1_000_000) as i32
             } else {
                 -1 // NULL timeout = wait indefinitely
@@ -2927,7 +3046,12 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
                         //   si_pid(12), si_uid(16), si_value(20)
                         let sig_bytes = (sig as i32).to_le_bytes();
                         let code_bytes = si_code.to_le_bytes();
-                        let pid_bytes = proc.pid.to_le_bytes();
+                        let si_pid = if sig == 17 && si_value > 0 {
+                            si_value as u32
+                        } else {
+                            proc.pid
+                        };
+                        let pid_bytes = si_pid.to_le_bytes();
                         let uid_bytes = proc.uid.to_le_bytes();
                         let val_bytes = si_value.to_le_bytes();
                         unsafe {
@@ -3330,6 +3454,14 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
 
         // prctl
         223 => kernel_prctl(a1 as u32, a2 as u32, a3 as *mut u8, a4 as u32), // SYS_PRCTL
+        289 => {
+            // SYS_UNSHARE
+            let (_gkl, proc) = unsafe { get_process() };
+            match syscalls::sys_unshare(proc, a1 as u32) {
+                Ok(()) => 0,
+                Err(e) => -(e as i32),
+            }
+        }
 
         // pathconf
         112 => {
@@ -3411,6 +3543,23 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
             let ipc = unsafe { crate::ipc::global_ipc_table() };
             let (pid, uid, gid) = current_pid_eids();
             let cmd = a2 & !0x100; // strip IPC_64
+            if cmd == 1 {
+                // IPC_SET: userspace supplies struct msqid_ds. Only
+                // msg_perm.uid/gid/mode and msg_qbytes are mutable; the rest
+                // of the structure is kernel-owned accounting data.
+                if a3 == 0 {
+                    return -(Errno::EFAULT as i32);
+                }
+                let input = a3 as *const u8;
+                let new_uid = unsafe { read_u32_le(input, 4) };
+                let new_gid = unsafe { read_u32_le(input, 8) };
+                let new_mode = unsafe { read_u32_le(input, 20) };
+                let new_qbytes = unsafe { read_u32_le(input, 72) };
+                return match ipc.msgctl_set(a1, new_uid, new_gid, new_mode, new_qbytes, uid, gid) {
+                    Ok(()) => 0,
+                    Err(e) => -(e as i32),
+                };
+            }
             match ipc.msgctl(a1, cmd, pid, uid, gid) {
                 Ok(Some(info)) => {
                     if a3 != 0 {
@@ -3682,18 +3831,36 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
         282 | 283 => 0, // mlockall, munlockall: success
         // SYS_GETPRIORITY
         285 => {
-            let (_gkl, proc) = unsafe { get_process() };
-            match syscalls::sys_getpriority(proc, a1, a2 as u32) {
-                Ok(v) => v,
-                Err(e) => -(e as i32),
+            if crate::is_centralized_mode() {
+                let table = unsafe { &*PROCESS_TABLE.0.get() };
+                let caller_pid = table.current_pid();
+                match table.getpriority(caller_pid, a1, a2 as u32) {
+                    Ok(v) => v,
+                    Err(e) => -(e as i32),
+                }
+            } else {
+                let (_gkl, proc) = unsafe { get_process() };
+                match syscalls::sys_getpriority(proc, a1, a2 as u32) {
+                    Ok(v) => v,
+                    Err(e) => -(e as i32),
+                }
             }
         }
         286 => {
             // SYS_SETPRIORITY
-            let (_gkl, proc) = unsafe { get_process() };
-            match syscalls::sys_setpriority(proc, a1, a2 as u32, a3) {
-                Ok(()) => 0,
-                Err(e) => -(e as i32),
+            if crate::is_centralized_mode() {
+                let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+                let caller_pid = table.current_pid();
+                match table.setpriority(caller_pid, a1, a2 as u32, a3) {
+                    Ok(()) => 0,
+                    Err(e) => -(e as i32),
+                }
+            } else {
+                let (_gkl, proc) = unsafe { get_process() };
+                match syscalls::sys_setpriority(proc, a1, a2 as u32, a3) {
+                    Ok(()) => 0,
+                    Err(e) => -(e as i32),
+                }
             }
         }
 
@@ -3984,8 +4151,9 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
         249 => 0, // SYS_INOTIFY_RM_WATCH: no-op success
 
         // --- mknod/mknodat: create regular files and FIFOs ---
-        // S_IFIFO nodes are created as regular files (sufficient for basic
-        // mkfifo/mknod tests that don't actually use FIFO I/O semantics).
+        // The host VFS stores FIFO nodes as empty backing files with a virtual
+        // S_IFIFO mode overlay. That preserves POSIX stat/filetype semantics
+        // without exposing host named pipes outside the Kandelo sandbox.
         271 => {
             // SYS_MKNOD: (path, mode, dev)
             let path = a1 as *const u8;
@@ -3994,7 +4162,7 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
             if file_type != 0 && file_type != 0o100000 && file_type != 0o010000 {
                 -(Errno::EPERM as i32)
             } else {
-                kernel_mknod(path, unsafe { cstr_len(path) }, mode & 0o7777)
+                kernel_mknod(path, unsafe { cstr_len(path) }, mode)
             }
         }
         272 => {
@@ -4005,7 +4173,7 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
             if file_type != 0 && file_type != 0o100000 && file_type != 0o010000 {
                 -(Errno::EPERM as i32)
             } else {
-                kernel_mknodat(a1, path, unsafe { cstr_len(path) }, mode & 0o7777)
+                kernel_mknodat(a1, path, unsafe { cstr_len(path) }, mode)
             }
         }
 
@@ -4318,7 +4486,6 @@ fn dispatch_channel_syscall(nr: u32, args: &[i64; 6]) -> i32 {
         253..=254
         | 262
         | 265..=268
-        | 289
         | 292
         | 301..=303
         | 305
@@ -4457,6 +4624,15 @@ unsafe fn write_ipc_perm(
     for i in 28..36 {
         *out.add(i) = 0;
     }
+}
+
+unsafe fn read_u32_le(ptr: *const u8, off: usize) -> u32 {
+    u32::from_le_bytes([
+        *ptr.add(off),
+        *ptr.add(off + 1),
+        *ptr.add(off + 2),
+        *ptr.add(off + 3),
+    ])
 }
 
 /// Write i64 as two i32 halves (little-endian) at offset.
@@ -4711,16 +4887,24 @@ pub extern "C" fn kernel_open(path_ptr: *const u8, path_len: u32, flags: u32, mo
     result
 }
 
-/// mknod — create a regular file node.
-/// Only supports S_IFREG (regular files). Creates an empty file via open+close.
+/// mknod — create a regular file or FIFO node.
 fn kernel_mknod(path_ptr: *const u8, path_len: u32, mode: u32) -> i32 {
     use wasm_posix_shared::flags::{O_CREAT, O_EXCL, O_WRONLY};
+    use wasm_posix_shared::mode::{S_IFIFO, S_IFMT};
     let (_gkl, proc) = unsafe { get_process() };
     let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
     let mut host = WasmHostIO;
     let flags = O_CREAT | O_EXCL | O_WRONLY;
-    match syscalls::sys_open(proc, &mut host, path, flags, mode) {
+    let perms = mode & 0o7777;
+    let file_type = mode & S_IFMT;
+    match syscalls::sys_open(proc, &mut host, path, flags, perms) {
         Ok(fd) => {
+            if file_type == S_IFIFO {
+                if let Err(e) = syscalls::sys_fchmod(proc, &mut host, fd, S_IFIFO | perms) {
+                    let _ = syscalls::sys_close(proc, &mut host, fd);
+                    return -(e as i32);
+                }
+            }
             let _ = syscalls::sys_close(proc, &mut host, fd);
             0
         }
@@ -4728,15 +4912,24 @@ fn kernel_mknod(path_ptr: *const u8, path_len: u32, mode: u32) -> i32 {
     }
 }
 
-/// mknodat — create a regular file node relative to directory fd.
+/// mknodat — create a regular file or FIFO node relative to directory fd.
 fn kernel_mknodat(dirfd: i32, path_ptr: *const u8, path_len: u32, mode: u32) -> i32 {
     use wasm_posix_shared::flags::{O_CREAT, O_EXCL, O_WRONLY};
+    use wasm_posix_shared::mode::{S_IFIFO, S_IFMT};
     let (_gkl, proc) = unsafe { get_process() };
     let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
     let mut host = WasmHostIO;
     let flags = O_CREAT | O_EXCL | O_WRONLY;
-    match syscalls::sys_openat(proc, &mut host, dirfd, path, flags, mode) {
+    let perms = mode & 0o7777;
+    let file_type = mode & S_IFMT;
+    match syscalls::sys_openat(proc, &mut host, dirfd, path, flags, perms) {
         Ok(fd) => {
+            if file_type == S_IFIFO {
+                if let Err(e) = syscalls::sys_fchmod(proc, &mut host, fd, S_IFIFO | perms) {
+                    let _ = syscalls::sys_close(proc, &mut host, fd);
+                    return -(e as i32);
+                }
+            }
             let _ = syscalls::sys_close(proc, &mut host, fd);
             0
         }
@@ -5690,7 +5883,7 @@ fn kernel_kill_with_value(pid: i32, sig: u32, si_value: i32) -> i32 {
                     -(Errno::EPERM as i32)
                 } else {
                     if sig > 0 {
-                        target.signals.raise_with_value(sig, si_value);
+                        target.signals.raise_with_info(sig, si_value, -1);
                         deliver_pending_signals(target, &mut host);
                     }
                     0
@@ -5729,7 +5922,7 @@ fn kernel_kill_with_value(pid: i32, sig: u32, si_value: i32) -> i32 {
                 }
                 delivered = true;
                 if sig > 0 {
-                    target.signals.raise_with_value(sig, si_value);
+                    target.signals.raise_with_info(sig, si_value, -1);
                     deliver_pending_signals(target, &mut host);
                 }
             }
@@ -5749,7 +5942,7 @@ fn kernel_kill_with_value(pid: i32, sig: u32, si_value: i32) -> i32 {
     // Local or traditional mode: use sys_kill (which uses raise, not raise_with_value)
     // For local sigqueue, raise with value on the current process directly
     if si_value != 0 && sig > 0 {
-        proc.signals.raise_with_value(sig, si_value);
+        proc.signals.raise_with_info(sig, si_value, -1);
         deliver_pending_signals(proc, &mut host);
         return 0;
     }
@@ -5926,7 +6119,7 @@ fn kernel_tkill_with_value(tid: u32, sig: u32, si_value: i32, si_code: i32) -> i
     if proc.is_main_thread(tid) {
         if sig > 0 {
             if si_code != 0 || si_value != 0 {
-                proc.signals.raise_with_value(sig, si_value);
+                proc.signals.raise_with_info(sig, si_value, si_code);
             } else {
                 proc.signals.raise(sig);
             }
@@ -5948,7 +6141,7 @@ fn kernel_tkill_with_value(tid: u32, sig: u32, si_value: i32, si_code: i32) -> i
         Some(t) => {
             if sig > 0 {
                 if si_code != 0 || si_value != 0 {
-                    t.signals.raise_with_value(sig, si_value);
+                    t.signals.raise_with_info(sig, si_value, si_code);
                 } else {
                     t.signals.raise(sig);
                 }
@@ -5959,7 +6152,7 @@ fn kernel_tkill_with_value(tid: u32, sig: u32, si_value: i32, si_code: i32) -> i
         None => {
             if sig > 0 {
                 if si_code != 0 || si_value != 0 {
-                    proc.signals.raise_with_value(sig, si_value);
+                    proc.signals.raise_with_info(sig, si_value, si_code);
                 } else {
                     proc.signals.raise(sig);
                 }
@@ -6480,8 +6673,56 @@ fn extract_scm_rights(
     result
 }
 
+fn extract_ipv6_tclass(control_ptr: usize, control_len: usize) -> Option<u32> {
+    if control_ptr == 0 || control_len == 0 {
+        return None;
+    }
+    let control = unsafe { slice::from_raw_parts(control_ptr as *const u8, control_len) };
+    let mut offset = 0usize;
+    while offset + 12 <= control_len {
+        let cmsg_len = u32::from_le_bytes([
+            control[offset],
+            control[offset + 1],
+            control[offset + 2],
+            control[offset + 3],
+        ]) as usize;
+        let cmsg_level = u32::from_le_bytes([
+            control[offset + 4],
+            control[offset + 5],
+            control[offset + 6],
+            control[offset + 7],
+        ]);
+        let cmsg_type = u32::from_le_bytes([
+            control[offset + 8],
+            control[offset + 9],
+            control[offset + 10],
+            control[offset + 11],
+        ]);
+        if cmsg_len < 12 || offset + cmsg_len > control_len {
+            break;
+        }
+        if cmsg_level == wasm_posix_shared::socket::IPPROTO_IPV6
+            && cmsg_type == wasm_posix_shared::socket::IPV6_TCLASS
+            && cmsg_len >= 16
+        {
+            return Some(u32::from_le_bytes([
+                control[offset + 12],
+                control[offset + 13],
+                control[offset + 14],
+                control[offset + 15],
+            ]));
+        }
+        offset += (cmsg_len + 3) & !3;
+    }
+    None
+}
+
 /// sendmsg — send a message on a socket.
-/// Parses msghdr to extract iov[0] and delegates to sys_sendmsg.
+/// Parses msghdr iovec arrays and delegates to sys_sendmsg/sys_sendto.
+///
+/// POSIX sendmsg() treats msg_iov as a scatter/gather vector. The kernel
+/// receives one logical message consisting of the concatenation of every iov
+/// entry (for datagram sockets, a single datagram), not just iov[0].
 /// Handles SCM_RIGHTS ancillary data by serializing FDs into the pipe's ancillary queue.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sendmsg(fd: i32, msg_ptr: *const u8, flags: u32) -> i32 {
@@ -6498,30 +6739,67 @@ pub extern "C" fn kernel_sendmsg(fd: i32, msg_ptr: *const u8, flags: u32) -> i32
     let control_ptr = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) as usize;
     let control_len = u32::from_le_bytes([msg[20], msg[21], msg[22], msg[23]]) as usize;
 
+    const SENDMSG_SUPPORTED_FLAGS: u32 =
+        wasm_posix_shared::socket::MSG_OOB
+            | wasm_posix_shared::socket::MSG_DONTWAIT
+            | wasm_posix_shared::socket::MSG_NOSIGNAL;
+    if flags & !SENDMSG_SUPPORTED_FLAGS != 0 {
+        deliver_pending_signals(proc, &mut host);
+        return -(Errno::EINVAL as i32);
+    }
+
     if iov_len == 0 {
         deliver_pending_signals(proc, &mut host);
         return 0;
     }
+    if iov_len > 1024 {
+        return -(Errno::EINVAL as i32);
+    }
 
     // Extract SCM_RIGHTS ancillary FDs before sending data
-    let ancillary_fds = extract_scm_rights(proc, control_ptr, control_len);
+    let mut ancillary_fds = extract_scm_rights(proc, control_ptr, control_len);
+    let ipv6_tclass = extract_ipv6_tclass(control_ptr, control_len);
 
-    // Parse first iovec: iov_base at offset 0, iov_len at offset 4
-    let iov = unsafe { slice::from_raw_parts(iov_ptr as *const u8, 8) };
-    let base = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
-    let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
-
-    let buf = unsafe { slice::from_raw_parts(base as *const u8, len) };
+    let mut total_len = 0usize;
+    for i in 0..iov_len as usize {
+        let iov = unsafe { slice::from_raw_parts((iov_ptr + i * 8) as *const u8, 8) };
+        let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+        total_len = match total_len.checked_add(len) {
+            Some(n) => n,
+            None => return -(Errno::EINVAL as i32),
+        };
+    }
+    let mut data = Vec::with_capacity(total_len);
+    for i in 0..iov_len as usize {
+        let iov = unsafe { slice::from_raw_parts((iov_ptr + i * 8) as *const u8, 8) };
+        let base = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
+        let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+        if len == 0 {
+            continue;
+        }
+        let chunk = unsafe { slice::from_raw_parts(base as *const u8, len) };
+        data.extend_from_slice(chunk);
+    }
 
     // If msg_name is set, use sendto with the destination address
     let result = if name_ptr != 0 && name_len > 0 {
         let addr = unsafe { slice::from_raw_parts(name_ptr as *const u8, name_len) };
-        match syscalls::sys_sendto(proc, &mut host, fd, buf, flags, addr) {
+        let send_ancillary = core::mem::take(&mut ancillary_fds);
+        match syscalls::sys_sendto_with_ancillary_and_ipv6_tclass(
+            proc,
+            &mut host,
+            fd,
+            &data,
+            flags,
+            addr,
+            send_ancillary,
+            ipv6_tclass,
+        ) {
             Ok(n) => n as i32,
             Err(e) => -(e as i32),
         }
     } else {
-        match syscalls::sys_sendmsg(proc, &mut host, fd, buf, flags) {
+        match syscalls::sys_sendmsg(proc, &mut host, fd, &data, flags) {
             Ok(n) => n as i32,
             Err(e) => -(e as i32),
         }
@@ -6702,7 +6980,9 @@ fn install_scm_rights_fds(
 }
 
 /// recvmsg — receive a message from a socket.
-/// Parses msghdr to extract iov[0]. For DGRAM sockets, uses recvfrom to fill msg_name.
+/// Parses msghdr iovec arrays. For DGRAM sockets, uses recvfrom to fill msg_name.
+/// Data is received into a contiguous temporary buffer and scattered across
+/// all iov entries in order, matching POSIX readv/recvmsg semantics.
 /// Delivers SCM_RIGHTS ancillary data by installing FDs in the receiver's process.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_recvmsg(fd: i32, msg_ptr: *mut u8, flags: u32) -> i32 {
@@ -6719,23 +6999,55 @@ pub extern "C" fn kernel_recvmsg(fd: i32, msg_ptr: *mut u8, flags: u32) -> i32 {
     let control_ptr = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) as usize;
     let control_len = u32::from_le_bytes([msg[20], msg[21], msg[22], msg[23]]) as usize;
 
+    const MSG_CMSG_CLOEXEC: u32 = 0x40000000;
+    const RECVMSG_SUPPORTED_FLAGS: u32 =
+        wasm_posix_shared::socket::MSG_OOB
+            | wasm_posix_shared::socket::MSG_PEEK
+            | wasm_posix_shared::socket::MSG_DONTWAIT
+            | MSG_CMSG_CLOEXEC;
+    if flags & !RECVMSG_SUPPORTED_FLAGS != 0 {
+        deliver_pending_signals(proc, &mut host);
+        return -(Errno::EINVAL as i32);
+    }
+
     if iov_len == 0 {
         deliver_pending_signals(proc, &mut host);
         return 0;
     }
+    if iov_len > 1024 {
+        return -(Errno::EINVAL as i32);
+    }
 
-    // Parse first iovec
-    let iov = unsafe { slice::from_raw_parts(iov_ptr as *const u8, 8) };
-    let base = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
-    let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+    let mut total_len = 0usize;
+    for i in 0..iov_len as usize {
+        let iov = unsafe { slice::from_raw_parts((iov_ptr + i * 8) as *const u8, 8) };
+        let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+        total_len = match total_len.checked_add(len) {
+            Some(n) => n,
+            None => return -(Errno::EINVAL as i32),
+        };
+    }
+    let mut data = alloc::vec![0u8; total_len];
 
-    let buf = unsafe { slice::from_raw_parts_mut(base as *mut u8, len) };
+    let mut recv_ancillary_fds: Vec<crate::pipe::InFlightFd> = Vec::new();
+    let mut recv_credentials: Option<(u32, u32, u32)> = None;
+    let mut recv_ipv6_meta: Option<([u8; 16], u32)> = None;
 
     // Use recvfrom if msg_name is provided (to fill source address)
     let result = if name_ptr != 0 && name_len > 0 {
         let addr_buf = unsafe { slice::from_raw_parts_mut(name_ptr as *mut u8, name_len) };
-        match syscalls::sys_recvfrom(proc, &mut host, fd, buf, flags, addr_buf) {
-            Ok((data_len, addr_written)) => {
+        match syscalls::sys_recvfrom_with_ancillary(
+            proc,
+            &mut host,
+            fd,
+            &mut data,
+            flags,
+            addr_buf,
+        ) {
+            Ok((data_len, addr_written, ancillary_fds, credentials, ipv6_meta)) => {
+                recv_ancillary_fds = ancillary_fds;
+                recv_credentials = credentials;
+                recv_ipv6_meta = ipv6_meta;
                 // Update msg_namelen with actual address length
                 let msg_mut = unsafe { slice::from_raw_parts_mut(msg_ptr, 28) };
                 msg_mut[4..8].copy_from_slice(&(addr_written as u32).to_le_bytes());
@@ -6744,17 +7056,194 @@ pub extern "C" fn kernel_recvmsg(fd: i32, msg_ptr: *mut u8, flags: u32) -> i32 {
             Err(e) => -(e as i32),
         }
     } else {
-        match syscalls::sys_recvmsg(proc, &mut host, fd, buf, flags) {
+        match syscalls::sys_recvmsg(proc, &mut host, fd, &mut data, flags) {
             Ok(n) => n as i32,
             Err(e) => -(e as i32),
         }
     };
 
-    // Check for SCM_RIGHTS ancillary data on the recv pipe.
+    if result > 0 {
+        let mut copied = 0usize;
+        let received = result as usize;
+        for i in 0..iov_len as usize {
+            if copied >= received {
+                break;
+            }
+            let iov = unsafe { slice::from_raw_parts((iov_ptr + i * 8) as *const u8, 8) };
+            let base = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
+            let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+            let n = len.min(received - copied);
+            if n > 0 {
+                let dst = unsafe { slice::from_raw_parts_mut(base as *mut u8, n) };
+                dst.copy_from_slice(&data[copied..copied + n]);
+                copied += n;
+            }
+        }
+    }
+
+    let mut ancillary_delivered = false;
+    if result > 0 && !recv_ancillary_fds.is_empty() {
+        let new_fds = install_scm_rights_fds(proc, recv_ancillary_fds);
+        if control_ptr != 0 && control_len > 0 && !new_fds.is_empty() {
+            let cmsg_data_len = new_fds.len() * 4;
+            let cmsg_len = 12 + cmsg_data_len; // cmsghdr + FD data
+            let cmsg_space = (cmsg_len + 3) & !3; // aligned
+            if cmsg_space <= control_len {
+                let ctrl = unsafe { slice::from_raw_parts_mut(control_ptr as *mut u8, control_len) };
+                ctrl[0..4].copy_from_slice(&(cmsg_len as u32).to_le_bytes());
+                ctrl[4..8].copy_from_slice(&1u32.to_le_bytes()); // SOL_SOCKET
+                ctrl[8..12].copy_from_slice(&1u32.to_le_bytes()); // SCM_RIGHTS
+                for (i, &new_fd) in new_fds.iter().enumerate() {
+                    let off = 12 + i * 4;
+                    ctrl[off..off + 4].copy_from_slice(&new_fd.to_le_bytes());
+                }
+                let msg_mut = unsafe { slice::from_raw_parts_mut(msg_ptr, 28) };
+                msg_mut[20..24].copy_from_slice(&(cmsg_space as u32).to_le_bytes());
+                ancillary_delivered = true;
+            }
+        }
+    }
+
+    if result > 0 && !ancillary_delivered {
+        let wants_credentials = {
+            let fd_entry = proc.fd_table.get(fd);
+            if let Ok(fd_entry) = fd_entry {
+                if let Some(ofd) = proc.ofd_table.get(fd_entry.ofd_ref.0) {
+                    if ofd.file_type == crate::ofd::FileType::Socket {
+                        let sock_idx = (-(ofd.host_handle + 1)) as usize;
+                        proc.sockets
+                            .get(sock_idx)
+                            .and_then(|sock| {
+                                sock.get_option(
+                                    wasm_posix_shared::socket::SOL_SOCKET,
+                                    wasm_posix_shared::socket::SO_PASSCRED,
+                                )
+                            })
+                            .unwrap_or(0)
+                            != 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if wants_credentials {
+            let (pid, uid, gid) =
+                recv_credentials.unwrap_or((proc.pid, proc.uid, proc.gid));
+            let cmsg_data_len = 12usize; // struct ucred { pid_t, uid_t, gid_t }
+            let cmsg_len = 12 + cmsg_data_len;
+            let cmsg_space = (cmsg_len + 3) & !3;
+            if control_ptr != 0 && control_len > 0 && cmsg_space <= control_len {
+                let ctrl = unsafe { slice::from_raw_parts_mut(control_ptr as *mut u8, control_len) };
+                ctrl[0..4].copy_from_slice(&(cmsg_len as u32).to_le_bytes());
+                ctrl[4..8].copy_from_slice(
+                    &wasm_posix_shared::socket::SOL_SOCKET.to_le_bytes(),
+                );
+                ctrl[8..12].copy_from_slice(
+                    &wasm_posix_shared::socket::SCM_CREDENTIALS.to_le_bytes(),
+                );
+                ctrl[12..16].copy_from_slice(&(pid as i32).to_le_bytes());
+                ctrl[16..20].copy_from_slice(&uid.to_le_bytes());
+                ctrl[20..24].copy_from_slice(&gid.to_le_bytes());
+                let msg_mut = unsafe { slice::from_raw_parts_mut(msg_ptr, 28) };
+                msg_mut[20..24].copy_from_slice(&(cmsg_space as u32).to_le_bytes());
+                ancillary_delivered = true;
+            }
+        }
+    }
+
+    if result > 0 && !ancillary_delivered {
+        if let Some((dst_addr6, tclass)) = recv_ipv6_meta {
+            let (wants_pktinfo, wants_tclass) = {
+                let fd_entry = proc.fd_table.get(fd);
+                if let Ok(fd_entry) = fd_entry {
+                    if let Some(ofd) = proc.ofd_table.get(fd_entry.ofd_ref.0) {
+                        if ofd.file_type == crate::ofd::FileType::Socket {
+                            let sock_idx = (-(ofd.host_handle + 1)) as usize;
+                            if let Some(sock) = proc.sockets.get(sock_idx) {
+                                (
+                                    sock.get_option(
+                                        wasm_posix_shared::socket::IPPROTO_IPV6,
+                                        wasm_posix_shared::socket::IPV6_RECVPKTINFO,
+                                    )
+                                    .unwrap_or(0)
+                                        != 0,
+                                    sock.get_option(
+                                        wasm_posix_shared::socket::IPPROTO_IPV6,
+                                        wasm_posix_shared::socket::IPV6_RECVTCLASS,
+                                    )
+                                    .unwrap_or(0)
+                                        != 0,
+                                )
+                            } else {
+                                (false, false)
+                            }
+                        } else {
+                            (false, false)
+                        }
+                    } else {
+                        (false, false)
+                    }
+                } else {
+                    (false, false)
+                }
+            };
+
+            if control_ptr != 0 && control_len > 0 && (wants_pktinfo || wants_tclass) {
+                let ctrl = unsafe { slice::from_raw_parts_mut(control_ptr as *mut u8, control_len) };
+                let mut offset = 0usize;
+
+                if wants_pktinfo {
+                    let cmsg_len = 32usize; // cmsghdr + struct in6_pktinfo
+                    if offset + cmsg_len <= control_len {
+                        ctrl[offset..offset + 4].copy_from_slice(&(cmsg_len as u32).to_le_bytes());
+                        ctrl[offset + 4..offset + 8].copy_from_slice(
+                            &wasm_posix_shared::socket::IPPROTO_IPV6.to_le_bytes(),
+                        );
+                        ctrl[offset + 8..offset + 12].copy_from_slice(
+                            &wasm_posix_shared::socket::IPV6_PKTINFO.to_le_bytes(),
+                        );
+                        ctrl[offset + 12..offset + 28].copy_from_slice(&dst_addr6);
+                        ctrl[offset + 28..offset + 32].copy_from_slice(&1u32.to_le_bytes());
+                        offset += (cmsg_len + 3) & !3;
+                    }
+                }
+
+                if wants_tclass {
+                    let cmsg_len = 16usize; // cmsghdr + int traffic class
+                    if offset + cmsg_len <= control_len {
+                        ctrl[offset..offset + 4].copy_from_slice(&(cmsg_len as u32).to_le_bytes());
+                        ctrl[offset + 4..offset + 8].copy_from_slice(
+                            &wasm_posix_shared::socket::IPPROTO_IPV6.to_le_bytes(),
+                        );
+                        ctrl[offset + 8..offset + 12].copy_from_slice(
+                            &wasm_posix_shared::socket::IPV6_TCLASS.to_le_bytes(),
+                        );
+                        ctrl[offset + 12..offset + 16].copy_from_slice(&tclass.to_le_bytes());
+                        offset += (cmsg_len + 3) & !3;
+                    }
+                }
+
+                if offset > 0 {
+                    let msg_mut = unsafe { slice::from_raw_parts_mut(msg_ptr, 28) };
+                    msg_mut[20..24].copy_from_slice(&(offset as u32).to_le_bytes());
+                    ancillary_delivered = true;
+                }
+            }
+        }
+    }
+
+    // Check for SCM_RIGHTS ancillary data on the recv pipe. This covers
+    // stream/socketpair delivery; datagram ancillary data is carried on the
+    // Datagram itself and handled above.
     // Pop ancillary data in a limited scope to avoid holding &mut pipe across
     // install_scm_rights_fds (which modifies proc).
-    let mut ancillary_delivered = false;
-    if result > 0 {
+    if result > 0 && !ancillary_delivered {
         let popped = 'pop: {
             let (recv_idx, use_global) = {
                 let fd_entry = match proc.fd_table.get(fd) {
@@ -7653,6 +8142,70 @@ pub extern "C" fn kernel_getsockopt(
         return result;
     }
 
+    // Handle struct linger (SO_LINGER).
+    if level == SOL_SOCKET && optname == SO_LINGER {
+        let result = match syscalls::sys_getsockopt_linger(proc, fd) {
+            Ok((l_onoff, l_linger)) => {
+                let avail = if !optlen_ptr.is_null() {
+                    unsafe { *optlen_ptr as usize }
+                } else {
+                    8
+                };
+                let write_len = avail.min(8);
+                let mut tmp = [0u8; 8];
+                tmp[0..4].copy_from_slice(&l_onoff.to_le_bytes());
+                tmp[4..8].copy_from_slice(&l_linger.to_le_bytes());
+                if write_len > 0 {
+                    let out = unsafe { slice::from_raw_parts_mut(optval_ptr, write_len) };
+                    out.copy_from_slice(&tmp[..write_len]);
+                }
+                if !optlen_ptr.is_null() {
+                    unsafe {
+                        *optlen_ptr = 8;
+                    }
+                }
+                0
+            }
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
+    // Handle string-valued TCP_CONGESTION. Linux returns a NUL-terminated
+    // algorithm name in the caller's buffer.
+    if level == IPPROTO_TCP && optname == TCP_CONGESTION {
+        let result = match syscalls::sys_getsockopt_tcp_congestion(proc, fd) {
+            Ok(name) => {
+                let avail = if !optlen_ptr.is_null() {
+                    unsafe { *optlen_ptr as usize }
+                } else {
+                    name.len() + 1
+                };
+                let write_len = avail.min(name.len() + 1);
+                if write_len > 0 {
+                    let out = unsafe { slice::from_raw_parts_mut(optval_ptr, write_len) };
+                    let name_copy = write_len.min(name.len());
+                    out[..name_copy].copy_from_slice(&name[..name_copy]);
+                    if write_len > name_copy {
+                        out[name_copy] = 0;
+                    }
+                }
+                if !optlen_ptr.is_null() {
+                    unsafe {
+                        *optlen_ptr = (name.len() + 1) as u32;
+                    }
+                }
+                0
+            }
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
     // Handle struct timeval options (SO_RCVTIMEO, SO_SNDTIMEO)
     if level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
         let result = match syscalls::sys_getsockopt_timeout(proc, fd, optname) {
@@ -7728,6 +8281,77 @@ pub extern "C" fn kernel_setsockopt(
         }
         let timeout_us = (tv_sec as u64) * 1_000_000 + (tv_usec as u64);
         let result = match syscalls::sys_setsockopt_timeout(proc, fd, optname, timeout_us) {
+            Ok(()) => 0,
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
+    // Handle struct linger (SO_LINGER).
+    if level == SOL_SOCKET && optname == SO_LINGER {
+        if optval_ptr.is_null() || optlen < 8 {
+            let mut host = WasmHostIO;
+            deliver_pending_signals(proc, &mut host);
+            return -(Errno::EINVAL as i32);
+        }
+        let buf = unsafe { slice::from_raw_parts(optval_ptr, 8) };
+        let l_onoff = i32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let l_linger = i32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let result = match syscalls::sys_setsockopt_linger(proc, fd, l_onoff, l_linger) {
+            Ok(()) => 0,
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
+    // Handle string-valued SO_BINDTODEVICE.
+    if level == SOL_SOCKET && optname == SO_BINDTODEVICE {
+        if optval_ptr.is_null() {
+            let mut host = WasmHostIO;
+            deliver_pending_signals(proc, &mut host);
+            return -(Errno::EFAULT as i32);
+        }
+        let buf = unsafe { slice::from_raw_parts(optval_ptr, optlen as usize) };
+        let result = match syscalls::sys_setsockopt_bindtodevice(proc, fd, buf) {
+            Ok(()) => 0,
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
+    // Handle string-valued TCP_CONGESTION.
+    if level == IPPROTO_TCP && optname == TCP_CONGESTION {
+        if optval_ptr.is_null() {
+            let mut host = WasmHostIO;
+            deliver_pending_signals(proc, &mut host);
+            return -(Errno::EFAULT as i32);
+        }
+        let buf = unsafe { slice::from_raw_parts(optval_ptr, optlen as usize) };
+        let result = match syscalls::sys_setsockopt_tcp_congestion(proc, fd, buf) {
+            Ok(()) => 0,
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
+    // Handle sticky IPV6_PKTINFO (struct in6_pktinfo). The kernel stores only
+    // the fact that it is enabled; per-message packet info for recvmsg() is
+    // produced from virtual routing metadata.
+    if level == IPPROTO_IPV6 && optname == IPV6_PKTINFO {
+        if optval_ptr.is_null() || optlen < 20 {
+            let mut host = WasmHostIO;
+            deliver_pending_signals(proc, &mut host);
+            return -(Errno::EINVAL as i32);
+        }
+        let result = match syscalls::sys_setsockopt(proc, fd, level, optname, 1) {
             Ok(()) => 0,
             Err(e) => -(e as i32),
         };
@@ -8047,16 +8671,23 @@ pub extern "C" fn kernel_ioctl(fd: i32, request: u32, buf_ptr: *mut u8, buf_len:
 }
 
 /// prctl — process control. Returns 0 on success, or negative errno.
-/// buf_ptr is used for PR_SET_NAME (read name from buf) and PR_GET_NAME (write name to buf).
+/// arg2 is the operation-specific user pointer/value:
+/// - PR_SET_NAME/PR_GET_NAME: 16-byte name buffer pointer
+/// - PR_GET_PDEATHSIG: u32 output pointer
+/// - PR_SET_PDEATHSIG: signal number value
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_prctl(option: u32, arg2: u32, _arg3: *mut u8, _arg4: u32) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
-    // For PR_SET_NAME (15) and PR_GET_NAME (16), arg2 is the pointer to
-    // a 16-byte name buffer.  The other prctl args are option-specific and
-    // may be garbage for options that don't use them.
+    const PR_GET_PDEATHSIG: u32 = 2;
     const PR_SET_NAME: u32 = 15;
     const PR_GET_NAME: u32 = 16;
-    let buf = if (option == PR_SET_NAME || option == PR_GET_NAME) && arg2 != 0 {
+    let buf = if option == PR_GET_PDEATHSIG {
+        if arg2 == 0 {
+            &mut []
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, 4) }
+        }
+    } else if (option == PR_SET_NAME || option == PR_GET_NAME) && arg2 != 0 {
         unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, 16) }
     } else {
         &mut []
@@ -9153,8 +9784,10 @@ pub extern "C" fn kernel_getitimer(which: u32, curr_ptr: *mut u8) -> i32 {
 // POSIX timers (timer_create / timer_settime / timer_gettime / etc.)
 // ---------------------------------------------------------------------------
 
-/// SIGEV_SIGNAL = 0, SIGEV_NONE = 1.
+/// POSIX/Linux sigevent notification modes.
 const SIGEV_SIGNAL: u32 = 0;
+const SIGEV_NONE: u32 = 1;
+const SIGEV_THREAD_ID: u32 = 4;
 /// TIMER_ABSTIME flag for timer_settime.
 const TIMER_ABSTIME: i32 = 1;
 
@@ -9171,20 +9804,37 @@ pub extern "C" fn kernel_timer_create(
 
     let (_gkl, proc) = unsafe { get_process() };
 
-    // Parse sigevent (default: SIGEV_SIGNAL with SIGALRM)
-    let (sigev_signo, sigev_value, sigev_notify) = if sevp_ptr.is_null() {
-        (14u32, 0i32, SIGEV_SIGNAL) // default: SIGALRM
+    // Parse musl's kernel sigevent layout:
+    // {sigev_value(i32), sigev_signo(i32), sigev_notify(i32), sigev_tid(i32)}.
+    // Linux accepts SIGEV_THREAD_ID as a non-POSIX extension used by runtimes
+    // that need a timer signal delivered to a specific thread.
+    let (sigev_signo, sigev_value, sigev_notify, sigev_tid) = if sevp_ptr.is_null() {
+        (14u32, 0i32, SIGEV_SIGNAL, 0u32) // default: SIGALRM
     } else {
         let buf = unsafe { slice::from_raw_parts(sevp_ptr, 16) };
         let value = i32::from_le_bytes(buf[0..4].try_into().unwrap());
         let signo = i32::from_le_bytes(buf[4..8].try_into().unwrap()) as u32;
         let notify = i32::from_le_bytes(buf[8..12].try_into().unwrap()) as u32;
-        (signo, value, notify)
+        let tid = i32::from_le_bytes(buf[12..16].try_into().unwrap()) as u32;
+        (signo, value, notify, tid)
     };
 
-    // Only SIGEV_SIGNAL and SIGEV_NONE are supported
-    if sigev_notify != SIGEV_SIGNAL && sigev_notify != 1 {
+    if sigev_notify != SIGEV_SIGNAL
+        && sigev_notify != SIGEV_NONE
+        && sigev_notify != SIGEV_THREAD_ID
+    {
         return -(Errno::EINVAL as i32);
+    }
+    if sigev_notify != SIGEV_NONE
+        && (sigev_signo == 0 || sigev_signo >= wasm_posix_shared::signal::NSIG)
+    {
+        return -(Errno::EINVAL as i32);
+    }
+    if sigev_notify == SIGEV_THREAD_ID
+        && !proc.is_main_thread(sigev_tid)
+        && proc.get_thread(sigev_tid).is_none()
+    {
+        return -(Errno::ESRCH as i32);
     }
 
     // Allocate timer slot
@@ -9208,8 +9858,10 @@ pub extern "C" fn kernel_timer_create(
 
     proc.posix_timers[timer_id] = Some(PosixTimerState {
         clock_id,
+        sigev_notify,
         sigev_signo,
         sigev_value,
+        sigev_tid,
         interval_sec: 0,
         interval_nsec: 0,
         value_sec: 0,
@@ -9300,7 +9952,11 @@ pub extern "C" fn kernel_timer_settime(
         if ms < 1 { 1 } else { ms } // minimum 1ms for repeating
     };
 
-    let signo = timer.sigev_signo as i32;
+    let signo = if timer.sigev_notify == SIGEV_NONE {
+        0
+    } else {
+        timer.sigev_signo as i32
+    };
     let _ = host.host_set_posix_timer(timerid, signo, value_ms, interval_ms);
 
     deliver_pending_signals(proc, &mut host);
@@ -9369,30 +10025,108 @@ pub extern "C" fn kernel_timer_delete(timerid: i32) -> i32 {
     0
 }
 
-/// Called by the host when a repeating POSIX timer fires to increment the overrun counter.
-/// This is used for timer_getoverrun() support.
+fn posix_timer_signal_pending(
+    proc: &crate::process::Process,
+    sigev_notify: u32,
+    sigev_tid: u32,
+    signo: u32,
+) -> bool {
+    if signo == 0 || signo >= wasm_posix_shared::signal::NSIG {
+        return false;
+    }
+    if sigev_notify == SIGEV_THREAD_ID {
+        proc.signal_pending_for(sigev_tid, signo)
+    } else {
+        (proc.signals.pending & crate::signal::sig_bit(signo)) != 0
+    }
+}
+
+/// Called by the host when a POSIX timer expires. Queues the timer signal
+/// according to the timer's sigevent state and returns the signal number
+/// queued, 0 when no signal should be delivered (SIGEV_NONE or overrun), or a
+/// negative errno.
+///
+/// Linux's SIGEV_THREAD_ID is process-local in Kandelo: the stored TID is
+/// validated at timer_create(), and expirations queue a directed signal for
+/// that thread instead of a process-shared signal.
 #[unsafe(no_mangle)]
-/// Called by the host when a POSIX timer's interval fires.
-/// If the timer's signal is already pending (blocked), increments overrun and
-/// returns 1 (don't send signal again). If not pending, resets overrun to 0
-/// and returns 0 (host should call sendSignalToProcess for a new delivery cycle).
+pub extern "C" fn kernel_posix_timer_fire(pid: u32, timer_id: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let proc = match table.get_mut(pid) {
+        Some(proc) => proc,
+        None => return -(Errno::ESRCH as i32),
+    };
+
+    let (sigev_notify, sigev_signo, sigev_value, sigev_tid) =
+        match proc.posix_timers.get(timer_id as usize) {
+            Some(Some(timer)) => (
+                timer.sigev_notify,
+                timer.sigev_signo,
+                timer.sigev_value,
+                timer.sigev_tid,
+            ),
+            _ => return -(Errno::EINVAL as i32),
+        };
+
+    if sigev_notify == SIGEV_NONE {
+        return 0;
+    }
+    if sigev_signo == 0 || sigev_signo >= wasm_posix_shared::signal::NSIG {
+        return -(Errno::EINVAL as i32);
+    }
+    if sigev_notify == SIGEV_THREAD_ID
+        && !proc.is_main_thread(sigev_tid)
+        && proc.get_thread(sigev_tid).is_none()
+    {
+        return -(Errno::ESRCH as i32);
+    }
+
+    if posix_timer_signal_pending(proc, sigev_notify, sigev_tid, sigev_signo) {
+        if let Some(Some(timer)) = proc.posix_timers.get_mut(timer_id as usize) {
+            timer.overrun = timer.overrun.saturating_add(1);
+        }
+        return 0;
+    }
+
+    if let Some(Some(timer)) = proc.posix_timers.get_mut(timer_id as usize) {
+        timer.overrun = 0;
+    }
+
+    if sigev_notify == SIGEV_THREAD_ID && !proc.is_main_thread(sigev_tid) {
+        if let Some(thread) = proc.get_thread_mut(sigev_tid) {
+            thread.signals.raise_with_value(sigev_signo, sigev_value);
+        }
+    } else {
+        proc.signals.raise_with_value(sigev_signo, sigev_value);
+    }
+
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    sigev_signo as i32
+}
+
+/// Legacy helper used by older hosts before `kernel_posix_timer_fire`.
+/// If the timer's signal is already pending, increments overrun and returns 1;
+/// otherwise resets overrun and returns 0 so the host can queue a signal.
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_posix_timer_interval_fire(pid: u32, timer_id: u32) -> i32 {
     let table = unsafe { &mut *PROCESS_TABLE.0.get() };
     if let Some(proc) = table.get_mut(pid) {
-        if let Some(Some(timer)) = proc.posix_timers.get_mut(timer_id as usize) {
-            let signo = timer.sigev_signo as u64;
-            if signo > 0 && signo <= 64 {
-                let mask = 1u64 << (signo - 1);
-                if proc.signals.pending & mask != 0 {
-                    // Signal already pending — this is an overrun
-                    timer.overrun += 1;
-                    return 1;
-                } else {
-                    // New delivery cycle — reset overrun
-                    timer.overrun = 0;
-                    return 0;
-                }
+        let (sigev_notify, sigev_tid, sigev_signo) =
+            match proc.posix_timers.get(timer_id as usize) {
+                Some(Some(timer)) => (timer.sigev_notify, timer.sigev_tid, timer.sigev_signo),
+                _ => return 0,
+            };
+        if sigev_notify == SIGEV_NONE || sigev_signo == 0 {
+            return 1;
+        }
+        if posix_timer_signal_pending(proc, sigev_notify, sigev_tid, sigev_signo) {
+            if let Some(Some(timer)) = proc.posix_timers.get_mut(timer_id as usize) {
+                timer.overrun = timer.overrun.saturating_add(1);
             }
+            return 1;
+        } else if let Some(Some(timer)) = proc.posix_timers.get_mut(timer_id as usize) {
+            timer.overrun = 0;
         }
     }
     0
@@ -9453,11 +10187,11 @@ pub extern "C" fn kernel_rt_sigtimedwait(mask_lo: u32, mask_hi: u32, timeout_ms:
 pub extern "C" fn kernel_pathconf(path_ptr: *const u8, path_len: u32, name: i32) -> i64 {
     let (_gkl, proc) = unsafe { get_process() };
     let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len as usize) };
-    let result = match syscalls::sys_pathconf(path, name) {
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_pathconf(proc, &mut host, path, name) {
         Ok(v) => v,
         Err(e) => -(e as i64),
     };
-    let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
 }

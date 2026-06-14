@@ -103,6 +103,7 @@ const EEXIST = 17;
 const ENAMETOOLONG = 36;
 const ETIMEDOUT = 110;
 const EINTR_ERRNO = 4;
+const SHM_RDONLY = 0o10000;
 
 /** Syscall numbers for sleep/delay */
 const SYS_NANOSLEEP = ABI_SYSCALLS.Nanosleep;
@@ -120,6 +121,7 @@ const SYS_EPOLL_CTL = ABI_SYSCALLS.EpollCtl;
 const SYS_EPOLL_WAIT = ABI_SYSCALLS.EpollWait;
 const SYS_RT_SIGTIMEDWAIT = ABI_SYSCALLS.RtSigtimedwait;
 const SYS_FLOCK = ABI_SYSCALLS.Flock;
+const SYS_PRCTL = ABI_SYSCALLS.Prctl;
 const LOCK_NB = 4;
 
 /**
@@ -151,6 +153,7 @@ const SYS_THREAD_CANCEL = ABI_SYSCALLS.ThreadCancel;
 
 /** waitpid options */
 const WNOHANG = 1;
+const WUNTRACED = 2;
 const WNOWAIT = 0x1000000;
 const WEXITED = 4;
 
@@ -162,15 +165,21 @@ const P_PGID = 2;
 /** CLD_* codes for siginfo_t */
 const CLD_EXITED = 1;
 const CLD_KILLED = 2;
+const CLD_STOPPED = 5;
 
 /** SIGCHLD */
 const SIGCHLD = 17;
 const SIGALRM = 14;
 
 /** Network ioctl request codes */
+const SIOCGIFNAME = 0x8910;
 const SIOCGIFCONF = 0x8912;
 const SIOCGIFHWADDR = 0x8927;
 const SIOCGIFADDR = 0x8915;
+const SIOCGIFINDEX = 0x8933;
+const VIRTUAL_IFACE_NAME = "eth0";
+const VIRTUAL_IFACE_INDEX = 1;
+const ENODEV = 19;
 
 /** Ioctl syscall number */
 const SYS_IOCTL = ABI_SYSCALLS.Ioctl;
@@ -201,6 +210,7 @@ const SYS_ACCEPT4 = ABI_SYSCALLS.Accept4;
 const SYS_CONNECT = ABI_SYSCALLS.Connect;
 
 const MSG_DONTWAIT = 0x0040;
+const IPC_NOWAIT = 0o4000;
 
 /** mmap flags */
 const MAP_SHARED = 0x01;
@@ -224,6 +234,7 @@ const SYS_DUP3 = ABI_SYSCALLS.Dup3;
 
 /** SysV IPC syscall numbers (only those still intercepted on host) */
 const SYS_SEMCTL = ABI_SYSCALLS.Semctl;
+const SYS_SEMOP = ABI_SYSCALLS.Semop;
 const SYS_SHMAT = ABI_SYSCALLS.Shmat;
 const SYS_SHMDT = ABI_SYSCALLS.Shmdt;
 
@@ -509,6 +520,14 @@ interface SharedMmapMapping {
   version: number;
 }
 
+interface SysvShmMapping {
+  segId: number;
+  size: number;
+  readOnly: boolean;
+  snapshot: Uint8Array;
+  version: number;
+}
+
 interface RegisterProcessOptions {
   skipKernelCreate?: boolean;
   argv?: string[];
@@ -537,8 +556,18 @@ export interface ProcessExitInfo {
 
 type WaitPollResult =
   | { kind: "exited"; childPid: number; waitStatus: number }
+  | { kind: "stopped"; childPid: number; waitStatus: number }
   | { kind: "running" }
   | { kind: "error"; errno: number };
+
+interface StoppedSyscall {
+  channel: ChannelInfo;
+  syscallNr: number;
+  origArgs: number[];
+  argDescs: SyscallArgDesc[] | undefined;
+  retVal: number;
+  errVal: number;
+}
 
 /**
  * Context describing a fork() initiated from a non-main thread. Set on
@@ -877,6 +906,11 @@ export class CentralizedKernelWorker {
     /** Date.now() deadline for finite-timeout poll/ppoll retries, or -1. */
     deadline?: number;
   }>();
+  /** Finite poll/ppoll deadlines must survive kernel EAGAIN retry cycles.
+   *  The kernel sees the original timeout argument on every retry; recomputing
+   *  Date.now()+timeout each time would turn a finite poll timeout into an
+   *  unbounded wait. */
+  private pollRetryDeadlines = new Map<string, number>();
   /** Pending pselect6/select retries — keyed by pid + channelOffset. */
   private pendingSelectRetries = new Map<string, {
     timer: any;  // setTimeout or setImmediate handle
@@ -910,6 +944,12 @@ export class CentralizedKernelWorker {
    * by firing Atomics.notify on the address it is waiting on. The waitAsync
    * Promise in handleFutex then resolves and writes the channel result. */
   private pendingFutexWaits = new Map<string, { channel: ChannelInfo; futexIndex: number }>();
+  /** Pending rt_sigtimedwait calls, woken immediately when any signal is queued. */
+  private pendingSigTimedWaits = new Map<string, {
+    channel: ChannelInfo;
+    origArgs: number[];
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   /** Channel offsets with a cancellation request pending. Set by
    * SYS_THREAD_CANCEL.  Checked at the entry of every blocking syscall
    * path (futex wait, pipe retry, poll retry) so a cancel that arrives
@@ -917,6 +957,8 @@ export class CentralizedKernelWorker {
    * syscall instead of silently racing past it. Cleared when the cancel
    * has been serviced (target's channel completed with -EINTR / woken). */
   private pendingCancels = new Set<string>();
+  /** Processes parked by POSIX job-control stop signals until SIGCONT. */
+  private stoppedSyscalls = new Map<number, StoppedSyscall>();
   /** Profiling data: syscallNr → {count, totalTimeMs, retries} */
   private profileData: Map<number, {count: number; totalTimeMs: number; retries: number}> | null =
     PROFILING ? new Map() : null;
@@ -945,8 +987,10 @@ export class CentralizedKernelWorker {
    *  (which crashes in Chrome for epoll_pwait due to a suspected V8 bug). */
   private epollInterests = new Map<string, Array<{ fd: number; events: number; data: bigint }>>();
   private lockTable: SharedLockTable | null = null;
-  /** Per-process shared memory mappings: pid → Map<addr, {segId, size}> */
-  private shmMappings = new Map<number, Map<number, { segId: number; size: number }>>();
+  /** Per-process SysV shared memory mappings: pid → Map<addr, mapping> */
+  private shmMappings = new Map<number, Map<number, SysvShmMapping>>();
+  /** Host-side backing versions for SysV shared memory segments. */
+  private shmSegmentVersions = new Map<number, number>();
 
   /** PTY index → pid mapping (for draining output after syscalls) */
   private ptyIndexByPid = new Map<number, number>();
@@ -1061,7 +1105,7 @@ export class CentralizedKernelWorker {
               this.posixTimers.delete(key);
               return;
             }
-            this.sendSignalToProcess(pid, signo);
+            this.firePosixTimer(pid, timerId, signo);
 
             // Set up repeating interval if needed
             if (intervalMs > 0) {
@@ -1072,13 +1116,7 @@ export class CentralizedKernelWorker {
                   this.posixTimers.delete(key);
                   return;
                 }
-                // Check if signal is already pending (overrun) or new cycle
-                const intervalFire = this.kernelInstance!.exports
-                  .kernel_posix_timer_interval_fire as ((pid: number, timerId: number) => number) | undefined;
-                const alreadyPending = intervalFire ? intervalFire(pid, timerId) : 0;
-                if (!alreadyPending) {
-                  this.sendSignalToProcess(pid, signo);
-                }
+                this.firePosixTimer(pid, timerId, signo);
               }, intervalMs);
               const entry = this.posixTimers.get(key);
               if (entry) entry.interval = iv;
@@ -1299,14 +1337,16 @@ export class CentralizedKernelWorker {
    * Data is returned in chunks until exhausted, then EOF is returned.
    * Must be called before the process starts reading stdin.
    */
-  setStdinData(pid: number, data: Uint8Array): void {
+  setStdinData(pid: number, data: Uint8Array, markPipe = true): void {
     this.stdinBuffers.set(pid, { data, offset: 0 });
     this.stdinFinite.add(pid); // EOF after data is consumed
-    // Mark stdin as a pipe so terminal echo is disabled and isatty(0) = false
-    const kernelSetStdinPipe = this.kernelInstance!.exports.kernel_set_stdin_pipe as
-      ((pid: number) => number) | undefined;
-    if (kernelSetStdinPipe) {
-      kernelSetStdinPipe(pid);
+    if (markPipe) {
+      // Mark stdin as a pipe so terminal echo is disabled and isatty(0) = false
+      const kernelSetStdinPipe = this.kernelInstance!.exports.kernel_set_stdin_pipe as
+        ((pid: number) => number) | undefined;
+      if (kernelSetStdinPipe) {
+        kernelSetStdinPipe(pid);
+      }
     }
   }
 
@@ -1642,6 +1682,7 @@ export class CentralizedKernelWorker {
     this.cleanupPendingPollRetries(pid);
     // Clean up pending select retries
     this.cleanupPendingSelectRetries(pid);
+    this.cleanupPendingSigTimedWaits(pid);
     // Clean up pending pipe readers/writers
     this.cleanupPendingPipeReaders(pid);
     this.cleanupPendingPipeWriters(pid);
@@ -1670,11 +1711,13 @@ export class CentralizedKernelWorker {
     }
 
     this.releaseAllSharedMappingsForProcess(pid);
+    this.releaseAllSysvShmMappingsForProcess(pid);
 
     // Remove from kernel process table
     this.removeFromKernelProcessTable(pid);
 
     this.processes.delete(pid);
+    this.stoppedSyscalls.delete(pid);
     this.stdinFinite.delete(pid);
     this.stdinBuffers.delete(pid);
 
@@ -1719,6 +1762,7 @@ export class CentralizedKernelWorker {
   deactivateProcess(pid: number): void {
     this.activeChannels = this.activeChannels.filter((ch) => ch.pid !== pid);
     this.processes.delete(pid);
+    this.stoppedSyscalls.delete(pid);
     this.stdinFinite.delete(pid);
     this.stdinBuffers.delete(pid);
     // Cancel any pending alarm timer for this process
@@ -1745,6 +1789,7 @@ export class CentralizedKernelWorker {
     this.cleanupPendingPollRetries(pid);
     // Clean up pending select retries
     this.cleanupPendingSelectRetries(pid);
+    this.cleanupPendingSigTimedWaits(pid);
     // Clean up network listeners/endpoints for this process
     this.cleanupUdpBindings(pid);
     // Clean up pending pipe readers/writers
@@ -1761,6 +1806,7 @@ export class CentralizedKernelWorker {
     this.cleanupTcpListeners(pid);
     // Drop host-side shared-mmap bookkeeping; Rust owns the zombie state.
     this.releaseAllSharedMappingsForProcess(pid);
+    this.releaseAllSysvShmMappingsForProcess(pid);
     // Keep hostReaped set until the next registerProcess generation. Exit
     // teardown is asynchronous, and clearing it here lets late worker errors
     // synthesize a second parent notification for the same process.
@@ -1788,6 +1834,7 @@ export class CentralizedKernelWorker {
     // Clean up pending blocking retries (the old program's syscalls are dead)
     this.cleanupPendingPollRetries(pid);
     this.cleanupPendingSelectRetries(pid);
+    this.cleanupPendingSigTimedWaits(pid);
     this.cleanupPendingPipeReaders(pid);
     this.cleanupPendingPipeWriters(pid);
     for (const [ch, timer] of this.socketTimeoutTimers) {
@@ -1799,7 +1846,9 @@ export class CentralizedKernelWorker {
 
     // Remove process registration (new one will be added by registerProcess)
     this.releaseAllSharedMappingsForProcess(pid);
+    this.releaseAllSysvShmMappingsForProcess(pid);
     this.processes.delete(pid);
+    this.stoppedSyscalls.delete(pid);
   }
 
   /**
@@ -2259,6 +2308,7 @@ export class CentralizedKernelWorker {
     }
 
     this.synchronizeSharedMappingsForSyscallBoundary(channel);
+    this.synchronizeSysvShmMappingsForSyscallBoundary(channel);
     this.flushSharedMappingsBeforeFileSyscall(channel, syscallNr, origArgs);
 
     // --- Intercept fork/exec/clone/exit before calling kernel ---
@@ -2389,7 +2439,7 @@ export class CentralizedKernelWorker {
       return;
     }
 
-    // --- ioctl: intercept network interface ioctls (SIOCGIFCONF, SIOCGIFHWADDR) ---
+    // --- ioctl: intercept network interface ioctls ---
     // These require host-side handling because:
     //   SIOCGIFCONF: struct ifconf contains a pointer to a process-memory buffer
     //   SIOCGIFHWADDR: returns the virtual MAC address for this kernel instance
@@ -2399,12 +2449,20 @@ export class CentralizedKernelWorker {
         this.handleIoctlIfconf(channel, origArgs);
         return;
       }
+      if (request === SIOCGIFNAME) {
+        this.handleIoctlIfname(channel, origArgs);
+        return;
+      }
       if (request === SIOCGIFHWADDR) {
         this.handleIoctlIfhwaddr(channel, origArgs);
         return;
       }
       if (request === SIOCGIFADDR) {
         this.handleIoctlIfaddr(channel, origArgs);
+        return;
+      }
+      if (request === SIOCGIFINDEX) {
+        this.handleIoctlIfindex(channel, origArgs);
         return;
       }
     }
@@ -2483,7 +2541,21 @@ export class CentralizedKernelWorker {
     const adjustedArgs = [...origArgs];
 
     // Process pointer args: copy data between process and kernel memory
-    const argDescs = SYSCALL_ARGS[syscallNr];
+    let argDescs: SyscallArgDesc[] | undefined = SYSCALL_ARGS[syscallNr];
+    if (syscallNr === SYS_PRCTL) {
+      const option = origArgs[0] >>> 0;
+      // prctl option arguments are not statically typed. In particular,
+      // PR_SET_PDEATHSIG uses arg2 as a scalar signal number; treating it as
+      // a pointer corrupts the syscall into EFAULT/EINVAL. Marshal only the
+      // options whose arg2 is actually a user buffer.
+      if (option === 15 || option === 16) { // PR_SET_NAME / PR_GET_NAME
+        argDescs = [{ argIndex: 1, direction: "inout", size: { type: "fixed", size: 16 } }];
+      } else if (option === 2) { // PR_GET_PDEATHSIG
+        argDescs = [{ argIndex: 1, direction: "out", size: { type: "fixed", size: 4 } }];
+      } else {
+        argDescs = undefined;
+      }
+    }
     let dataOffset = 0; // Offset within scratch data area for allocations
 
     if (argDescs) {
@@ -2786,10 +2858,28 @@ export class CentralizedKernelWorker {
     this.dequeueSignalForDelivery(channel);
     this.assertKernelStackStage("after dequeueSignalForDelivery", kernelStackTrace, channel, syscallNr, origArgs);
 
+    if (
+      (syscallNr === SYS_POLL || syscallNr === SYS_PPOLL) &&
+      !(retVal === -1 && errVal === EAGAIN)
+    ) {
+      this.pollRetryDeadlines.delete(this.channelKey(channel));
+    }
+
     // --- Blocking syscall handling ---
     // 1. EAGAIN: kernel returned EAGAIN for a blocking syscall.
     //    Schedule async retry — the process stays blocked on Atomics.wait.
     if (retVal === -1 && errVal === EAGAIN) {
+      if (syscallNr === SYS_SEMOP && this.semopHasNowait(origArgs, channel)) {
+        this.completeChannel(
+          channel,
+          syscallNr,
+          origArgs,
+          SYSCALL_ARGS[syscallNr],
+          retVal,
+          errVal,
+        );
+        return;
+      }
       if (syscallNr === SYS_FLOCK && (origArgs[1] & LOCK_NB) !== 0) {
         this.completeChannel(
           channel,
@@ -2844,6 +2934,7 @@ export class CentralizedKernelWorker {
     if (errVal === 0 && syscallNr === SYS_KILL) {
       this.scheduleWakeBlockedRetries();
       this.reapKilledProcessesAfterSyscall();
+      this.resumeContinuedStoppedSyscalls();
     }
     this.assertKernelStackStage("after kill wake/reap", kernelStackTrace, channel, syscallNr, origArgs);
 
@@ -2853,6 +2944,9 @@ export class CentralizedKernelWorker {
       console.error(logEntry + this.formatSyscallReturn(syscallNr, retVal, errVal));
     }
     this.assertKernelStackStage("before completeChannel", kernelStackTrace, channel, syscallNr, origArgs);
+    if (this.parkStoppedSyscallIfNeeded(channel, syscallNr, origArgs, argDescs, retVal, errVal)) {
+      return;
+    }
     this.completeChannel(channel, syscallNr, origArgs, argDescs, retVal, errVal);
     this.assertKernelStackStage("after completeChannel", kernelStackTrace, channel, syscallNr, origArgs);
   }
@@ -2956,7 +3050,11 @@ export class CentralizedKernelWorker {
             continue;
           }
           let copySize = size;
-          if (desc.direction === "out" && desc.size.type === "arg") {
+          if (
+            desc.direction === "out" &&
+            desc.size.type === "arg" &&
+            desc.copyRetvalLimit !== false
+          ) {
             // For read/recv-like syscalls, retVal is bytes read — limit copy to actual data
             const copyRetvalAdd = desc.copyRetvalAdd ?? 0;
             if (retVal > 0 && retVal + copyRetvalAdd < size) {
@@ -3390,6 +3488,16 @@ export class CentralizedKernelWorker {
           clearImmediate(entry.timer);
         }
         this.pendingSelectRetries.delete(key);
+      }
+    }
+  }
+
+  /** Cancel all pending rt_sigtimedwait retries for a given pid. */
+  private cleanupPendingSigTimedWaits(pid: number): void {
+    for (const [key, entry] of this.pendingSigTimedWaits) {
+      if (entry.channel.pid === pid) {
+        clearTimeout(entry.timer);
+        this.pendingSigTimedWaits.delete(key);
       }
     }
   }
@@ -3879,6 +3987,20 @@ export class CentralizedKernelWorker {
     }
   }
 
+  private semopHasNowait(origArgs: number[], channel: ChannelInfo): boolean {
+    const sopsPtr = origArgs[1] >>> 0;
+    const nsops = origArgs[2] >>> 0;
+    if (sopsPtr === 0 || nsops === 0) return false;
+    const processMem = new DataView(channel.memory.buffer);
+    const end = sopsPtr + nsops * 6;
+    if (end > processMem.byteLength) return false;
+    for (let i = 0; i < nsops; i++) {
+      const flags = processMem.getUint16(sopsPtr + i * 6 + 4, true);
+      if ((flags & IPC_NOWAIT) !== 0) return true;
+    }
+    return false;
+  }
+
   private handleBlockingRetry(
     channel: ChannelInfo,
     syscallNr: number,
@@ -3924,6 +4046,7 @@ export class CentralizedKernelWorker {
     // We retry after a short delay. If poll has timeout=0 (EAGAIN means no events),
     // we should return 0 immediately instead of retrying.
     if (syscallNr === SYS_POLL || syscallNr === SYS_PPOLL) {
+      const key = this.channelKey(channel);
       let timeoutMs = -1;
       // PPOLL with a non-null sigmask pointer swaps the signal mask for the
       // duration of the wait. Broad wakes from cross-process pipe writes
@@ -3942,6 +4065,7 @@ export class CentralizedKernelWorker {
         }
       }
       if (timeoutMs === 0) {
+        this.pollRetryDeadlines.delete(key);
         this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], 0, 0);
         return;
       }
@@ -3954,31 +4078,48 @@ export class CentralizedKernelWorker {
       // expires instead of retrying forever. The nfds=0 case (pure sleep) is
       // optimized to skip retries entirely — just wait for the deadline.
       const nfds = origArgs[1]; // poll(fds, nfds, ...) / ppoll(fds, nfds, ...)
+      const deadline =
+        timeoutMs > 0
+          ? (this.pollRetryDeadlines.get(key) ?? Date.now() + timeoutMs)
+          : -1;
+      if (deadline > 0) {
+        this.pollRetryDeadlines.set(key, deadline);
+        if (Date.now() >= deadline) {
+          this.pendingPollRetries.delete(key);
+          this.pollRetryDeadlines.delete(key);
+          this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], 0, 0);
+          return;
+        }
+      } else {
+        this.pollRetryDeadlines.delete(key);
+      }
+
       if (timeoutMs > 0 && nfds === 0) {
         // Pure sleep: no fds to poll, just wait for timeout
         const timer = setTimeout(() => {
-          this.pendingPollRetries.delete(this.channelKey(channel));
+          this.pendingPollRetries.delete(key);
+          this.pollRetryDeadlines.delete(key);
           if (this.isChannelActive(channel)) {
             this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], 0, 0);
           }
-        }, timeoutMs);
-        this.pendingPollRetries.set(this.channelKey(channel), {
+        }, Math.max(deadline - Date.now(), 1));
+        this.pendingPollRetries.set(key, {
           timer,
           channel,
           pipeIndices,
           acceptIndices,
           needsSignalSafeWake,
-          deadline: Date.now() + timeoutMs,
+          deadline,
         });
         return;
       }
 
-      const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : -1;
       const retryFn = () => {
-        this.pendingPollRetries.delete(this.channelKey(channel));
+        this.pendingPollRetries.delete(key);
         if (!this.isChannelActive(channel)) return;
         // Check deadline for finite timeout
         if (deadline > 0 && Date.now() >= deadline) {
+          this.pollRetryDeadlines.delete(key);
           this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], 0, 0);
           return;
         }
@@ -4002,7 +4143,7 @@ export class CentralizedKernelWorker {
         ? (deadline > 0 ? Math.min(deadline - Date.now(), 10) : 10)
         : (deadline > 0 ? Math.min(deadline - Date.now(), 50) : 50);
       const timer = setTimeout(retryFn, Math.max(retryMs, 1));
-      this.pendingPollRetries.set(this.channelKey(channel), {
+      this.pendingPollRetries.set(key, {
         timer,
         channel,
         pipeIndices,
@@ -4038,16 +4179,27 @@ export class CentralizedKernelWorker {
       // timespec: i64 sec + i64 nsec (time64)
       const sec = Number(pv.getBigInt64(0, true));
       const nsec = Number(pv.getBigInt64(8, true));
+      if (sec < 0 || nsec < 0 || nsec >= 1_000_000_000) {
+        this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], -1, 22);
+        return;
+      }
       const timeoutMs = sec * 1000 + Math.floor(nsec / 1_000_000);
       const EAGAIN_ERRNO = 11;
       if (timeoutMs <= 0) {
         this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], -1, EAGAIN_ERRNO);
       } else {
-        setTimeout(() => {
+        const key = this.channelKey(channel);
+        const timer = setTimeout(() => {
+          this.pendingSigTimedWaits.delete(key);
           if (this.isChannelActive(channel)) {
             this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], -1, EAGAIN_ERRNO);
           }
         }, timeoutMs);
+        this.pendingSigTimedWaits.set(key, {
+          channel,
+          origArgs: [...origArgs],
+          timer,
+        });
       }
       return;
     }
@@ -5117,8 +5269,8 @@ export class CentralizedKernelWorker {
   }
 
   // ---- Network interface ioctl host-side handlers ----
-  // The kernel has a single virtual network interface ("eth0") with a random
-  // MAC address generated per kernel instance.
+  // The kernel has a single virtual network interface ("eth0") at ifindex 1
+  // with a random MAC address generated per kernel instance.
 
   /**
    * Handle SIOCGIFCONF: enumerate network interfaces.
@@ -5148,8 +5300,8 @@ export class CentralizedKernelWorker {
     const SIZEOF_IFREQ = 32;
 
     if (ifcLen >= SIZEOF_IFREQ && ifcBuf !== 0) {
-      // Write one ifreq entry for "eth0" into process memory at ifc_buf
-      const nameBytes = new TextEncoder().encode("eth0");
+      // Write one ifreq entry for the virtual interface into process memory at ifc_buf
+      const nameBytes = new TextEncoder().encode(VIRTUAL_IFACE_NAME);
       processMem.set(nameBytes, ifcBuf);
       processMem.fill(0, ifcBuf + nameBytes.length, ifcBuf + 16); // pad ifr_name
 
@@ -5167,6 +5319,30 @@ export class CentralizedKernelWorker {
       // No space or null buffer
       processView.setInt32(ifconfPtr, 0, true);
     }
+
+    this.completeChannelRaw(channel, 0, 0);
+    this.relistenChannel(channel);
+  }
+
+  /**
+   * Handle SIOCGIFNAME: map an interface index to its name.
+   * struct ifreq at arg[2]: ifr_name[16] + union; ifr_ifindex lives at +16.
+   */
+  private handleIoctlIfname(channel: ChannelInfo, origArgs: number[]): void {
+    const processView = new DataView(channel.memory.buffer);
+    const processMem = new Uint8Array(channel.memory.buffer);
+    const ifreqPtr = origArgs[2];
+    const ifindex = processView.getInt32(ifreqPtr + 16, true);
+
+    if (ifindex !== VIRTUAL_IFACE_INDEX) {
+      this.completeChannelRaw(channel, -ENODEV, ENODEV);
+      this.relistenChannel(channel);
+      return;
+    }
+
+    const nameBytes = new TextEncoder().encode(VIRTUAL_IFACE_NAME);
+    processMem.set(nameBytes, ifreqPtr);
+    processMem.fill(0, ifreqPtr + nameBytes.length, ifreqPtr + 16);
 
     this.completeChannelRaw(channel, 0, 0);
     this.relistenChannel(channel);
@@ -5210,6 +5386,30 @@ export class CentralizedKernelWorker {
     processMem[ifreqPtr + 21] = 0;
     processMem[ifreqPtr + 22] = 0;
     processMem[ifreqPtr + 23] = 1;
+
+    this.completeChannelRaw(channel, 0, 0);
+    this.relistenChannel(channel);
+  }
+
+  /**
+   * Handle SIOCGIFINDEX: map an interface name to its index.
+   * struct ifreq at arg[2]: ifr_name[16] + union; ifr_ifindex lives at +16.
+   */
+  private handleIoctlIfindex(channel: ChannelInfo, origArgs: number[]): void {
+    const processView = new DataView(channel.memory.buffer);
+    const processMem = new Uint8Array(channel.memory.buffer);
+    const ifreqPtr = origArgs[2];
+    const nul = processMem.indexOf(0, ifreqPtr);
+    const end = nul >= ifreqPtr && nul < ifreqPtr + 16 ? nul : ifreqPtr + 16;
+    const name = new TextDecoder().decode(processMem.subarray(ifreqPtr, end));
+
+    if (name !== VIRTUAL_IFACE_NAME) {
+      this.completeChannelRaw(channel, -ENODEV, ENODEV);
+      this.relistenChannel(channel);
+      return;
+    }
+
+    processView.setInt32(ifreqPtr + 16, VIRTUAL_IFACE_INDEX, true);
 
     this.completeChannelRaw(channel, 0, 0);
     this.relistenChannel(channel);
@@ -6179,6 +6379,7 @@ export class CentralizedKernelWorker {
       }
 
       this.inheritSharedMappings(parentPid, childPid);
+      this.inheritSysvShmMappings(parentPid, childPid);
 
       // Complete parent's channel with child PID
       this.completeChannel(channel, SYS_FORK, _origArgs, undefined, childPid, 0);
@@ -6664,6 +6865,53 @@ export class CentralizedKernelWorker {
   }
 
   /**
+   * Apply kernel-owned child side effects for a process that just became a
+   * zombie: Linux PR_SET_PDEATHSIG delivery and orphan reparenting to init.
+   *
+   * The Rust export mutates process-table parentage and may mark children as
+   * signal-terminated if their configured parent-death signal has the default
+   * terminate action. The host then wakes/reaps any affected child workers.
+   */
+  private handleParentExitSideEffects(pid: number): void {
+    const handleParentExit = this.kernelInstance!.exports.kernel_handle_parent_exit as
+      ((pid: number) => number) | undefined;
+    if (!handleParentExit) return;
+
+    const rc = handleParentExit(pid);
+    if (rc < 0) {
+      console.error(`[handleParentExitSideEffects] kernel_handle_parent_exit failed for pid=${pid}: errno=${-rc}`);
+      return;
+    }
+    if (EXIT_TRACE) {
+      console.error(`[exit] pid=${pid} parent-exit side effects delivered=${rc}`);
+    }
+
+    if (rc > 0) {
+      this.scheduleWakeBlockedRetries();
+      this.reapKilledProcessesAfterSyscall();
+    }
+  }
+
+  /**
+   * PID 1 is a virtual init process in centralized mode; there is no guest
+   * worker that can call waitpid() for orphans. Reap zombies reparented to
+   * init so procfs/process enumeration matches Linux's "init adopts and
+   * reaps orphaned children" behavior.
+   */
+  private maybeAutoReapInitChild(pid: number, parentPid: number | undefined): void {
+    if (parentPid !== 1) return;
+    try {
+      if (EXIT_TRACE) console.error(`[exit] pid=${pid} auto-reap init child start`);
+      this.consumeExitedChild(1, pid);
+      if (EXIT_TRACE) console.error(`[exit] pid=${pid} auto-reap init child done`);
+    } catch {
+      if (EXIT_TRACE) console.error(`[exit] pid=${pid} auto-reap init child skipped/failed`);
+      // Best-effort: the child may already have been reaped by SA_NOCLDWAIT
+      // or an overlapping cleanup path.
+    }
+  }
+
+  /**
    * Handle SYS_EXIT/SYS_EXIT_GROUP: notify the kernel and clean up.
    *
    * For SYS_EXIT from a non-main channel (thread exit): notify kernel,
@@ -6774,6 +7022,8 @@ export class CentralizedKernelWorker {
       return;
     }
     this.hostReaped.add(exitingPid);
+    this.handleParentExitSideEffects(exitingPid);
+    const parentPid = this.getParentPid(exitingPid);
     this.notifyParentOfExitedProcess(exitingPid);
 
     // From this point the process is a zombie in the kernel. Remove its host
@@ -6802,6 +7052,7 @@ export class CentralizedKernelWorker {
       this.callbacks.onExit(exitingPid, exitStatus);
       if (EXIT_TRACE) console.error(`[exit] pid=${exitingPid} callback done`);
     }
+    this.maybeAutoReapInitChild(exitingPid, parentPid);
   }
 
   /**
@@ -6818,19 +7069,24 @@ export class CentralizedKernelWorker {
     // but defensive) starts fresh.
     if (this.hostReaped.has(exitingPid)) return;
     this.hostReaped.add(exitingPid);
+    this.handleParentExitSideEffects(exitingPid);
+    const parentPid = this.getParentPid(exitingPid);
+    if (EXIT_TRACE) console.error(`[exit] pid=${exitingPid} terminated parentPid=${parentPid}`);
+
+    const getExitStatus = this.kernelInstance!.exports
+      .kernel_get_process_exit_status as ((pid: number) => number) | undefined;
+    const exitStatus = getExitStatus ? getExitStatus(exitingPid) : -1;
     this.notifyParentOfExitedProcess(exitingPid);
 
     // Clean up per-process state
     this.releaseAllSharedMappingsForProcess(exitingPid);
+    this.releaseAllSysvShmMappingsForProcess(exitingPid);
 
     const registration = this.processes.get(exitingPid);
     const workerWillQuiesce = !!registration?.channelErrorTraps;
 
     // For older binaries, do NOT complete the channel: waking them would return
     // to C after a fatal signal. onExit will terminate those workers instead.
-    const getExitStatus = this.kernelInstance!.exports
-      .kernel_get_process_exit_status as ((pid: number) => number) | undefined;
-    const exitStatus = getExitStatus ? getExitStatus(exitingPid) : -1;
     if (this.callbacks.onExit) {
       this.callbacks.onExit(
         exitingPid,
@@ -6845,6 +7101,7 @@ export class CentralizedKernelWorker {
       // quiescence proof rather than surfaced as an unexpected process crash.
       this.completeChannelFatal(channel);
     }
+    this.maybeAutoReapInitChild(exitingPid, parentPid);
   }
 
   /**
@@ -6876,8 +7133,12 @@ export class CentralizedKernelWorker {
       ((pid: number, signum: number) => number) | undefined;
     if (markSignaled && markSignaled(pid, signum) < 0) return;
     this.hostReaped.add(pid);
+    this.handleParentExitSideEffects(pid);
+    const parentPid = this.getParentPid(pid);
     this.notifyParentOfExitedProcess(pid);
     this.releaseAllSharedMappingsForProcess(pid);
+    this.releaseAllSysvShmMappingsForProcess(pid);
+    this.maybeAutoReapInitChild(pid, parentPid);
   }
 
   /**
@@ -6933,7 +7194,7 @@ export class CentralizedKernelWorker {
     const options = origArgs[2] >>> 0;
     const parentPid = channel.pid;
 
-    const poll = this.pollWaitableChild(parentPid, targetPid);
+    const poll = this.pollWaitableChild(parentPid, targetPid, options);
     if (poll.kind === "error") {
       this.completeWaitpid(channel, origArgs, -1, poll.errno);
       return;
@@ -6941,6 +7202,13 @@ export class CentralizedKernelWorker {
     if (poll.kind === "exited") {
       this.consumeExitedChild(parentPid, poll.childPid);
       this.writeWaitStatus(channel, wstatusPtr, poll.waitStatus);
+      this.writeRusage(channel, origArgs[3]);
+      this.completeWaitpid(channel, origArgs, poll.childPid, 0);
+      return;
+    }
+    if (poll.kind === "stopped") {
+      this.writeWaitStatus(channel, wstatusPtr, poll.waitStatus);
+      this.writeRusage(channel, origArgs[3]);
       this.completeWaitpid(channel, origArgs, poll.childPid, 0);
       return;
     }
@@ -6962,17 +7230,72 @@ export class CentralizedKernelWorker {
     });
   }
 
-  private pollWaitableChild(parentPid: number, targetPid: number): WaitPollResult {
+  private pollWaitableChild(parentPid: number, targetPid: number, options: number = 0): WaitPollResult {
     const waitPoll = this.kernelInstance!.exports.kernel_wait4_poll as
-      (parentPid: number, targetPid: number, statusPtr: KernelPointer) => number;
-    const result = waitPoll(parentPid, targetPid, this.toKernelPtr(this.scratchOffset!));
+      (parentPid: number, targetPid: number, statusPtr: KernelPointer, options: number) => number;
+    const result = waitPoll(parentPid, targetPid, this.toKernelPtr(this.scratchOffset!), options);
     if (result > 0) {
       const waitStatus = new DataView(this.kernelMemory!.buffer)
         .getInt32(this.scratchOffset!, true);
+      if ((waitStatus & 0xff) === 0x7f) {
+        return { kind: "stopped", childPid: result, waitStatus };
+      }
       return { kind: "exited", childPid: result, waitStatus };
     }
     if (result === 0) return { kind: "running" };
     return { kind: "error", errno: (-result) >>> 0 };
+  }
+
+  private getProcessState(pid: number): number {
+    const getState = this.kernelInstance!.exports.kernel_get_process_state as
+      ((pid: number) => number) | undefined;
+    return getState ? getState(pid) : 0;
+  }
+
+  private parkStoppedSyscallIfNeeded(
+    channel: ChannelInfo,
+    syscallNr: number,
+    origArgs: number[],
+    argDescs: SyscallArgDesc[] | undefined,
+    retVal: number,
+    errVal: number,
+  ): boolean {
+    if (errVal !== 0) return false;
+    if (this.getProcessState(channel.pid) !== 1) return false;
+
+    this.stoppedSyscalls.set(channel.pid, {
+      channel,
+      syscallNr,
+      origArgs: [...origArgs],
+      argDescs,
+      retVal,
+      errVal,
+    });
+    const parentPid = this.getParentPid(channel.pid);
+    if (parentPid !== undefined) {
+      this.wakeWaitingParent(parentPid);
+    }
+    return true;
+  }
+
+  private resumeContinuedStoppedSyscalls(): void {
+    for (const [pid, stopped] of Array.from(this.stoppedSyscalls.entries())) {
+      const state = this.getProcessState(pid);
+      if (state === 1) continue;
+      this.stoppedSyscalls.delete(pid);
+      if (state === 2) {
+        this.handleProcessTerminated(stopped.channel);
+        continue;
+      }
+      this.completeChannel(
+        stopped.channel,
+        stopped.syscallNr,
+        stopped.origArgs,
+        stopped.argDescs,
+        stopped.retVal,
+        stopped.errVal,
+      );
+    }
   }
 
   private getParentPid(pid: number): number | undefined {
@@ -7002,10 +7325,16 @@ export class CentralizedKernelWorker {
     const autoReap = hasNoCldWait ? hasNoCldWait(parentPid) === 1 : false;
     if (autoReap) {
       this.consumeExitedChild(parentPid, pid);
+      this.wakeWaitingParentsWithNoMatchingChild(parentPid);
       return;
     }
 
-    this.sendSignalToProcess(parentPid, SIGCHLD);
+    const queueSigchld = this.kernelInstance!.exports.kernel_queue_sigchld as
+      ((parentPid: number, childPid: number) => number) | undefined;
+    const queued = queueSigchld ? queueSigchld(parentPid, pid) === 0 : false;
+    if (!queued) {
+      this.sendSignalToProcess(parentPid, SIGCHLD);
+    }
     this.wakeWaitingParent(parentPid);
   }
 
@@ -7034,13 +7363,13 @@ export class CentralizedKernelWorker {
     for (let i = 0; i < this.waitingForChild.length; i++) {
       const waiter = this.waitingForChild[i];
       if (waiter.parentPid !== parentPid) continue;
-      const waiterPoll = this.pollWaitableChild(waiter.parentPid, waiter.pid);
-      if (waiterPoll.kind !== "exited") continue;
+      const waiterPoll = this.pollWaitableChild(waiter.parentPid, waiter.pid, waiter.options);
+      if (waiterPoll.kind !== "exited" && waiterPoll.kind !== "stopped") continue;
       idx = i;
       poll = waiterPoll;
       break;
     }
-    if (idx === -1 || poll?.kind !== "exited") return;
+    if (idx === -1 || (poll?.kind !== "exited" && poll?.kind !== "stopped")) return;
 
     const waiter = this.waitingForChild[idx];
     this.waitingForChild.splice(idx, 1);
@@ -7048,17 +7377,48 @@ export class CentralizedKernelWorker {
     if (waiter.syscallNr === SYS_WAITID) {
       // waitid: write siginfo_t, optionally consume zombie
       this.writeSignalInfo(waiter.channel, waiter.origArgs[2], poll.childPid, poll.waitStatus);
-      if (!(waiter.options & WNOWAIT)) {
+      if (poll.kind === "exited" && !(waiter.options & WNOWAIT)) {
         this.consumeExitedChild(parentPid, poll.childPid);
       }
       this.dequeueSignalForDelivery(waiter.channel);
       this.completeChannel(waiter.channel, SYS_WAITID, waiter.origArgs, undefined, 0, 0);
     } else {
-      // wait4: write wstatus, consume zombie
-      this.consumeExitedChild(parentPid, poll.childPid);
+      // wait4: write wstatus; stopped children remain waitable processes
+      if (poll.kind === "exited") {
+        this.consumeExitedChild(parentPid, poll.childPid);
+      }
       this.writeWaitStatus(waiter.channel, waiter.origArgs[1], poll.waitStatus);
+      this.writeRusage(waiter.channel, waiter.origArgs[3]);
       this.completeWaitpid(waiter.channel, waiter.origArgs, poll.childPid, 0);
     }
+  }
+
+  /** Wake deferred waiters whose matching child set disappeared.
+   *
+   * POSIX treats SIGCHLD set to SIG_IGN, and SA_NOCLDWAIT, as no-zombie
+   * modes: children are discarded as they terminate. A waitpid() already
+   * blocked in the parent must not sleep forever after such an auto-reap; it
+   * should observe ECHILD once there is no matching child left.
+   */
+  private wakeWaitingParentsWithNoMatchingChild(parentPid: number): void {
+    for (let i = this.waitingForChild.length - 1; i >= 0; i--) {
+      const waiter = this.waitingForChild[i];
+      if (waiter.parentPid !== parentPid) continue;
+      const poll = this.pollWaitableChild(waiter.parentPid, waiter.pid, waiter.options);
+      if (poll.kind !== "error") continue;
+      this.waitingForChild.splice(i, 1);
+      if (waiter.syscallNr === SYS_WAITID) {
+        this.completeChannel(waiter.channel, SYS_WAITID, waiter.origArgs, undefined, -1, poll.errno);
+      } else {
+        this.completeWaitpid(waiter.channel, waiter.origArgs, -1, poll.errno);
+      }
+    }
+  }
+
+  private writeRusage(channel: ChannelInfo, rusagePtr: number): void {
+    if (rusagePtr === 0) return;
+    const processMem = new Uint8Array(channel.memory.buffer);
+    processMem.fill(0, rusagePtr, Math.min(rusagePtr + 144, processMem.length));
   }
 
   /**
@@ -7073,7 +7433,7 @@ export class CentralizedKernelWorker {
       // Only re-check waiters targeting a specific process group (pid < -1 or pid == 0)
       if (waiter.pid > 0 || waiter.pid === -1) continue;
 
-      const poll = this.pollWaitableChild(waiter.parentPid, waiter.pid);
+      const poll = this.pollWaitableChild(waiter.parentPid, waiter.pid, waiter.options);
       if (poll.kind === "error") {
         // No more matching children — wake with ECHILD
         this.waitingForChild.splice(i, 1);
@@ -7101,7 +7461,7 @@ export class CentralizedKernelWorker {
     const parentPid = channel.pid;
     const waitPid = this.waitidToWaitPid(idtype, id);
 
-    const poll = this.pollWaitableChild(parentPid, waitPid);
+    const poll = this.pollWaitableChild(parentPid, waitPid, options);
     if (poll.kind === "error") {
       this.completeChannel(channel, SYS_WAITID, origArgs, undefined, -1, poll.errno);
       return;
@@ -7111,6 +7471,11 @@ export class CentralizedKernelWorker {
       if (!(options & WNOWAIT)) {
         this.consumeExitedChild(parentPid, poll.childPid);
       }
+      this.completeChannel(channel, SYS_WAITID, origArgs, undefined, 0, 0);
+      return;
+    }
+    if (poll.kind === "stopped") {
+      this.writeSignalInfo(channel, siginfoPtr, poll.childPid, poll.waitStatus);
       this.completeChannel(channel, SYS_WAITID, origArgs, undefined, 0, 0);
       return;
     }
@@ -7156,17 +7521,22 @@ export class CentralizedKernelWorker {
       procView.setInt32(siginfoPtr + i, 0, true);
     }
 
-    const signaled = (waitStatus & 0x7f) !== 0;
+    const stopped = (waitStatus & 0xff) === 0x7f;
+    const signaled = !stopped && (waitStatus & 0x7f) !== 0;
     procView.setInt32(siginfoPtr + 0, SIGCHLD, true);  // si_signo
     procView.setInt32(siginfoPtr + 4, 0, true);         // si_errno
-    if (signaled) {
+    if (stopped) {
+      procView.setInt32(siginfoPtr + 8, CLD_STOPPED, true); // si_code
+    } else if (signaled) {
       procView.setInt32(siginfoPtr + 8, CLD_KILLED, true); // si_code
     } else {
       procView.setInt32(siginfoPtr + 8, CLD_EXITED, true); // si_code
     }
     procView.setInt32(siginfoPtr + 12, childPid, true);  // si_pid
     procView.setInt32(siginfoPtr + 16, 1000, true);      // si_uid
-    if (signaled) {
+    if (stopped) {
+      procView.setInt32(siginfoPtr + 20, (waitStatus >> 8) & 0xff, true); // si_status = stop signal
+    } else if (signaled) {
       procView.setInt32(siginfoPtr + 20, waitStatus & 0x7f, true); // si_status = signal number
     } else {
       procView.setInt32(siginfoPtr + 20, (waitStatus >> 8) & 0xff, true); // si_status = exit code
@@ -7340,6 +7710,35 @@ export class CentralizedKernelWorker {
   }
 
   /**
+   * Handle a host POSIX-timer expiration. New kernels queue the signal
+   * themselves from the stored sigevent so Linux SIGEV_THREAD_ID and
+   * SIGEV_NONE semantics are preserved. Older kernels fall back to the
+   * historical shared-signal path.
+   */
+  private firePosixTimer(targetPid: number, timerId: number, fallbackSigno: number): void {
+    if (!this.kernelInstance) return;
+    if (!this.processes.has(targetPid)) return;
+
+    const timerFire = this.kernelInstance.exports.kernel_posix_timer_fire as
+      ((pid: number, timerId: number) => number) | undefined;
+    if (timerFire) {
+      const queuedSigno = timerFire(targetPid, timerId);
+      if (queuedSigno > 0) {
+        this.wakeProcessForSignalIfDeliverable(targetPid, queuedSigno);
+      }
+      return;
+    }
+
+    // Compatibility path for kernels that predate kernel_posix_timer_fire.
+    const intervalFire = this.kernelInstance.exports.kernel_posix_timer_interval_fire as
+      ((pid: number, timerId: number) => number) | undefined;
+    const alreadyPending = intervalFire ? intervalFire(targetPid, timerId) : 0;
+    if (!alreadyPending && fallbackSigno > 0) {
+      this.sendSignalToProcess(targetPid, fallbackSigno);
+    }
+  }
+
+  /**
    * Queue a signal on a target process in the kernel by invoking SYS_KILL
    * through kernel_handle_channel. The signal is queued in the kernel's
    * ProcessTable and will be delivered via dequeueSignalForDelivery on the
@@ -7377,6 +7776,29 @@ export class CentralizedKernelWorker {
       console.error(`[sendSignalToProcess] kernel threw for pid=${targetPid} sig=${signum}: ${err}`);
     } finally {
       this.currentHandlePid = 0;
+    }
+
+    this.wakeProcessForSignalIfDeliverable(targetPid, signum);
+  }
+
+  /**
+   * Wake any host-side blocking syscall state for a signal that is already
+   * queued in the kernel.
+   */
+  private wakeProcessForSignalIfDeliverable(targetPid: number, signum: number): void {
+    if (!this.kernelInstance || signum <= 0) return;
+    if (!this.processes.has(targetPid)) return;
+
+    // rt_sigtimedwait waits for selected pending signals regardless of whether
+    // they are blocked for asynchronous handler delivery. Retry these first so
+    // the kernel can match the wait set and consume the queued signal.
+    for (const [key, waitEntry] of Array.from(this.pendingSigTimedWaits.entries())) {
+      if (waitEntry.channel.pid !== targetPid) continue;
+      clearTimeout(waitEntry.timer);
+      this.pendingSigTimedWaits.delete(key);
+      if (this.processes.has(targetPid)) {
+        this.retrySyscall(waitEntry.channel);
+      }
     }
 
     // Check if the signal is deliverable (not blocked by the process)
@@ -8362,6 +8784,172 @@ export class CentralizedKernelWorker {
     }
   }
 
+  private setKernelCurrentPid(pid: number): void {
+    const setCurrentPid = this.kernelInstance!.exports.kernel_set_current_pid as
+      ((pid: number) => void) | undefined;
+    if (setCurrentPid) setCurrentPid(pid);
+  }
+
+  private synchronizeSysvShmMappingsForSyscallBoundary(channel: ChannelInfo): void {
+    this.syncSysvShmMappingsFromProcess(channel);
+    this.refreshSysvShmMappingsToProcess(channel);
+  }
+
+  private syncSysvShmMappingsFromProcess(channel: ChannelInfo): void {
+    const pidMap = this.shmMappings.get(channel.pid);
+    if (!pidMap || pidMap.size === 0) return;
+    const processMem = new Uint8Array(channel.memory.buffer);
+    this.setKernelCurrentPid(channel.pid);
+
+    for (const [mapAddr, mapping] of pidMap) {
+      this.syncSysvShmMappingFromProcess(processMem, mapAddr, mapping);
+    }
+  }
+
+  private syncSysvShmMappingFromProcess(
+    processMem: Uint8Array,
+    mapAddr: number,
+    mapping: SysvShmMapping,
+  ): void {
+    if (mapping.readOnly) return;
+    if (mapAddr + mapping.size > processMem.length) return;
+
+    let changed = false;
+    for (let offset = 0; offset < mapping.size; offset += FILE_PAGE_SIZE) {
+      const n = Math.min(FILE_PAGE_SIZE, mapping.size - offset);
+      if (!this.rangeDiffersFromSnapshot(
+        processMem,
+        mapAddr + offset,
+        mapping.snapshot,
+        offset,
+        n,
+      )) {
+        continue;
+      }
+
+      const bytes = processMem.subarray(mapAddr + offset, mapAddr + offset + n);
+      if (!this.writeSysvShmRange(mapping.segId, offset, bytes)) break;
+      mapping.snapshot.set(bytes, offset);
+      changed = true;
+    }
+
+    if (changed) {
+      const version = (this.shmSegmentVersions.get(mapping.segId) ?? 0) + 1;
+      this.shmSegmentVersions.set(mapping.segId, version);
+      mapping.version = version;
+    }
+  }
+
+  private refreshSysvShmMappingsToProcess(channel: ChannelInfo): void {
+    const pidMap = this.shmMappings.get(channel.pid);
+    if (!pidMap || pidMap.size === 0) return;
+    const processMem = new Uint8Array(channel.memory.buffer);
+
+    for (const [mapAddr, mapping] of pidMap) {
+      const version = this.shmSegmentVersions.get(mapping.segId) ?? 0;
+      if (mapping.version === version) continue;
+      if (mapAddr + mapping.size > processMem.length) continue;
+      const latest = this.readSysvShmRange(mapping.segId, 0, mapping.size);
+      if (!latest) continue;
+      processMem.set(latest, mapAddr);
+      mapping.snapshot = latest;
+      mapping.version = version;
+    }
+  }
+
+  private readSysvShmRange(segId: number, offset: number, len: number): Uint8Array | null {
+    const readChunk = this.kernelInstance!.exports.kernel_ipc_shm_read_chunk as
+      (shmid: number, offset: number, outPtr: KernelPointer, maxLen: number) => number;
+    const kernelMem = this.getKernelMem();
+    const chunkPtr = this.scratchOffset + CH_DATA;
+    const out = new Uint8Array(len);
+    let transferred = 0;
+
+    while (transferred < len) {
+      const toRead = Math.min(CH_DATA_SIZE, len - transferred);
+      const nRead = readChunk(segId, offset + transferred, this.toKernelPtr(chunkPtr), toRead);
+      if (nRead < 0) return null;
+      if (nRead === 0) break;
+      out.set(kernelMem.subarray(chunkPtr, chunkPtr + nRead), transferred);
+      transferred += nRead;
+    }
+
+    return out;
+  }
+
+  private writeSysvShmRange(segId: number, offset: number, bytes: Uint8Array): boolean {
+    const writeChunk = this.kernelInstance!.exports.kernel_ipc_shm_write_chunk as
+      (shmid: number, offset: number, dataPtr: KernelPointer, dataLen: number) => number;
+    const kernelMem = this.getKernelMem();
+    const chunkPtr = this.scratchOffset + CH_DATA;
+    let transferred = 0;
+
+    while (transferred < bytes.length) {
+      const toWrite = Math.min(CH_DATA_SIZE, bytes.length - transferred);
+      kernelMem.set(bytes.subarray(transferred, transferred + toWrite), chunkPtr);
+      const nWritten = writeChunk(segId, offset + transferred, this.toKernelPtr(chunkPtr), toWrite);
+      if (nWritten <= 0) return false;
+      transferred += nWritten;
+    }
+
+    return true;
+  }
+
+  private releaseAllSysvShmMappingsForProcess(pid: number): void {
+    const registration = this.processes.get(pid);
+    const pidMap = this.shmMappings.get(pid);
+    if (!pidMap || pidMap.size === 0) return;
+
+    if (registration) {
+      this.syncSysvShmMappingsFromProcess({
+        pid,
+        memory: registration.memory,
+        channelOffset: 0,
+        i32View: new Int32Array(registration.memory.buffer, 0, 1),
+        consecutiveSyscalls: 0,
+      });
+    }
+
+    this.setKernelCurrentPid(pid);
+    const kernelShmdt = this.kernelInstance!.exports.kernel_ipc_shmdt as
+      ((shmid: number) => number) | undefined;
+    if (kernelShmdt) {
+      for (const mapping of pidMap.values()) {
+        kernelShmdt(mapping.segId);
+      }
+    }
+    this.shmMappings.delete(pid);
+  }
+
+  private inheritSysvShmMappings(parentPid: number, childPid: number): void {
+    const parentMap = this.shmMappings.get(parentPid);
+    const childRegistration = this.processes.get(childPid);
+    if (!parentMap || parentMap.size === 0 || !childRegistration) return;
+
+    const childMem = new Uint8Array(childRegistration.memory.buffer);
+    const childMap = new Map<number, SysvShmMapping>();
+    const kernelShmat = this.kernelInstance!.exports.kernel_ipc_shmat as
+      ((shmid: number, shmaddr: number, flags: number) => number) | undefined;
+    if (!kernelShmat) return;
+
+    this.setKernelCurrentPid(childPid);
+    for (const [mapAddr, mapping] of parentMap) {
+      if (mapAddr + mapping.size > childMem.length) continue;
+      const flags = mapping.readOnly ? SHM_RDONLY : 0;
+      const sizeOrErr = kernelShmat(mapping.segId, mapAddr, flags);
+      if (sizeOrErr < 0) continue;
+      childMap.set(mapAddr, {
+        ...mapping,
+        snapshot: childMem.slice(mapAddr, mapAddr + mapping.size),
+        version: this.shmSegmentVersions.get(mapping.segId) ?? mapping.version,
+      });
+    }
+
+    if (childMap.size > 0) {
+      this.shmMappings.set(childPid, childMap);
+    }
+  }
+
   /** Set the next child PID to allocate. */
   setNextChildPid(pid: number): void {
     this.nextChildPid = pid;
@@ -9321,7 +9909,6 @@ export class CentralizedKernelWorker {
       }
     }
     this.tcpConnections.delete(pid);
-    this.shmMappings.delete(pid);
   }
 
   // =========================================================================
@@ -9448,8 +10035,7 @@ export class CentralizedKernelWorker {
     const [shmid, _shmaddr, _flags] = args;
 
     // Set current pid for kernel_ipc_* exports
-    const setCurrentPid = this.kernelInstance!.exports.kernel_set_current_pid as ((pid: number) => void) | undefined;
-    if (setCurrentPid) setCurrentPid(channel.pid);
+    this.setKernelCurrentPid(channel.pid);
 
     const kernelShmat = this.kernelInstance!.exports.kernel_ipc_shmat as (shmid: number, shmaddr: number, flags: number) => number;
     const sizeOrErr = kernelShmat(shmid, _shmaddr, _flags);
@@ -9461,11 +10047,13 @@ export class CentralizedKernelWorker {
     const size = sizeOrErr;
 
     // Synthesize mmap to allocate virtual address space for this pid
+    const readOnly = (_flags & SHM_RDONLY) !== 0;
+    const prot = readOnly ? 1 : 3; // PROT_READ, or PROT_READ|PROT_WRITE.
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
     kernelView.setUint32(CH_SYSCALL, SYS_MMAP, true);
     kernelView.setBigInt64(CH_ARGS + 0 * CH_ARG_SIZE, BigInt(0), true);          // addr hint = NULL
     kernelView.setBigInt64(CH_ARGS + 1 * CH_ARG_SIZE, BigInt(size), true);        // length
-    kernelView.setBigInt64(CH_ARGS + 2 * CH_ARG_SIZE, BigInt(3), true);           // prot = PROT_READ|PROT_WRITE
+    kernelView.setBigInt64(CH_ARGS + 2 * CH_ARG_SIZE, BigInt(prot), true);        // prot
     kernelView.setBigInt64(CH_ARGS + 3 * CH_ARG_SIZE, BigInt(0x22), true);       // flags = MAP_PRIVATE|MAP_ANONYMOUS
     kernelView.setBigInt64(CH_ARGS + 4 * CH_ARG_SIZE, BigInt(-1), true);         // fd = -1
     kernelView.setBigInt64(CH_ARGS + 5 * CH_ARG_SIZE, BigInt(0), true);          // offset = 0
@@ -9492,23 +10080,13 @@ export class CentralizedKernelWorker {
     }
 
     // Grow process memory to cover the allocated address
-    this.ensureProcessMemoryCovers(channel.pid, channel.memory, SYS_MMAP, addr, [0, size, 3, 0x22, -1, 0]);
+    this.ensureProcessMemoryCovers(channel.pid, channel.memory, SYS_MMAP, addr, [0, size, prot, 0x22, -1, 0]);
 
     // Transfer segment data from kernel to process memory via read_chunk
-    const readChunk = this.kernelInstance!.exports.kernel_ipc_shm_read_chunk as
-      (shmid: number, offset: number, outPtr: KernelPointer, maxLen: number) => number;
     const processMem = new Uint8Array(channel.memory.buffer);
-    const kernelMem = this.getKernelMem();
-    const chunkSize = CH_DATA_SIZE;
-    const chunkPtr = this.scratchOffset + CH_DATA;
-    let transferred = 0;
-    while (transferred < size) {
-      const remaining = size - transferred;
-      const toRead = Math.min(remaining, chunkSize);
-      const nRead = readChunk(shmid, transferred, this.toKernelPtr(chunkPtr), toRead);
-      if (nRead <= 0) break;
-      processMem.set(kernelMem.subarray(chunkPtr, chunkPtr + nRead), (addr >>> 0) + transferred);
-      transferred += nRead;
+    const snapshot = this.readSysvShmRange(shmid, 0, size);
+    if (snapshot) {
+      processMem.set(snapshot, addr >>> 0);
     }
 
     // Track the mapping for shmdt
@@ -9517,7 +10095,14 @@ export class CentralizedKernelWorker {
       pidMappings = new Map();
       this.shmMappings.set(channel.pid, pidMappings);
     }
-    pidMappings.set(addr >>> 0, { segId: shmid, size });
+    const mapAddr = addr >>> 0;
+    pidMappings.set(mapAddr, {
+      segId: shmid,
+      size,
+      readOnly,
+      snapshot: snapshot ?? processMem.slice(mapAddr, mapAddr + size),
+      version: this.shmSegmentVersions.get(shmid) ?? 0,
+    });
 
     this.completeChannelRaw(channel, addr, 0);
     this.relistenChannel(channel);
@@ -9540,25 +10125,12 @@ export class CentralizedKernelWorker {
     }
 
     // Set current pid for kernel exports
-    const setCurrentPid = this.kernelInstance!.exports.kernel_set_current_pid as ((pid: number) => void) | undefined;
-    if (setCurrentPid) setCurrentPid(channel.pid);
+    this.setKernelCurrentPid(channel.pid);
 
-    // Sync process memory back to kernel segment via write_chunk
-    const writeChunk = this.kernelInstance!.exports.kernel_ipc_shm_write_chunk as
-      (shmid: number, offset: number, dataPtr: KernelPointer, dataLen: number) => number;
+    // Sync only dirty writable mappings. A read-only attachment must never
+    // overwrite newer segment contents on detach.
     const processMem = new Uint8Array(channel.memory.buffer);
-    const kernelMem = this.getKernelMem();
-    const chunkSize = CH_DATA_SIZE;
-    const chunkPtr = this.scratchOffset + CH_DATA;
-    let transferred = 0;
-    while (transferred < mapping.size) {
-      const remaining = mapping.size - transferred;
-      const toWrite = Math.min(remaining, chunkSize);
-      kernelMem.set(processMem.subarray(addr + transferred, addr + transferred + toWrite), chunkPtr);
-      const nWritten = writeChunk(mapping.segId, transferred, this.toKernelPtr(chunkPtr), toWrite);
-      if (nWritten <= 0) break;
-      transferred += nWritten;
-    }
+    this.syncSysvShmMappingFromProcess(processMem, addr, mapping);
 
     // Kernel-side detach bookkeeping
     const kernelShmdt = this.kernelInstance!.exports.kernel_ipc_shmdt as (shmid: number) => number;

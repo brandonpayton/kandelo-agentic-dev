@@ -1011,7 +1011,7 @@ async function handleSpawn(
       if (msg.stdin) {
         const stdinData =
           msg.stdin instanceof Uint8Array ? msg.stdin : new Uint8Array(msg.stdin);
-        kernelWorker.setStdinData(pid, stdinData);
+        kernelWorker.setStdinData(pid, stdinData, msg.stdinIsPipe ?? true);
       }
     }
 

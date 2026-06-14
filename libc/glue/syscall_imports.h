@@ -648,7 +648,7 @@ int32_t kernel_sendto(int32_t fd, const uint8_t *buf_ptr, uint32_t buf_len,
 
 KERNEL_IMPORT(kernel_recvfrom)
 int32_t kernel_recvfrom(int32_t fd, uint8_t *buf_ptr, uint32_t buf_len,
-                        uint32_t flags, uint8_t *addr_ptr, uint32_t addr_len);
+                        uint32_t flags, uint8_t *addr_ptr, uint32_t *addrlen_ptr);
 
 KERNEL_IMPORT(kernel_select)
 int32_t kernel_select(int32_t nfds, uint8_t *readfds_ptr,

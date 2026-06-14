@@ -16,6 +16,7 @@ interface RunPhpScriptRequest {
   cwd: string;
   env?: string[];
   stdin?: string;
+  stdinIsPipe?: boolean;
   pipeStdio?: number[];
   timeoutMs?: number;
 }
@@ -139,6 +140,7 @@ async function init() {
           cwd: request.cwd,
           env,
           stdin,
+          stdinIsPipe: request.stdinIsPipe,
           pipeStdio: request.pipeStdio,
         }),
         new Promise<number>((_, reject) =>

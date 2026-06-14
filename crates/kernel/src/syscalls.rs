@@ -1662,14 +1662,11 @@ pub fn sys_read(
                 return Ok(n);
             }
 
-            let n = if (0..=2).contains(&host_handle) {
-                host.host_read(host_handle, buf)?
-            } else {
-                let current_offset = proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset);
-                host.host_pread(host_handle, current_offset, buf)?
-            };
+            let n = host.host_read(host_handle, buf)?;
             if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-                ofd.offset += n as i64;
+                ofd.offset = host
+                    .host_seek(host_handle, 0, SEEK_CUR)
+                    .unwrap_or(ofd.offset.saturating_add(n as i64));
             }
             Ok(n)
         }
@@ -2010,21 +2007,20 @@ pub fn sys_write(
             // RLIMIT_FSIZE: check if write would exceed file size limit
             let fsize_limit = proc.rlimits[1][0]; // RLIMIT_FSIZE soft limit
             if fsize_limit != u64::MAX {
-                let current_offset = proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset);
+                let current_offset = host.host_seek(host_handle, 0, SEEK_CUR).unwrap_or_else(|_| {
+                    proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset)
+                });
                 let end_pos = current_offset as u64 + buf.len() as u64;
                 if end_pos > fsize_limit {
                     proc.signals.raise(wasm_posix_shared::signal::SIGXFSZ);
                     return Err(Errno::EFBIG);
                 }
             }
-            let n = if (0..=2).contains(&host_handle) {
-                host.host_write(host_handle, buf)?
-            } else {
-                let current_offset = proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset);
-                host.host_pwrite(host_handle, current_offset, buf)?
-            };
+            let n = host.host_write(host_handle, buf)?;
             if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-                ofd.offset += n as i64;
+                ofd.offset = host
+                    .host_seek(host_handle, 0, SEEK_CUR)
+                    .unwrap_or(ofd.offset.saturating_add(n as i64));
             }
             Ok(n)
         }
@@ -2206,9 +2202,7 @@ pub fn sys_lseek(
     }
 
     let new_offset = match whence {
-        SEEK_SET => offset,
-        SEEK_CUR => ofd.offset + offset,
-        SEEK_END => host.host_seek(ofd.host_handle, offset, whence)?,
+        SEEK_SET | SEEK_CUR | SEEK_END => host.host_seek(ofd.host_handle, offset, whence)?,
         _ => return Err(Errno::EINVAL),
     };
 
@@ -3220,6 +3214,7 @@ pub fn sys_stat(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Resul
         });
     }
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
+        crate::procfs::validate_entry(proc, &entry)?;
         return Ok(crate::procfs::procfs_stat(&entry, 0, true));
     }
     if let Some(st) = crate::devfs::match_devfs_stat(&resolved, proc.euid, proc.egid) {
@@ -3290,6 +3285,7 @@ pub fn sys_lstat(
         });
     }
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
+        crate::procfs::validate_entry(proc, &entry)?;
         return Ok(crate::procfs::procfs_stat(&entry, 0, false));
     }
     if let Some(st) = crate::devfs::match_devfs_stat(&resolved, proc.euid, proc.egid) {
@@ -3500,7 +3496,8 @@ pub fn sys_access(
     {
         return Ok(());
     }
-    if crate::procfs::match_procfs(&resolved, proc.pid).is_some() {
+    if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
+        crate::procfs::validate_entry(proc, &entry)?;
         // Procfs entries are read-only: allow R_OK/F_OK/X_OK(dirs), deny W_OK
         if amode & 0o2 != 0 {
             return Err(Errno::EACCES);
@@ -3519,6 +3516,7 @@ pub fn sys_chdir(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Resu
     let canonical = || crate::path::canonicalize_existing_path(&resolved);
     // Check virtual filesystems first (procfs, devfs), then fall through to host
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
+        crate::procfs::validate_entry(proc, &entry)?;
         let st = crate::procfs::procfs_stat(&entry, 0, true);
         if st.st_mode & wasm_posix_shared::mode::S_IFMT != wasm_posix_shared::mode::S_IFDIR {
             return Err(Errno::ENOTDIR);
@@ -4149,7 +4147,11 @@ pub fn sys_getdents64(
 
 /// Get the process ID.
 pub fn sys_getpid(proc: &Process) -> i32 {
-    proc.pid as i32
+    if proc.pid_ns_vpid != 0 {
+        proc.pid_ns_vpid as i32
+    } else {
+        proc.pid as i32
+    }
 }
 
 /// Get the parent process ID.
@@ -4273,6 +4275,67 @@ pub fn sys_kill(
 /// Send a signal to the current process.
 pub fn sys_raise(proc: &mut Process, host: &mut dyn HostIO, sig: u32) -> Result<(), Errno> {
     sys_kill(proc, host, proc.pid as i32, sig)
+}
+
+/// Linux unshare(2) namespace support.
+///
+/// Kandelo models the namespaces that are observable by current guests:
+/// - CLONE_NEWUSER gives the process an unmapped overflow uid/gid, matching
+///   Linux's view before uid_map/gid_map are populated.
+/// - CLONE_NEWPID places subsequently-forked children in a new PID namespace;
+///   the first child observes getpid() == 1.
+/// - CLONE_NEWNET creates an isolated network namespace with no external DNS
+///   or routes. Loopback/in-process sockets continue to work.
+///
+/// Other namespace types are valid Linux flags but are not implemented yet;
+/// return EPERM rather than silently pretending isolation was created.
+pub fn sys_unshare(proc: &mut Process, flags: u32) -> Result<(), Errno> {
+    const CLONE_NEWTIME: u32 = 0x00000080;
+    const CLONE_NEWNS: u32 = 0x00020000;
+    const CLONE_NEWCGROUP: u32 = 0x02000000;
+    const CLONE_NEWUTS: u32 = 0x04000000;
+    const CLONE_NEWIPC: u32 = 0x08000000;
+    const CLONE_NEWUSER: u32 = 0x10000000;
+    const CLONE_NEWPID: u32 = 0x20000000;
+    const CLONE_NEWNET: u32 = 0x40000000;
+    const VALID_FLAGS: u32 = CLONE_NEWTIME
+        | CLONE_NEWNS
+        | CLONE_NEWCGROUP
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_NEWNET;
+    const IMPLEMENTED_FLAGS: u32 = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+
+    if flags == 0 || flags & !VALID_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & !IMPLEMENTED_FLAGS != 0 {
+        return Err(Errno::EPERM);
+    }
+
+    if flags & CLONE_NEWUSER != 0 {
+        // In a fresh user namespace with no uid_map/gid_map, Linux exposes
+        // the overflow id (usually nobody/nogroup, 65534) instead of the
+        // caller's original id.
+        proc.uid = 65534;
+        proc.euid = 65534;
+        proc.gid = 65534;
+        proc.egid = 65534;
+    }
+    if flags & CLONE_NEWPID != 0 {
+        // unshare(CLONE_NEWPID) affects children created after the call; the
+        // caller remains in its current PID namespace.
+        if proc.pid_ns_next_child_pid == 0 {
+            proc.pid_ns_next_child_pid = 1;
+        }
+    }
+    if flags & CLONE_NEWNET != 0 {
+        proc.net_namespace_isolated = true;
+    }
+
+    Ok(())
 }
 
 /// Fork the current process. Delegates to host for worker creation.
@@ -5328,6 +5391,9 @@ pub fn sys_socket(
         AF_NETLINK => SocketDomain::Netlink,
         _ => return Err(Errno::EAFNOSUPPORT),
     };
+    if dom == SocketDomain::Unix && protocol != 0 {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
 
     let base_type = sock_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
     let stype = match base_type {
@@ -5374,7 +5440,9 @@ pub fn sys_socketpair(
     use wasm_posix_shared::socket::*;
 
     if domain != AF_UNIX {
-        return Err(Errno::EAFNOSUPPORT);
+        // Linux only supports socketpair(2) for AF_UNIX. For AF_INET with an
+        // unusable socket type, native Linux reports ESOCKTNOSUPPORT.
+        return Err(Errno::ESOCKTNOSUPPORT);
     }
 
     let base_type = sock_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -5523,6 +5591,16 @@ fn is_loopback_addr(addr: [u8; 4]) -> bool {
 
 fn is_loopback_addr6(addr: [u8; 16]) -> bool {
     addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+}
+
+fn loopback_addr6() -> [u8; 16] {
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+}
+
+fn ipv4_mapped_addr6(addr: [u8; 4]) -> [u8; 16] {
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, addr[0], addr[1], addr[2], addr[3],
+    ]
 }
 
 fn is_unspecified_addr6(addr: [u8; 16]) -> bool {
@@ -5730,9 +5808,14 @@ fn udp_send_datagram(
     };
     udp_ensure_bound(proc, host, sock_idx, auto_bind_addr)?;
 
-    let (src_addr, src_port) = {
+    let (bound_src_addr, src_port) = {
         let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
         (sock.bind_addr, sock.bind_port)
+    };
+    let src_addr = if bound_src_addr == [0, 0, 0, 0] && is_loopback_addr(dst_addr) {
+        udp_route_local_addr(dst_addr)
+    } else {
+        bound_src_addr
     };
     if !is_loopback_addr(dst_addr) {
         return match host.host_udp_send(&src_addr, src_port, &dst_addr, dst_port, buf) {
@@ -5751,8 +5834,15 @@ fn udp_send_datagram(
         data: buf.to_vec(),
         src_addr,
         src_addr6: [0; 16],
+        dst_addr,
+        dst_addr6: [0; 16],
         src_port,
         src_sock_idx: Some(sock_idx),
+        ipv6_tclass: 0,
+        src_pid: proc.pid,
+        src_uid: proc.uid,
+        src_gid: proc.gid,
+        ancillary_fds: Vec::new(),
     };
 
     let mut delivered = false;
@@ -5791,6 +5881,16 @@ fn unix_dgram_send_to_sock(
     dst_sock_idx: usize,
     buf: &[u8],
 ) -> Result<usize, Errno> {
+    unix_dgram_send_to_sock_with_ancillary(proc, src_sock_idx, dst_sock_idx, buf, Vec::new())
+}
+
+fn unix_dgram_send_to_sock_with_ancillary(
+    proc: &mut Process,
+    src_sock_idx: usize,
+    dst_sock_idx: usize,
+    buf: &[u8],
+    ancillary_fds: Vec<crate::pipe::InFlightFd>,
+) -> Result<usize, Errno> {
     use crate::socket::Datagram;
 
     let shut_wr = proc
@@ -5806,8 +5906,15 @@ fn unix_dgram_send_to_sock(
         data: buf.to_vec(),
         src_addr: [0; 4],
         src_addr6: [0; 16],
+        dst_addr: [0; 4],
+        dst_addr6: [0; 16],
         src_port: 0,
         src_sock_idx: Some(src_sock_idx),
+        ipv6_tclass: 0,
+        src_pid: proc.pid,
+        src_uid: proc.uid,
+        src_gid: proc.gid,
+        ancillary_fds,
     };
     let target = proc.sockets.get_mut(dst_sock_idx).ok_or(Errno::ECONNREFUSED)?;
     udp_queue_datagram(target, datagram);
@@ -5924,6 +6031,7 @@ fn udp6_send_datagram(
     buf: &[u8],
     dst_addr: [u8; 16],
     dst_port: u16,
+    tclass_override: Option<u32>,
 ) -> Result<usize, Errno> {
     use crate::socket::{Datagram, SocketDomain, SocketState, SocketType};
 
@@ -5955,16 +6063,38 @@ fn udp6_send_datagram(
     };
     udp6_ensure_bound(proc, sock_idx, auto_bind_addr)?;
 
-    let (src_addr, src_port) = {
+    let (bound_src_addr, src_port) = {
         let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
         (sock.bind_addr6, sock.bind_port)
+    };
+    let src_addr = if is_unspecified_addr6(bound_src_addr) && is_loopback_addr6(dst_addr) {
+        loopback
+    } else {
+        bound_src_addr
     };
     let datagram = Datagram {
         data: buf.to_vec(),
         src_addr: [0; 4],
         src_addr6: src_addr,
+        dst_addr: [0; 4],
+        dst_addr6: dst_addr,
         src_port,
         src_sock_idx: Some(sock_idx),
+        ipv6_tclass: tclass_override.unwrap_or_else(|| {
+            proc.sockets
+                .get(sock_idx)
+                .and_then(|sock| {
+                    sock.get_option(
+                        wasm_posix_shared::socket::IPPROTO_IPV6,
+                        wasm_posix_shared::socket::IPV6_TCLASS,
+                    )
+                })
+                .unwrap_or(0)
+        }),
+        src_pid: proc.pid,
+        src_uid: proc.uid,
+        src_gid: proc.gid,
+        ancillary_fds: Vec::new(),
     };
 
     let mut delivered = false;
@@ -6014,8 +6144,15 @@ pub fn inject_udp_datagram_into(
         data: data.to_vec(),
         src_addr,
         src_addr6: [0; 16],
+        dst_addr,
+        dst_addr6: [0; 16],
         src_port,
         src_sock_idx: None,
+        ipv6_tclass: 0,
+        src_pid: 0,
+        src_uid: 0,
+        src_gid: 0,
+        ancillary_fds: Vec::new(),
     };
     let endpoints = crate::socket::udp_lookup(dst_addr, dst_port);
     for endpoint in endpoints {
@@ -6156,6 +6293,7 @@ pub fn sys_shutdown(
     fd: i32,
     how: u32,
 ) -> Result<(), Errno> {
+    use crate::socket::{SocketState, SocketType};
     use wasm_posix_shared::socket::*;
 
     let entry = proc.fd_table.get(fd)?;
@@ -6167,6 +6305,9 @@ pub fn sys_shutdown(
 
     let sock_idx = (-(ofd.host_handle + 1)) as usize;
     let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+    if sock.sock_type == SocketType::Stream && sock.state != SocketState::Connected {
+        return Err(Errno::ENOTCONN);
+    }
     let use_global = sock.global_pipes;
 
     match how {
@@ -6264,7 +6405,7 @@ pub fn sys_send(
                 }
                 let dst_addr = sock.peer_addr6;
                 let dst_port = sock.peer_port;
-                return udp6_send_datagram(proc, sock_idx, buf, dst_addr, dst_port);
+                return udp6_send_datagram(proc, sock_idx, buf, dst_addr, dst_port, None);
             }
             SocketDomain::Unix if sock.state == SocketState::Connected => {
                 let peer_idx = sock.peer_idx;
@@ -6482,15 +6623,34 @@ pub fn sys_getsockopt(proc: &mut Process, fd: i32, level: u32, optname: u32) -> 
                 0
             }),
             SO_RCVBUF | SO_SNDBUF => Ok(DEFAULT_PIPE_CAPACITY as u32),
-            SO_REUSEADDR | SO_KEEPALIVE | SO_LINGER | SO_BROADCAST => {
+            SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE | SO_LINGER | SO_BROADCAST
+            | SO_PASSCRED | SO_BINDTODEVICE | SO_ATTACH_REUSEPORT_CBPF | SO_ZEROCOPY => {
                 Ok(sock.get_option(level, optname).unwrap_or(0))
             }
             // SO_RCVTIMEO/SO_SNDTIMEO handled by sys_getsockopt_timeout
             _ => Err(Errno::ENOPROTOOPT),
         },
+        IPPROTO_IP => match optname {
+            IP_TOS | IP_PKTINFO | IP_MTU_DISCOVER | IP_MULTICAST_IF | IP_MULTICAST_TTL
+            | IP_MULTICAST_LOOP | MCAST_JOIN_GROUP => {
+                Ok(sock.get_option(level, optname).unwrap_or_else(|| match optname {
+                    IP_MULTICAST_TTL | IP_MULTICAST_LOOP => 1,
+                    _ => 0,
+                }))
+            }
+            IP_MTU => Ok(1500),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        IPPROTO_IPV6 => match optname {
+            IPV6_MULTICAST_IF | IPV6_MULTICAST_HOPS | IPV6_MULTICAST_LOOP
+            | IPV6_RECVPKTINFO | IPV6_RECVTCLASS | IPV6_DONTFRAG | IPV6_TCLASS => {
+                Ok(sock.get_option(level, optname).unwrap_or(0))
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
         IPPROTO_TCP => match optname {
             TCP_NODELAY | TCP_CORK | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT
-            | TCP_DEFER_ACCEPT | TCP_QUICKACK | TCP_USER_TIMEOUT => {
+            | TCP_DEFER_ACCEPT | TCP_QUICKACK | TCP_USER_TIMEOUT | TCP_CONGESTION => {
                 Ok(sock.get_option(level, optname).unwrap_or(0))
             }
             // TCP_INFO handled separately by sys_getsockopt_tcp_info
@@ -6579,6 +6739,119 @@ pub fn sys_getsockopt_timeout(proc: &Process, fd: i32, optname: u32) -> Result<u
     })
 }
 
+/// Get SO_LINGER's structured state.
+pub fn sys_getsockopt_linger(proc: &Process, fd: i32) -> Result<(i32, i32), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+    Ok((sock.linger_onoff, sock.linger_seconds))
+}
+
+/// Set SO_LINGER's structured state.
+pub fn sys_setsockopt_linger(
+    proc: &mut Process,
+    fd: i32,
+    l_onoff: i32,
+    l_linger: i32,
+) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+    sock.linger_onoff = l_onoff;
+    sock.linger_seconds = l_linger;
+    sock.set_option(
+        wasm_posix_shared::socket::SOL_SOCKET,
+        wasm_posix_shared::socket::SO_LINGER,
+        if l_onoff != 0 { 1 } else { 0 },
+    );
+    Ok(())
+}
+
+/// Set SO_BINDTODEVICE to a named virtual interface.
+pub fn sys_setsockopt_bindtodevice(
+    proc: &mut Process,
+    fd: i32,
+    device: &[u8],
+) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let name = device
+        .split(|&b| b == 0)
+        .next()
+        .unwrap_or(device);
+    if name != b"lo" && name != b"eth0" {
+        return Err(Errno::ENODEV);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+    sock.bind_device = Some(name.to_vec());
+    sock.set_option(
+        wasm_posix_shared::socket::SOL_SOCKET,
+        wasm_posix_shared::socket::SO_BINDTODEVICE,
+        1,
+    );
+    Ok(())
+}
+
+/// Get TCP_CONGESTION's algorithm name.
+pub fn sys_getsockopt_tcp_congestion(proc: &Process, fd: i32) -> Result<Vec<u8>, Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+    Ok(sock.tcp_congestion.clone())
+}
+
+/// Set TCP_CONGESTION's algorithm name.
+pub fn sys_setsockopt_tcp_congestion(
+    proc: &mut Process,
+    fd: i32,
+    name: &[u8],
+) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let name = name
+        .split(|&b| b == 0)
+        .next()
+        .unwrap_or(name);
+    if name.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    // Kandelo's virtual TCP stack does not implement multiple congestion
+    // algorithms, but Linux exposes "cubic" as a normal unprivileged default.
+    // Accepting the common aliases keeps the option usable without pretending
+    // to implement BBR/Reno behavior internally.
+    if name != b"cubic" && name != b"reno" && name != b"newreno" {
+        return Err(Errno::ENOENT);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+    sock.tcp_congestion = name.to_vec();
+    sock.set_option(
+        wasm_posix_shared::socket::IPPROTO_TCP,
+        wasm_posix_shared::socket::TCP_CONGESTION,
+        1,
+    );
+    Ok(())
+}
+
 /// Set socket option value.
 pub fn sys_setsockopt(
     proc: &mut Process,
@@ -6600,16 +6873,36 @@ pub fn sys_setsockopt(
 
     match level {
         SOL_SOCKET => match optname {
-            SO_REUSEADDR | SO_KEEPALIVE | SO_RCVBUF | SO_SNDBUF | SO_LINGER | SO_BROADCAST => {
+            SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE | SO_RCVBUF | SO_SNDBUF | SO_LINGER
+            | SO_BROADCAST | SO_PASSCRED | SO_BINDTODEVICE | SO_ATTACH_REUSEPORT_CBPF
+            | SO_ZEROCOPY => {
+                    sock.set_option(level, optname, value);
+                    Ok(())
+                }
+            // SO_RCVTIMEO/SO_SNDTIMEO handled by sys_setsockopt_timeout
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        IPPROTO_IP => match optname {
+            IP_TOS | IP_PKTINFO | IP_MTU_DISCOVER | IP_MULTICAST_IF | IP_MULTICAST_TTL
+            | IP_MULTICAST_LOOP | MCAST_JOIN_GROUP => {
                 sock.set_option(level, optname, value);
                 Ok(())
             }
-            // SO_RCVTIMEO/SO_SNDTIMEO handled by sys_setsockopt_timeout
+            IP_MTU => Err(Errno::ENOPROTOOPT),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        IPPROTO_IPV6 => match optname {
+            IPV6_MULTICAST_IF | IPV6_MULTICAST_HOPS | IPV6_MULTICAST_LOOP
+            | IPV6_PKTINFO | IPV6_RECVPKTINFO | IPV6_RECVTCLASS | IPV6_DONTFRAG
+            | IPV6_TCLASS => {
+                sock.set_option(level, optname, value);
+                Ok(())
+            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         IPPROTO_TCP => match optname {
             TCP_NODELAY | TCP_CORK | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT
-            | TCP_DEFER_ACCEPT | TCP_QUICKACK | TCP_USER_TIMEOUT => {
+            | TCP_DEFER_ACCEPT | TCP_QUICKACK | TCP_USER_TIMEOUT | TCP_CONGESTION => {
                 sock.set_option(level, optname, value);
                 Ok(())
             }
@@ -6739,7 +7032,8 @@ pub fn sys_bind(
             }
             // Extract path: starts at offset 2, null-terminated
             let path_bytes = &addr[2..];
-            let (resolved, abstract_unix) = if path_bytes.first().copied() == Some(0) {
+            let (resolved, returned_path, abstract_unix) =
+                if path_bytes.first().copied() == Some(0) {
                 if path_bytes.len() < 2 {
                     return Err(Errno::EINVAL);
                 }
@@ -6747,7 +7041,7 @@ pub fn sys_bind(
                 // bytes after sun_family, including the leading NUL. No
                 // filesystem inode is created and embedded/trailing NUL bytes
                 // are part of the address.
-                (path_bytes.to_vec(), true)
+                (path_bytes.to_vec(), path_bytes.to_vec(), true)
             } else {
                 let path_end = path_bytes
                     .iter()
@@ -6756,8 +7050,10 @@ pub fn sys_bind(
                 if path_end == 0 {
                     return Err(Errno::EINVAL);
                 }
+                let supplied_path = path_bytes[..path_end].to_vec();
                 (
-                    crate::path::resolve_path(&path_bytes[..path_end], &proc.cwd),
+                    crate::path::resolve_path(&supplied_path, &proc.cwd),
+                    supplied_path,
                     false,
                 )
             };
@@ -6794,7 +7090,11 @@ pub fn sys_bind(
             }
 
             let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
-            sock.bind_path = Some(resolved);
+            // getsockname(AF_UNIX) returns the bound sun_path bytes supplied
+            // by userspace. The registry uses the canonical resolved
+            // filesystem path for lookup/conflict detection, but POSIX/Linux
+            // callers observe the original relative pathname.
+            sock.bind_path = Some(returned_path);
             sock.state = SocketState::Bound;
             Ok(())
         }
@@ -6823,12 +7123,57 @@ pub fn sys_listen(
         return Err(Errno::ENOTSOCK);
     }
     let sock_idx = (-(ofd.host_handle + 1)) as usize;
-    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
-    if sock.sock_type != SocketType::Stream {
+    let (domain, sock_type, state) = {
+        let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+        (sock.domain, sock.sock_type, sock.state)
+    };
+    if sock_type != SocketType::Stream {
         return Err(Errno::EOPNOTSUPP);
     }
-    if sock.state != SocketState::Bound && sock.state != SocketState::Listening {
+    if state == SocketState::Unbound {
+        // Linux auto-binds unbound INET stream sockets on listen(2). This is
+        // observable through getsockname() and lets standard socket option
+        // probes listen without an explicit bind.
+        match domain {
+            SocketDomain::Inet | SocketDomain::Inet6 => {
+                let assigned_port = {
+                    let p = proc.next_ephemeral_port;
+                    proc.next_ephemeral_port = proc.next_ephemeral_port.wrapping_add(1);
+                    if proc.next_ephemeral_port == 0 {
+                        proc.next_ephemeral_port = 49152;
+                    }
+                    p
+                };
+                if domain == SocketDomain::Inet {
+                    crate::socket::tcp_register(proc.pid, sock_idx, [0, 0, 0, 0], assigned_port)?;
+                }
+                let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+                sock.bind_addr = [0, 0, 0, 0];
+                sock.bind_addr6 = [0; 16];
+                sock.bind_port = assigned_port;
+                sock.state = SocketState::Bound;
+            }
+            SocketDomain::Unix | SocketDomain::Netlink => return Err(Errno::EINVAL),
+        }
+    } else if state != SocketState::Bound && state != SocketState::Listening {
         return Err(Errno::EINVAL);
+    }
+
+    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+    if let Some(value) = sock.get_option(
+        wasm_posix_shared::socket::IPPROTO_TCP,
+        wasm_posix_shared::socket::TCP_DEFER_ACCEPT,
+    ) {
+        if value > 0 {
+            // Linux rounds TCP_DEFER_ACCEPT to an internal retransmission
+            // timeout. Preserve the observable contract that getsockopt()
+            // after listen() returns a value greater than the requested one.
+            sock.set_option(
+                wasm_posix_shared::socket::IPPROTO_TCP,
+                wasm_posix_shared::socket::TCP_DEFER_ACCEPT,
+                value.saturating_add(1),
+            );
+        }
     }
     sock.state = SocketState::Listening;
     if sock.accept_wake_idx.is_none() {
@@ -6840,18 +7185,31 @@ pub fn sys_listen(
     // listening socket object, not one per process, so every fork/spawn
     // inheritor of this fd must pull from the same queue.
     let domain = sock.domain;
-    if matches!(domain, SocketDomain::Inet | SocketDomain::Unix)
+    if matches!(
+        domain,
+        SocketDomain::Inet | SocketDomain::Inet6 | SocketDomain::Unix
+    )
         && sock.shared_backlog_idx.is_none()
     {
         let backlog_idx = unsafe { crate::socket::shared_listener_backlog_table().alloc() };
         sock.shared_backlog_idx = Some(backlog_idx);
     }
 
-    // Notify the host for AF_INET sockets so it can open a real TCP server
+    // Notify the host so it can open a real TCP server. The bridge transport is
+    // IPv4 today; AF_INET6 loopback listeners are registered on the IPv4
+    // loopback transport while the guest-facing socket remains AF_INET6. This
+    // gives cross-process ::1 loopback the same accept/backlog semantics as
+    // 127.0.0.1 without exposing host-network details to the guest.
     let port = sock.bind_port;
     let addr = sock.bind_addr;
-    if domain == SocketDomain::Inet {
-        let _ = host.host_net_listen(fd, port, &addr);
+    match domain {
+        SocketDomain::Inet => {
+            let _ = host.host_net_listen(fd, port, &addr);
+        }
+        SocketDomain::Inet6 => {
+            let _ = host.host_net_listen(fd, port, &[127, 0, 0, 1]);
+        }
+        SocketDomain::Unix | SocketDomain::Netlink => {}
     }
     Ok(())
 }
@@ -6908,7 +7266,11 @@ pub fn sys_accept(proc: &mut Process, _host: &mut dyn HostIO, fd: i32) -> Result
                 SocketDomain::Inet6 => {
                     accepted.bind_addr6 = bind_addr6;
                     accepted.bind_port = bind_port;
-                    accepted.peer_addr = pc.peer_addr;
+                    accepted.peer_addr6 = if is_loopback_addr(pc.peer_addr) {
+                        loopback_addr6()
+                    } else {
+                        ipv4_mapped_addr6(pc.peer_addr)
+                    };
                     accepted.peer_port = pc.peer_port;
                 }
                 SocketDomain::Unix => {
@@ -6978,6 +7340,7 @@ pub fn sys_connect(
     if ofd.file_type != FileType::Socket {
         return Err(Errno::ENOTSOCK);
     }
+    let status_flags = ofd.status_flags;
     let sock_idx = (-(ofd.host_handle + 1)) as usize;
     let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
 
@@ -7029,6 +7392,13 @@ pub fn sys_connect(
             }
 
             if sock.state == SocketState::Connected {
+                return Err(Errno::EISCONN);
+            }
+            // POSIX sockets that have entered listen(2) mode are passive
+            // endpoints. Linux rejects connect(2) on the same descriptor with
+            // EISCONN; allowing it would let a listener connect to itself and
+            // corrupt the listener's backlog/state.
+            if sock.sock_type == SocketType::Stream && sock.state == SocketState::Listening {
                 return Err(Errno::EISCONN);
             }
 
@@ -7084,7 +7454,73 @@ pub fn sys_connect(
                         }
                     }
                 }
-                let listener_idx = listener_idx.ok_or(Errno::ECONNREFUSED)?;
+                let listener_idx = match listener_idx {
+                    Some(idx) => idx,
+                    None => {
+                        // Cross-process AF_INET6 loopback uses the same host
+                        // TCP bridge as AF_INET. Keep the socket's guest-visible
+                        // peer/bind metadata in IPv6 form, but ask the host
+                        // bridge to connect to its IPv4 loopback transport.
+                        let net_handle = sock_idx as i32;
+                        let was_connecting = sock.state == SocketState::Connecting;
+                        if sock.state != SocketState::Connecting {
+                            host.host_net_connect(net_handle, &[127, 0, 0, 1], port)?;
+                            let client = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+                            client.state = SocketState::Connecting;
+                            client.host_net_handle = Some(net_handle);
+                            client.peer_addr6 = if is_unspecified_addr6(ip6) {
+                                loopback_addr6()
+                            } else {
+                                ip6
+                            };
+                            client.peer_port = port;
+                            if client.bind_port == 0 {
+                                client.bind_addr6 = loopback_addr6();
+                            }
+                        }
+                        return match host.host_net_connect_status(net_handle) {
+                            Ok(()) => {
+                                let assigned_port = {
+                                    let current_port =
+                                        proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?.bind_port;
+                                    if current_port == 0 {
+                                        let p = proc.next_ephemeral_port;
+                                        proc.next_ephemeral_port =
+                                            proc.next_ephemeral_port.wrapping_add(1);
+                                        if proc.next_ephemeral_port == 0 {
+                                            proc.next_ephemeral_port = 49152;
+                                        }
+                                        Some(p)
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let client =
+                                    proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+                                client.state = SocketState::Connected;
+                                if let Some(port) = assigned_port {
+                                    client.bind_port = port;
+                                }
+                                Ok(())
+                            }
+                            Err(Errno::EAGAIN) if status_flags & O_NONBLOCK != 0 => {
+                                Err(if was_connecting {
+                                    Errno::EALREADY
+                                } else {
+                                    Errno::EINPROGRESS
+                                })
+                            }
+                            Err(Errno::EAGAIN) => Err(Errno::EAGAIN),
+                            Err(e) => {
+                                let client =
+                                    proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+                                client.state = SocketState::Closed;
+                                client.connect_error = e as u32;
+                                Err(e)
+                            }
+                        };
+                    }
+                };
 
                 let (pipe_a_idx, pipe_b_idx) =
                     proc.alloc_pipe_pair(PipeBuffer::new(65536), PipeBuffer::new(65536));
@@ -7262,9 +7698,15 @@ pub fn sys_connect(
                 // External connection: two-phase. First call kicks off the
                 // async host-side connect; subsequent calls (driven by the
                 // userspace poll/getsockopt loop) query host_net_connect_status
-                // until the TCP handshake either completes or errors. EAGAIN
-                // surfaces while still in flight.
+                // until the TCP handshake either completes or errors.
+                //
+                // POSIX nonblocking connect must not surface EAGAIN here:
+                // the first in-flight result is EINPROGRESS and later in-flight
+                // probes are EALREADY. Blocking sockets keep using EAGAIN as
+                // the centralized-host retry token so the guest thread remains
+                // blocked until the host TCP handshake resolves.
                 let net_handle = sock_idx as i32;
+                let was_connecting = sock.state == SocketState::Connecting;
                 if sock.state != SocketState::Connecting {
                     host.host_net_connect(net_handle, &ip, port)?;
                     let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
@@ -7276,6 +7718,13 @@ pub fn sys_connect(
                         let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
                         sock.state = SocketState::Connected;
                         Ok(())
+                    }
+                    Err(Errno::EAGAIN) if status_flags & O_NONBLOCK != 0 => {
+                        Err(if was_connecting {
+                            Errno::EALREADY
+                        } else {
+                            Errno::EINPROGRESS
+                        })
                     }
                     Err(Errno::EAGAIN) => Err(Errno::EAGAIN),
                     Err(e) => {
@@ -7322,6 +7771,9 @@ pub fn sys_connect(
                 return Ok(());
             }
             if sock.state == SocketState::Connected {
+                return Err(Errno::EISCONN);
+            }
+            if sock.sock_type == SocketType::Stream && sock.state == SocketState::Listening {
                 return Err(Errno::EISCONN);
             }
 
@@ -7446,13 +7898,16 @@ pub fn sys_connect(
 /// `name` is the hostname bytes. `result_buf` receives the resolved address(es).
 /// Returns the number of bytes written to `result_buf`.
 pub fn sys_getaddrinfo(
-    _proc: &mut Process,
+    proc: &mut Process,
     host: &mut dyn HostIO,
     name: &[u8],
     result_buf: &mut [u8],
 ) -> Result<usize, Errno> {
     if result_buf.len() < 4 {
         return Err(Errno::EINVAL);
+    }
+    if proc.net_namespace_isolated {
+        return Err(Errno::ENETUNREACH);
     }
     host.host_getaddrinfo(name, result_buf)
 }
@@ -7463,11 +7918,40 @@ pub fn sys_getaddrinfo(
 /// bound DGRAM socket and pushes the datagram to its queue.
 pub fn sys_sendto(
     proc: &mut Process,
-    _host: &mut dyn HostIO,
+    host: &mut dyn HostIO,
     fd: i32,
     buf: &[u8],
-    _flags: u32,
+    flags: u32,
     addr: &[u8],
+) -> Result<usize, Errno> {
+    sys_sendto_with_ancillary(proc, host, fd, buf, flags, addr, Vec::new())
+}
+
+/// Send a message and associated ancillary file descriptors to a specific
+/// socket address. Ancillary data is meaningful for AF_UNIX datagrams and is
+/// otherwise ignored, matching the fact that SCM_RIGHTS is a Unix-domain
+/// socket facility.
+pub fn sys_sendto_with_ancillary(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    buf: &[u8],
+    flags: u32,
+    addr: &[u8],
+    ancillary_fds: Vec<crate::pipe::InFlightFd>,
+) -> Result<usize, Errno> {
+    sys_sendto_with_ancillary_and_ipv6_tclass(proc, host, fd, buf, flags, addr, ancillary_fds, None)
+}
+
+pub fn sys_sendto_with_ancillary_and_ipv6_tclass(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    buf: &[u8],
+    flags: u32,
+    addr: &[u8],
+    ancillary_fds: Vec<crate::pipe::InFlightFd>,
+    ipv6_tclass: Option<u32>,
 ) -> Result<usize, Errno> {
     use crate::socket::{SocketDomain, SocketState, SocketType};
 
@@ -7480,12 +7964,12 @@ pub fn sys_sendto(
     let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
 
     if sock.domain == SocketDomain::Netlink {
-        return sys_send(proc, _host, fd, buf, _flags);
+        return sys_send(proc, host, fd, buf, flags);
     }
 
     if addr.is_empty() {
         if sock.state == SocketState::Connected {
-            return sys_send(proc, _host, fd, buf, _flags);
+            return sys_send(proc, host, fd, buf, flags);
         }
         return Err(Errno::EDESTADDRREQ);
     }
@@ -7497,11 +7981,11 @@ pub fn sys_sendto(
     match sock.domain {
         SocketDomain::Inet => {
             let (dst_ip, dst_port) = parse_sockaddr_in(addr)?;
-            udp_send_datagram(proc, _host, sock_idx, buf, dst_ip, dst_port)
+            udp_send_datagram(proc, host, sock_idx, buf, dst_ip, dst_port)
         }
         SocketDomain::Inet6 => {
             let (dst_ip, dst_port) = parse_sockaddr_in6(addr)?;
-            udp6_send_datagram(proc, sock_idx, buf, dst_ip, dst_port)
+            udp6_send_datagram(proc, sock_idx, buf, dst_ip, dst_port, ipv6_tclass)
         }
         SocketDomain::Unix => {
             if addr.len() < 3 {
@@ -7528,7 +8012,7 @@ pub fn sys_sendto(
                 .lookup(&resolved)
                 .map(|entry| entry.sock_idx)
                 .ok_or(Errno::ECONNREFUSED)?;
-            unix_dgram_send_to_sock(proc, sock_idx, peer_idx, buf)
+            unix_dgram_send_to_sock_with_ancillary(proc, sock_idx, peer_idx, buf, ancillary_fds)
         }
         SocketDomain::Netlink => Err(Errno::EOPNOTSUPP),
     }
@@ -7539,12 +8023,37 @@ pub fn sys_sendto(
 /// For AF_INET DGRAM sockets, dequeues a datagram and writes the sender address.
 pub fn sys_recvfrom(
     proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    buf: &mut [u8],
+    flags: u32,
+    addr_buf: &mut [u8],
+) -> Result<(usize, usize), Errno> {
+    let (n, addr_len, _, _, _) =
+        sys_recvfrom_with_ancillary(proc, host, fd, buf, flags, addr_buf)?;
+    Ok((n, addr_len))
+}
+
+/// Receive a datagram and return any per-message ancillary metadata captured
+/// when it was queued. This is used by recvmsg() to report SCM_RIGHTS and
+/// SCM_CREDENTIALS for AF_UNIX datagrams; plain recvfrom() discards it.
+pub fn sys_recvfrom_with_ancillary(
+    proc: &mut Process,
     _host: &mut dyn HostIO,
     fd: i32,
     buf: &mut [u8],
     _flags: u32,
     addr_buf: &mut [u8],
-) -> Result<(usize, usize), Errno> {
+) -> Result<
+    (
+        usize,
+        usize,
+        Vec<crate::pipe::InFlightFd>,
+        Option<(u32, u32, u32)>,
+        Option<([u8; 16], u32)>,
+    ),
+    Errno,
+> {
     use crate::socket::{SocketDomain, SocketState, SocketType};
     use wasm_posix_shared::socket::MSG_PEEK;
 
@@ -7558,13 +8067,13 @@ pub fn sys_recvfrom(
 
     if sock.domain == SocketDomain::Netlink {
         let n = sys_recv(proc, _host, fd, buf, _flags)?;
-        return Ok((n, 0));
+        return Ok((n, 0, Vec::new(), None, None));
     }
 
     // For STREAM sockets, delegate to sys_recv (musl routes recv→recvfrom)
     if sock.sock_type == SocketType::Stream {
         let n = sys_recv(proc, _host, fd, buf, _flags)?;
-        return Ok((n, 0));
+        return Ok((n, 0, Vec::new(), None, None));
     }
     if !matches!(
         sock.domain,
@@ -7573,10 +8082,11 @@ pub fn sys_recvfrom(
         return Err(Errno::EOPNOTSUPP);
     }
     if sock.shut_rd {
-        return Ok((0, 0));
+        return Ok((0, 0, Vec::new(), None, None));
     }
 
     let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+    let domain = sock.domain;
     let datagram_idx = sock.dgram_queue.iter().position(|d| {
         if sock.state != SocketState::Connected {
             return true;
@@ -7604,6 +8114,13 @@ pub fn sys_recvfrom(
     } else {
         sock.dgram_queue.remove(datagram_idx)
     };
+    let credentials = Some((datagram.src_pid, datagram.src_uid, datagram.src_gid));
+    let ipv6_meta = if domain == SocketDomain::Inet6 {
+        Some((datagram.dst_addr6, datagram.ipv6_tclass))
+    } else {
+        None
+    };
+    let ancillary_fds = datagram.ancillary_fds.clone();
 
     // Copy data to buffer
     let copy_len = buf.len().min(datagram.data.len());
@@ -7612,23 +8129,49 @@ pub fn sys_recvfrom(
     // Write sender sockaddr to addr_buf
     let mut addr_written = 0;
     if !addr_buf.is_empty() {
-        addr_written = match sock.domain {
+        addr_written = match domain {
             SocketDomain::Inet => write_sockaddr_in(addr_buf, datagram.src_addr, datagram.src_port),
             SocketDomain::Inet6 => {
                 write_sockaddr_in6(addr_buf, datagram.src_addr6, datagram.src_port)
             }
             SocketDomain::Unix => {
-                if addr_buf.len() >= 2 {
-                    addr_buf[0] = 1;
-                    addr_buf[1] = 0;
+                if let Some(src_idx) = datagram.src_sock_idx {
+                    if let Some(src_sock) = proc.sockets.get(src_idx) {
+                        if let Some(path) = src_sock.bind_path.as_ref() {
+                            if addr_buf.len() >= 2 {
+                                addr_buf[0] = 1;
+                                addr_buf[1] = 0;
+                                let copy_len = (addr_buf.len() - 2).min(path.len());
+                                addr_buf[2..2 + copy_len].copy_from_slice(&path[..copy_len]);
+                                if path.first().copied() == Some(0) {
+                                    2 + copy_len
+                                } else {
+                                    let nul_off = 2 + copy_len;
+                                    if nul_off < addr_buf.len() {
+                                        addr_buf[nul_off] = 0;
+                                        nul_off + 1
+                                    } else {
+                                        nul_off
+                                    }
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
                 }
-                2
             }
             SocketDomain::Netlink => 0,
         };
     }
 
-    Ok((copy_len, addr_written))
+    Ok((copy_len, addr_written, ancillary_fds, credentials, ipv6_meta))
 }
 
 /// Poll file descriptors for I/O readiness.
@@ -8268,6 +8811,7 @@ pub fn sys_fstatat(
         });
     }
     if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
+        crate::procfs::validate_entry(proc, &entry)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         return Ok(crate::procfs::procfs_stat(&entry, 0, follow));
     }
@@ -8943,13 +9487,36 @@ pub fn sys_ioctl(proc: &mut Process, fd: i32, request: u32, buf: &mut [u8]) -> R
 }
 
 /// prctl — process control operations.
-/// PR_SET_NAME (15) stores thread name, PR_GET_NAME (16) returns it.
-/// All other operations are no-ops returning success.
-pub fn sys_prctl(proc: &mut Process, option: u32, _arg2: u32, buf: &mut [u8]) -> Result<(), Errno> {
+///
+/// Supported Linux-compatible operations:
+/// - PR_SET_PDEATHSIG/PR_GET_PDEATHSIG maintain the per-process parent-death
+///   signal. The value is cleared across fork and preserved across exec.
+/// - PR_SET_NAME/PR_GET_NAME maintain the 16-byte thread name buffer.
+///
+/// Other operations remain no-ops for compatibility with software that probes
+/// optional Linux prctl features.
+pub fn sys_prctl(proc: &mut Process, option: u32, arg2: u32, buf: &mut [u8]) -> Result<(), Errno> {
+    const PR_SET_PDEATHSIG: u32 = 1;
+    const PR_GET_PDEATHSIG: u32 = 2;
     const PR_SET_NAME: u32 = 15;
     const PR_GET_NAME: u32 = 16;
 
     match option {
+        PR_SET_PDEATHSIG => {
+            use wasm_posix_shared::signal::NSIG;
+            if arg2 != 0 && arg2 >= NSIG {
+                return Err(Errno::EINVAL);
+            }
+            proc.parent_death_signal = arg2;
+            Ok(())
+        }
+        PR_GET_PDEATHSIG => {
+            if buf.len() < core::mem::size_of::<u32>() {
+                return Err(Errno::EFAULT);
+            }
+            buf[..4].copy_from_slice(&proc.parent_death_signal.to_le_bytes());
+            Ok(())
+        }
         PR_SET_NAME => {
             // arg2 is a pointer to the name string in our buffer
             // The name comes in via buf (up to 16 bytes, null-terminated)
@@ -8973,10 +9540,15 @@ pub fn sys_prctl(proc: &mut Process, option: u32, _arg2: u32, buf: &mut [u8]) ->
     }
 }
 
-// Returns thread ID. Without threading, tid == pid.
-// Threading upgrade: return actual TID from thread table.
+// Returns the caller's Linux thread ID. The main thread TID equals the PID;
+// worker threads use their allocated TID from the process thread table.
 pub fn sys_gettid(proc: &Process) -> i32 {
-    proc.pid as i32
+    let tid = crate::process_table::current_tid();
+    if proc.is_main_thread(tid) {
+        proc.pid as i32
+    } else {
+        tid as i32
+    }
 }
 
 // Stores tidptr for thread exit notification. Without threading, returns pid.
@@ -9953,9 +10525,17 @@ pub fn sys_sysconf(name: i32) -> Result<i64, Errno> {
 
 /// pathconf -- get configurable pathname variable values.
 ///
-/// Returns POSIX-required compile-time constants for the given name.
-/// The path is not validated (we return the same values regardless).
-pub fn sys_pathconf(_path: &[u8], name: i32) -> Result<i64, Errno> {
+/// POSIX requires pathconf() to fail for an invalid pathname before reporting
+/// a value for the requested variable. The limits are currently filesystem
+/// wide constants, but the path still has to resolve successfully.
+pub fn sys_pathconf(
+    proc: &Process,
+    host: &mut dyn HostIO,
+    path: &[u8],
+    name: i32,
+) -> Result<i64, Errno> {
+    let resolved = crate::path::resolve_path(path, &proc.cwd);
+    let _ = host.host_stat(&resolved)?;
     pathconf_value(name)
 }
 
@@ -10274,7 +10854,8 @@ pub fn sys_faccessat(
     {
         return Ok(());
     }
-    if crate::procfs::match_procfs(&resolved, proc.pid).is_some() {
+    if let Some(entry) = crate::procfs::match_procfs(&resolved, proc.pid) {
+        crate::procfs::validate_entry(proc, &entry)?;
         if amode & 0o2 != 0 {
             return Err(Errno::EACCES);
         }
@@ -11290,12 +11871,19 @@ mod tests {
         /// host-side VFS owns ownership; tests use `set_file_with_owner` to seed.
         file_owners: std::collections::HashMap<Vec<u8>, (u32, u32)>,
         file_modes: std::collections::HashMap<Vec<u8>, u32>,
+        file_contents: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+        handle_positions: std::collections::HashMap<i64, i64>,
+        handle_contents: std::collections::HashMap<i64, Vec<u8>>,
         /// Per-handle owner mapping captured at host_open time so host_fstat
         /// returns the same owners host_stat would for the path.
         handle_owners: std::collections::HashMap<i64, (u32, u32)>,
         handle_paths: std::collections::HashMap<i64, Vec<u8>>,
         missing_paths: std::collections::HashSet<Vec<u8>>,
         statfs_by_path: std::collections::HashMap<Vec<u8>, WasmStatfs>,
+        net_connect_result: Result<(), Errno>,
+        net_connect_status_result: Result<(), Errno>,
+        net_connect_calls: Vec<(i32, Vec<u8>, u16)>,
+        net_listen_calls: Vec<(i32, u16, [u8; 4])>,
     }
 
     impl MockHostIO {
@@ -11310,10 +11898,17 @@ mod tests {
                 clock_time: (1234567890, 123456789),
                 file_owners: std::collections::HashMap::new(),
                 file_modes: std::collections::HashMap::new(),
+                file_contents: std::collections::HashMap::new(),
+                handle_positions: std::collections::HashMap::new(),
+                handle_contents: std::collections::HashMap::new(),
                 handle_owners: std::collections::HashMap::new(),
                 handle_paths: std::collections::HashMap::new(),
                 missing_paths: std::collections::HashSet::new(),
                 statfs_by_path: std::collections::HashMap::new(),
+                net_connect_result: Err(Errno::ECONNREFUSED),
+                net_connect_status_result: Err(Errno::ECONNREFUSED),
+                net_connect_calls: Vec::new(),
+                net_listen_calls: Vec::new(),
             }
         }
 
@@ -11336,6 +11931,7 @@ mod tests {
                 S_IFREG | (_mode & 0o7777)
             };
             self.file_modes.insert(path.to_vec(), full_mode);
+            self.file_contents.insert(path.to_vec(), _content.to_vec());
         }
 
         fn set_dir_with_owner(&mut self, path: &[u8], uid: u32, gid: u32, mode: u32) {
@@ -11369,6 +11965,13 @@ mod tests {
                 self.handle_owners.insert(handle, owner);
             }
             self.handle_paths.insert(handle, path.to_vec());
+            self.handle_positions.insert(handle, 0);
+            let content = self
+                .file_contents
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| b"hello".to_vec());
+            self.handle_contents.insert(handle, content);
             Ok(handle)
         }
 
@@ -11376,19 +11979,49 @@ mod tests {
             Ok(())
         }
 
-        fn host_read(&mut self, _handle: i64, buf: &mut [u8]) -> Result<usize, Errno> {
-            let data = b"hello";
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
+        fn host_read(&mut self, handle: i64, buf: &mut [u8]) -> Result<usize, Errno> {
+            let data = self
+                .handle_contents
+                .entry(handle)
+                .or_insert_with(|| b"hello".to_vec());
+            let pos = self.handle_positions.entry(handle).or_insert(0);
+            let start = (*pos).max(0) as usize;
+            if start >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            *pos += n as i64;
             Ok(n)
         }
 
-        fn host_write(&mut self, _handle: i64, buf: &[u8]) -> Result<usize, Errno> {
+        fn host_write(&mut self, handle: i64, buf: &[u8]) -> Result<usize, Errno> {
+            let data = self.handle_contents.entry(handle).or_default();
+            let pos = self.handle_positions.entry(handle).or_insert(0);
+            let start = (*pos).max(0) as usize;
+            let end = start + buf.len();
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[start..end].copy_from_slice(buf);
+            *pos += buf.len() as i64;
             Ok(buf.len())
         }
 
-        fn host_seek(&mut self, _handle: i64, _offset: i64, _whence: u32) -> Result<i64, Errno> {
-            Ok(0)
+        fn host_seek(&mut self, handle: i64, offset: i64, whence: u32) -> Result<i64, Errno> {
+            let cur = *self.handle_positions.get(&handle).unwrap_or(&0);
+            let len = self.handle_contents.get(&handle).map_or(0, |d| d.len() as i64);
+            let next = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => cur + offset,
+                SEEK_END => len + offset,
+                _ => return Err(Errno::EINVAL),
+            };
+            if next < 0 {
+                return Err(Errno::EINVAL);
+            }
+            self.handle_positions.insert(handle, next);
+            Ok(next)
         }
 
         fn host_fstat(&mut self, handle: i64) -> Result<WasmStat, Errno> {
@@ -11673,14 +12306,15 @@ mod tests {
         }
         fn host_net_connect(
             &mut self,
-            _handle: i32,
-            _addr: &[u8],
-            _port: u16,
+            handle: i32,
+            addr: &[u8],
+            port: u16,
         ) -> Result<(), Errno> {
-            Err(Errno::ECONNREFUSED)
+            self.net_connect_calls.push((handle, addr.to_vec(), port));
+            self.net_connect_result
         }
         fn host_net_connect_status(&mut self, _handle: i32) -> Result<(), Errno> {
-            Err(Errno::ECONNREFUSED)
+            self.net_connect_status_result
         }
         fn host_net_send(
             &mut self,
@@ -11702,7 +12336,8 @@ mod tests {
         fn host_net_close(&mut self, _handle: i32) -> Result<(), Errno> {
             Ok(())
         }
-        fn host_net_listen(&mut self, _fd: i32, _port: u16, _addr: &[u8; 4]) -> Result<(), Errno> {
+        fn host_net_listen(&mut self, fd: i32, port: u16, addr: &[u8; 4]) -> Result<(), Errno> {
+            self.net_listen_calls.push((fd, port, *addr));
             Ok(())
         }
         fn host_getaddrinfo(&mut self, _name: &[u8], _result: &mut [u8]) -> Result<usize, Errno> {
@@ -12637,9 +13272,81 @@ mod tests {
     }
 
     #[test]
+    fn test_forked_regular_file_descriptors_share_host_offset() {
+        let mut parent = Process::new(100);
+        let mut host = MockHostIO::new();
+        host.set_file_with_owner(b"/tmp/shared-offset", 0, 0, 0o644, b"aaaa");
+        let fd = sys_open(&mut parent, &mut host, b"/tmp/shared-offset", O_RDWR, 0).unwrap();
+
+        let mut fork_buf = vec![0u8; 64 * 1024];
+        let written = crate::fork::serialize_fork_state(&parent, &mut fork_buf).unwrap();
+        let mut child = *crate::fork::deserialize_fork_state(&fork_buf[..written], 200).unwrap();
+
+        sys_lseek(&mut parent, &mut host, fd, 0, SEEK_SET).unwrap();
+        sys_write(&mut child, &mut host, fd, b"bb").unwrap();
+
+        let entry = parent.fd_table.get(fd).unwrap();
+        let ofd = parent.ofd_table.get(entry.ofd_ref.0).unwrap();
+        let data = host.handle_contents.get(&ofd.host_handle).unwrap();
+        assert_eq!(&data[..4], b"bbaa");
+    }
+
+    #[test]
     fn test_getpid_returns_pid() {
         let proc = Process::new(42);
         assert_eq!(sys_getpid(&proc), 42);
+    }
+
+    #[test]
+    fn test_getpid_returns_namespace_pid_when_unshared() {
+        let mut proc = Process::new(42);
+        proc.pid_ns_vpid = 1;
+        assert_eq!(sys_getpid(&proc), 1);
+    }
+
+    #[test]
+    fn test_unshare_newuser_exposes_overflow_ids() {
+        let mut proc = Process::new(1);
+        sys_unshare(&mut proc, 0x10000000).unwrap(); // CLONE_NEWUSER
+        assert_eq!(sys_getuid(&proc), 65534);
+        assert_eq!(sys_geteuid(&proc), 65534);
+        assert_eq!(sys_getgid(&proc), 65534);
+        assert_eq!(sys_getegid(&proc), 65534);
+    }
+
+    #[test]
+    fn test_unshare_newpid_affects_subsequent_fork_children() {
+        let mut table = crate::process_table::ProcessTable::new();
+        table.create_process(100).unwrap();
+        {
+            let parent = table.get_mut(100).unwrap();
+            sys_unshare(parent, 0x20000000).unwrap(); // CLONE_NEWPID
+            assert_eq!(sys_getpid(parent), 100);
+        }
+
+        table.fork_process(100, 200).unwrap();
+        let child = table.get(200).unwrap();
+        assert_eq!(sys_getpid(child), 1);
+        assert_eq!(child.pid_ns_next_child_pid, 2);
+        assert_eq!(table.get(100).unwrap().pid_ns_next_child_pid, 2);
+    }
+
+    #[test]
+    fn test_unshare_newnet_blocks_host_dns() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let mut out = [0u8; 16];
+        sys_unshare(&mut proc, 0x40000000).unwrap(); // CLONE_NEWNET
+        assert_eq!(
+            sys_getaddrinfo(&mut proc, &mut host, b"example.com", &mut out),
+            Err(Errno::ENETUNREACH)
+        );
+    }
+
+    #[test]
+    fn test_unshare_rejects_invalid_flags() {
+        let mut proc = Process::new(1);
+        assert_eq!(sys_unshare(&mut proc, 42), Err(Errno::EINVAL));
     }
 
     #[test]
@@ -13408,6 +14115,15 @@ mod tests {
     }
 
     #[test]
+    fn test_socket_unix_rejects_nonzero_protocol() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::{AF_UNIX, SOCK_DGRAM};
+        let result = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 17);
+        assert_eq!(result, Err(Errno::EPROTONOSUPPORT));
+    }
+
+    #[test]
     fn test_socketpair_unix_stream() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
@@ -13570,7 +14286,7 @@ mod tests {
         let mut host = MockHostIO::new();
         use wasm_posix_shared::socket::*;
         let result = sys_socketpair(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0);
-        assert_eq!(result, Err(Errno::EAFNOSUPPORT));
+        assert_eq!(result, Err(Errno::ESOCKTNOSUPPORT));
     }
 
     #[test]
@@ -13891,6 +14607,31 @@ mod tests {
     }
 
     #[test]
+    fn test_getsockname_unix_preserves_supplied_relative_path() {
+        let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
+        let mut proc = Process::new(90101);
+        let mut host = MockHostIO::new();
+        let path = b"relative.sock";
+        let resolved = crate::path::resolve_path(path, &proc.cwd);
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.unregister(&resolved);
+
+        let fd = sys_socket(&mut proc, &mut host, 1, 1, 0).unwrap(); // AF_UNIX, SOCK_STREAM
+        let mut addr = [0u8; 110];
+        addr[0] = 1; // AF_UNIX
+        addr[2..2 + path.len()].copy_from_slice(path);
+        sys_bind(&mut proc, &mut host, fd, &addr[..2 + path.len() + 1]).unwrap();
+
+        let mut out = [0u8; 110];
+        let len = sys_getsockname(&proc, fd, &mut out).unwrap();
+        assert_eq!(len, 2 + path.len() + 1);
+        assert_eq!(&out[0..2], &[1, 0]);
+        assert_eq!(&out[2..2 + path.len()], path);
+        assert_eq!(out[2 + path.len()], 0);
+
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.unregister(&resolved);
+    }
+
+    #[test]
     fn test_bind_unix_duplicate_fails() {
         let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
         let mut proc = Process::new(9011);
@@ -13940,6 +14681,35 @@ mod tests {
         sys_listen(&mut proc, &mut host, fd, 5).unwrap();
         let result = sys_accept(&mut proc, &mut host, fd);
         assert_eq!(result, Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_connect_on_listening_inet_stream_returns_eisconn() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let mut addr = [0u8; 16];
+        addr[0] = 2; // AF_INET
+        addr[2] = 0x30;
+        addr[3] = 0x39; // port 12345
+        addr[4] = 127;
+        addr[5] = 0;
+        addr[6] = 0;
+        addr[7] = 1;
+        sys_bind(&mut proc, &mut host, fd, &addr).unwrap();
+        sys_listen(&mut proc, &mut host, fd, 5).unwrap();
+
+        let err = sys_connect(&mut proc, &mut host, fd, &addr).unwrap_err();
+        assert_eq!(err, Errno::EISCONN);
+
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        let sock_idx = (-(ofd.host_handle + 1)) as usize;
+        let sock = proc.sockets.get(sock_idx).unwrap();
+        assert_eq!(sock.state, crate::socket::SocketState::Listening);
+        assert!(sock.listen_backlog.is_empty());
     }
 
     #[test]
@@ -14589,6 +15359,27 @@ mod tests {
     }
 
     #[test]
+    fn test_prctl_set_get_parent_death_signal() {
+        let mut proc = Process::new(1);
+        let mut out = [0u8; 4];
+
+        sys_prctl(&mut proc, 1, 15, &mut []).unwrap(); // PR_SET_PDEATHSIG(SIGTERM)
+        sys_prctl(&mut proc, 2, 0, &mut out).unwrap(); // PR_GET_PDEATHSIG
+
+        assert_eq!(u32::from_le_bytes(out), 15);
+        assert_eq!(proc.parent_death_signal, 15);
+    }
+
+    #[test]
+    fn test_prctl_rejects_invalid_parent_death_signal() {
+        let mut proc = Process::new(1);
+        assert_eq!(
+            sys_prctl(&mut proc, 1, wasm_posix_shared::signal::NSIG, &mut []),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
     fn test_prctl_unknown_is_noop() {
         let mut proc = Process::new(1);
         let mut buf = [0u8; 16];
@@ -14793,17 +15584,37 @@ mod tests {
 
     #[test]
     fn test_pathconf_name_max() {
-        assert_eq!(sys_pathconf(b"/tmp/foo", 4), Ok(255)); // _PC_NAME_MAX
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        assert_eq!(sys_pathconf(&proc, &mut host, b"/tmp/foo", 4), Ok(255)); // _PC_NAME_MAX
     }
 
     #[test]
     fn test_pathconf_pipe_buf() {
-        assert_eq!(sys_pathconf(b"/tmp/foo", 6), Ok(4096)); // _PC_PIPE_BUF
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        assert_eq!(sys_pathconf(&proc, &mut host, b"/tmp/foo", 6), Ok(4096)); // _PC_PIPE_BUF
     }
 
     #[test]
     fn test_pathconf_invalid_name() {
-        assert_eq!(sys_pathconf(b"/tmp/foo", 999), Err(Errno::EINVAL));
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        assert_eq!(
+            sys_pathconf(&proc, &mut host, b"/tmp/foo", 999),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn test_pathconf_missing_path() {
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.set_missing_path(b"/missing");
+        assert_eq!(
+            sys_pathconf(&proc, &mut host, b"/missing", 4),
+            Err(Errno::ENOENT)
+        );
     }
 
     #[test]
@@ -16542,6 +17353,31 @@ mod tests {
     }
 
     #[test]
+    fn test_nonblocking_external_connect_reports_inprogress_then_already() {
+        // A nonblocking TCP connect whose host-side handshake is still pending
+        // must report EINPROGRESS on the first call and EALREADY while the same
+        // connection remains in progress. EAGAIN is the centralized host's
+        // internal retry token for blocking syscalls, not the POSIX result for
+        // nonblocking connect(2).
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.net_connect_result = Ok(());
+        host.net_connect_status_result = Err(Errno::EAGAIN);
+
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+            .unwrap();
+        // sockaddr_in: AF_INET(2) + port(443) + external IPv4 address.
+        let addr = [2, 0, 0x01, 0xbb, 93, 184, 216, 34, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let err = sys_connect(&mut proc, &mut host, fd, &addr).unwrap_err();
+        assert_eq!(err, Errno::EINPROGRESS);
+
+        let err = sys_connect(&mut proc, &mut host, fd, &addr).unwrap_err();
+        assert_eq!(err, Errno::EALREADY);
+    }
+
+    #[test]
     fn test_inet_send_on_unconnected_returns_enotconn() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
@@ -17991,6 +18827,144 @@ mod tests {
     }
 
     #[test]
+    fn test_unix_dgram_recvfrom_unbound_sender_has_no_name() {
+        let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        proc.pid = 9026;
+        let server_fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        let mut addr = [0u8; 64];
+        addr[0] = 1; // AF_UNIX
+        let path = b"/tmp/udg-unbound-sender.sock";
+        addr[2..2 + path.len()].copy_from_slice(path);
+        let addrlen = 2 + path.len() + 1;
+        sys_bind(&mut proc, &mut host, server_fd, &addr[..addrlen]).unwrap();
+
+        let client_fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(
+            sys_sendto(&mut proc, &mut host, client_fd, b"hello", 0, &addr[..addrlen]).unwrap(),
+            5,
+        );
+
+        let mut buf = [0u8; 16];
+        let mut from = [0u8; 64];
+        let (n, addr_written) =
+            sys_recvfrom(&mut proc, &mut host, server_fd, &mut buf, 0, &mut from).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(
+            addr_written, 0,
+            "unbound AF_UNIX datagram senders have no peer address to report",
+        );
+
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.cleanup_process(9026);
+    }
+
+    #[test]
+    fn test_unix_dgram_recvfrom_bound_sender_reports_path() {
+        let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        proc.pid = 9028;
+        let sender_fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        let mut sender_addr = [0u8; 64];
+        sender_addr[0] = 1;
+        let sender_path = b"/tmp/udg-bound-sender.sock";
+        sender_addr[2..2 + sender_path.len()].copy_from_slice(sender_path);
+        let sender_len = 2 + sender_path.len() + 1;
+        sys_bind(&mut proc, &mut host, sender_fd, &sender_addr[..sender_len]).unwrap();
+
+        let recv_fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        let mut recv_addr = [0u8; 64];
+        recv_addr[0] = 1;
+        let recv_path = b"/tmp/udg-bound-recv.sock";
+        recv_addr[2..2 + recv_path.len()].copy_from_slice(recv_path);
+        let recv_len = 2 + recv_path.len() + 1;
+        sys_bind(&mut proc, &mut host, recv_fd, &recv_addr[..recv_len]).unwrap();
+
+        assert_eq!(
+            sys_sendto(&mut proc, &mut host, sender_fd, b"hello", 0, &recv_addr[..recv_len])
+                .unwrap(),
+            5,
+        );
+
+        let mut buf = [0u8; 16];
+        let mut from = [0u8; 64];
+        let (n, addr_written) =
+            sys_recvfrom(&mut proc, &mut host, recv_fd, &mut buf, 0, &mut from).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(&from[..2], &[1, 0]);
+        assert_eq!(&from[2..2 + sender_path.len()], sender_path);
+        assert_eq!(from[2 + sender_path.len()], 0);
+        assert_eq!(addr_written, 2 + sender_path.len() + 1);
+
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.cleanup_process(9028);
+    }
+
+    #[test]
+    fn test_unix_dgram_ancillary_and_credentials_follow_datagram() {
+        let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        proc.pid = 9027;
+        proc.uid = 123;
+        proc.gid = 456;
+        let server_fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        let mut addr = [0u8; 64];
+        addr[0] = 1; // AF_UNIX
+        let path = b"/tmp/udg-ancillary.sock";
+        addr[2..2 + path.len()].copy_from_slice(path);
+        let addrlen = 2 + path.len() + 1;
+        sys_bind(&mut proc, &mut host, server_fd, &addr[..addrlen]).unwrap();
+
+        let client_fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        let ancillary = vec![crate::pipe::InFlightFd {
+            file_type: 0,
+            status_flags: 0,
+            host_handle: -1,
+            offset: 0,
+            path: b"pipe".to_vec(),
+            socket: None,
+        }];
+        assert_eq!(
+            sys_sendto_with_ancillary(
+                &mut proc,
+                &mut host,
+                client_fd,
+                b"meta",
+                0,
+                &addr[..addrlen],
+                ancillary,
+            )
+            .unwrap(),
+            4,
+        );
+
+        let mut buf = [0u8; 16];
+        let mut from = [0u8; 64];
+        let (n, _, fds, creds, _) = sys_recvfrom_with_ancillary(
+            &mut proc,
+            &mut host,
+            server_fd,
+            &mut buf,
+            0,
+            &mut from,
+        )
+        .unwrap();
+        assert_eq!(&buf[..n], b"meta");
+        assert_eq!(fds.len(), 1);
+        assert_eq!(fds[0].path, b"pipe");
+        assert_eq!(creds, Some((9027, 123, 456)));
+
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.cleanup_process(9027);
+    }
+
+    #[test]
     fn test_inet6_loopback_bind_getsockname_and_connect_refused() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
@@ -18020,6 +18994,54 @@ mod tests {
             sys_connect(&mut proc, &mut host, client_fd, &refused).unwrap_err(),
             Errno::ECONNREFUSED,
         );
+    }
+
+    #[test]
+    fn test_inet6_loopback_listen_registers_host_transport() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        let fd = sys_socket(&mut proc, &mut host, AF_INET6, SOCK_STREAM, 0).unwrap();
+        let mut addr = [0u8; 28];
+        addr[0] = 10; // AF_INET6
+        addr[2] = 0x19;
+        addr[3] = 0x44; // port 6468
+        addr[23] = 1; // ::1
+
+        sys_bind(&mut proc, &mut host, fd, &addr).unwrap();
+        sys_listen(&mut proc, &mut host, fd, 5).unwrap();
+
+        assert_eq!(host.net_listen_calls, vec![(fd, 6468, [127, 0, 0, 1])]);
+    }
+
+    #[test]
+    fn test_inet6_loopback_cross_process_connect_uses_host_transport() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.net_connect_result = Ok(());
+        host.net_connect_status_result = Ok(());
+        use wasm_posix_shared::socket::*;
+
+        let fd = sys_socket(&mut proc, &mut host, AF_INET6, SOCK_STREAM, 0).unwrap();
+        let mut addr = [0u8; 28];
+        addr[0] = 10; // AF_INET6
+        addr[2] = 0x19;
+        addr[3] = 0x45; // port 6469
+        addr[23] = 1; // ::1
+
+        sys_connect(&mut proc, &mut host, fd, &addr).unwrap();
+
+        assert_eq!(host.net_connect_calls, vec![(0, vec![127, 0, 0, 1], 6469)]);
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        let sock_idx = (-(ofd.host_handle + 1)) as usize;
+        let sock = proc.sockets.get(sock_idx).unwrap();
+        assert_eq!(sock.state, crate::socket::SocketState::Connected);
+        assert_eq!(sock.peer_addr6, loopback_addr6());
+        assert_eq!(sock.peer_port, 6469);
+        assert_eq!(sock.bind_addr6, loopback_addr6());
+        assert_ne!(sock.bind_port, 0);
     }
 
     // ── Threading tests ──────────────────────────────────────────────
@@ -20423,6 +21445,36 @@ mod tests {
         assert_eq!(
             sys_access(&mut proc, &mut host, b"/proc/self/stat", 2).unwrap_err(),
             Errno::EACCES,
+        );
+    }
+
+    #[test]
+    fn test_procfs_metadata_ops_reject_missing_pid() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+
+        // Parsing `/proc/<pid>/...` is not enough: Linux procfs reports
+        // ENOENT once the pid has been reaped. Shell probes like
+        // `[ -r /proc/$pid/stat ]` depend on access/stat enforcing this.
+        assert_eq!(
+            sys_access(&mut proc, &mut host, b"/proc/999/stat", 0).unwrap_err(),
+            Errno::ENOENT,
+        );
+        assert_eq!(
+            sys_faccessat(&mut proc, &mut host, -100, b"/proc/999/stat", 0, 0).unwrap_err(),
+            Errno::ENOENT,
+        );
+        assert_eq!(
+            sys_stat(&mut proc, &mut host, b"/proc/999/stat").unwrap_err(),
+            Errno::ENOENT,
+        );
+        assert_eq!(
+            sys_lstat(&mut proc, &mut host, b"/proc/999").unwrap_err(),
+            Errno::ENOENT,
+        );
+        assert_eq!(
+            sys_chdir(&mut proc, &mut host, b"/proc/999").unwrap_err(),
+            Errno::ENOENT,
         );
     }
 

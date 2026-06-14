@@ -123,13 +123,124 @@ interface PhpRunner {
     scriptArgs?: string[];
     env: string[];
     stdin?: string;
+    stdinIsPipe?: boolean;
     pipeStdio?: number[];
+    waitForChildOutput?: boolean;
     timeoutMs: number;
   }): Promise<PhpRunResult>;
+  endTest?(): Promise<void>;
   close(): Promise<void>;
 }
 
 let tempCounter = 0;
+let nodeToolDir: string | null = null;
+
+function ensureNodeToolDir(): string {
+  if (nodeToolDir) return nodeToolDir;
+  nodeToolDir = mkdtempSync(join(tmpdir(), "kandelo-php-tools-"));
+  writeFileSync(
+    join(nodeToolDir, "pgrep"),
+    `#!/bin/sh
+if [ "$1" != "-P" ] || [ -z "$2" ]; then
+  exit 1
+fi
+want_ppid=$2
+for stat in /proc/[0-9]*/stat; do
+  [ -r "$stat" ] || continue
+  line=$(cat "$stat" 2>/dev/null) || continue
+  pid=\${line%% *}
+  after=\${line#*) }
+  set -- $after
+  ppid=$2
+  if [ "$ppid" = "$want_ppid" ]; then
+    printf '%s\\n' "$pid"
+  fi
+done
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(nodeToolDir, "ps"),
+    `#!/bin/sh
+pids=
+format=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p)
+      shift
+      pids=$1
+      ;;
+    -o)
+      shift
+      format=$1
+      ;;
+    *)
+      ;;
+  esac
+  shift
+done
+
+if [ -z "$pids" ]; then
+  exit 1
+fi
+
+[ -n "$format" ] || format=pid,command
+header=1
+case "$format" in
+  *=*)
+    header=0
+    ;;
+esac
+
+fields=$(printf '%s' "$format" | tr ',' ' ')
+pid_list=$(printf '%s' "$pids" | tr ',' ' ')
+
+if [ "$header" = 1 ]; then
+  out=
+  for field in $fields; do
+    field=\${field%=}
+    case "$field" in
+      pid) label=PID ;;
+      nice|ni) label=NICE ;;
+      command|comm|args) label=COMMAND ;;
+      *) label=$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]') ;;
+    esac
+    out="$out\${out:+ }$label"
+  done
+  printf '%s\\n' "$out"
+fi
+
+found=0
+for pid in $pid_list; do
+  stat=/proc/$pid/stat
+  [ -r "$stat" ] || continue
+  line=$(cat "$stat" 2>/dev/null) || continue
+  comm=\${line#*(}
+  comm=\${comm%)*}
+  after=\${line#*) }
+  set -- $after
+  nice=\${17:-0}
+  row=
+  for field in $fields; do
+    field=\${field%=}
+    case "$field" in
+      pid) value=$pid ;;
+      nice|ni) value=$nice ;;
+      command|comm|args) value=$comm ;;
+      *) value= ;;
+    esac
+    row="$row\${row:+ }$value"
+  done
+  printf '%s\\n' "$row"
+  found=1
+done
+
+[ "$found" = 1 ]
+`,
+    { mode: 0o755 },
+  );
+  return nodeToolDir;
+}
 
 const PASSTHROUGH_ENV_NAMES = [
   "NO_INTERACTION",
@@ -351,6 +462,34 @@ function passthroughEnvArgs(): string[] {
   );
 }
 
+function defaultPhpTestEnvArgs(): string[] {
+  // Mirror upstream php-src run-tests.php's baseline CGI-ish environment for
+  // ordinary FILE tests. Several CLI PHPT fixtures intentionally inspect
+  // $_SERVER['REQUEST_METHOD'] / REQUEST_URI without using a CGI section.
+  return [
+    "REDIRECT_STATUS=",
+    "QUERY_STRING=",
+    "PATH_TRANSLATED=",
+    "SCRIPT_FILENAME=",
+    "REQUEST_METHOD=GET",
+    "CONTENT_TYPE=",
+    "CONTENT_LENGTH=",
+    "TZ=",
+  ];
+}
+
+function mergeEnvArgs(...groups: string[][]): string[] {
+  const merged = new Map<string, string>();
+  for (const group of groups) {
+    for (const entry of group) {
+      const eq = entry.indexOf("=");
+      if (eq <= 0) continue;
+      merged.set(entry.slice(0, eq), entry);
+    }
+  }
+  return [...merged.values()];
+}
+
 function isFlakyTest(test: PhptTest): boolean {
   if (test.sections.FLAKY !== undefined) return true;
   const file = test.sections.FILE ?? "";
@@ -398,6 +537,16 @@ function phptConflictTokens(test: PhptTest): string[] {
   return [...tokens];
 }
 
+function requiresExclusiveScheduling(conflicts: string[]): boolean {
+  // Server-style PHPTs commonly start a helper PHP process, sleep briefly, and
+  // then connect to a fixed loopback listener. The declared `server` conflict
+  // prevents port/helper overlap, but under Kandelo's Wasm host even unrelated
+  // concurrent PHPTs can consume enough CPU during PHP startup to turn those
+  // upstream timing assumptions into false connection-refused failures. Run
+  // server tests exclusively rather than skipping or patching them.
+  return conflicts.includes("server");
+}
+
 function isFlakyOutput(output: string): boolean {
   return /\b(?:404: page not found|address already in use|connection refused|deadlock|mailbox already exists|timed out)\b/i.test(output);
 }
@@ -430,23 +579,48 @@ function normalizeExtensionName(extension: string): string {
 
 function sharedExtensionsForPhp(phpPath: string): Set<string> {
   const out = new Set<string>();
+  const phpDir = dirname(phpPath);
+  if (existsSync(phpDir)) {
+    for (const entry of readdirSync(phpDir)) {
+      if (entry.endsWith(".so")) {
+        out.add(normalizeExtensionName(entry));
+      }
+    }
+  }
   const opcachePath =
     process.env.PHP_OPCACHE_SO ??
     tryResolveBinary("programs/php/opcache.so") ??
-    join(dirname(phpPath), "opcache.so");
+    join(phpDir, "opcache.so");
   if (opcachePath && existsSync(opcachePath)) out.add("opcache");
   return out;
 }
 
 function staticExtensionsForPhpSource(sourceRoot: string): Set<string> {
   const out = new Set<string>();
-  const internalFunctions = join(sourceRoot, "main/internal_functions.c");
-  if (!existsSync(internalFunctions)) return out;
-  const text = readFileSync(internalFunctions, "utf8");
-  for (const match of text.matchAll(/\bphpext_([A-Za-z0-9_]+)_ptr\b/g)) {
-    out.add(normalizeExtensionName(match[1]));
+  for (const file of ["internal_functions.c", "internal_functions_cli.c"]) {
+    const internalFunctions = join(sourceRoot, "main", file);
+    if (!existsSync(internalFunctions)) continue;
+    const text = readFileSync(internalFunctions, "utf8");
+    for (const match of text.matchAll(/\bphpext_([A-Za-z0-9_]+)_ptr\b/g)) {
+      out.add(normalizeExtensionName(match[1]));
+    }
   }
   return out;
+}
+
+function preparePhpTestFixtures(sourceRoot: string): void {
+  // PHP 8.3.15's upstream SNI PHPT fixtures expired on 2026-04-02. Do not
+  // fake guest time to make them pass: that would compromise Kandelo as a
+  // general POSIX platform. Instead, treat this as test-fixture maintenance
+  // and copy equivalent long-lived certificates into the local test tree
+  // before discovery/VFS packaging.
+  const fixtureDir = join(REPO_ROOT, "tests/php-fixtures/openssl-sni-2036");
+  const destDir = join(sourceRoot, "ext/openssl/tests");
+  if (!existsSync(fixtureDir) || !existsSync(destDir)) return;
+  for (const entry of readdirSync(fixtureDir)) {
+    if (!entry.startsWith("sni_server_") || !entry.endsWith(".pem")) continue;
+    cpSync(join(fixtureDir, entry), join(destDir, entry));
+  }
 }
 
 function loadExtensionIniArgs(
@@ -597,7 +771,7 @@ function unsupportedReason(test: PhptTest): string | null {
   }
   if (
     test.rel.startsWith("Zend/tests/fibers/") ||
-    /\b(?:new\s+\\?Fiber|\\?Fiber::|ReflectionFiber)\b/.test(source)
+    /\b(?:new\s+\\?Fiber|\\?Fiber::|ReflectionFiber|_?ZendTestFiber)\b/.test(source)
   ) {
     return "PHP Fibers require ucontext/boost context switching, which the Kandelo PHP build does not support yet";
   }
@@ -688,6 +862,8 @@ class NodePhpRunner implements PhpRunner {
   private virtualPhpPath: string;
   private host: NodeKernelHost | null = null;
   private phpBytes: ArrayBuffer | null = null;
+  private extensionMountRoot: string | null = null;
+  private testsSinceReset = 0;
   private activeOutput: { stdout: string; stderr: string; output: string } | null =
     null;
 
@@ -696,6 +872,8 @@ class NodePhpRunner implements PhpRunner {
     private phpPath: string,
     private availableSharedExtensions: Set<string>,
     private ownsSourceRoot = false,
+    private hostResetInterval = 50,
+    private enableTcpNetwork = true,
   ) {
     this.virtualPhpPath = `/kandelo-bin/${basename(phpPath)}`;
   }
@@ -704,21 +882,47 @@ class NodePhpRunner implements PhpRunner {
     return loadExtensionIniArgs(
       requiredExtensions,
       this.availableSharedExtensions,
-      "/kandelo-bin",
+      BROWSER_EXTENSION_DIR,
     );
+  }
+
+  private ensureExtensionMountRoot(): string {
+    if (this.extensionMountRoot) return this.extensionMountRoot;
+    const root = mkdtempSync(join(tmpdir(), "kandelo-php-ext-"));
+    const destDir = join(root, "php", "extensions");
+    mkdirSync(destDir, { recursive: true });
+    const srcDir = dirname(this.phpPath);
+    for (const entry of readdirSync(srcDir)) {
+      if (!entry.endsWith(".so")) continue;
+      cpSync(join(srcDir, entry), join(destDir, entry));
+    }
+    this.extensionMountRoot = root;
+    return root;
   }
 
   private async ensureHost(): Promise<NodeKernelHost> {
     if (this.host) return this.host;
     this.phpBytes = loadBytes(this.phpPath);
+    const extensionMountRoot = this.ensureExtensionMountRoot();
     const host = new NodeKernelHost({
       maxWorkers: 4,
       rootfsImage: "default",
+      enableTcpNetwork: this.enableTcpNetwork,
       extraMounts: [
         { mountPoint: "/php-src", hostPath: this.sourceRoot },
         {
           mountPoint: "/kandelo-bin",
           hostPath: dirname(this.phpPath),
+          readonly: true,
+        },
+        {
+          mountPoint: "/usr/lib",
+          hostPath: extensionMountRoot,
+          readonly: true,
+        },
+        {
+          mountPoint: "/kandelo-test-bin",
+          hostPath: ensureNodeToolDir(),
           readonly: true,
         },
       ],
@@ -768,6 +972,11 @@ class NodePhpRunner implements PhpRunner {
     await delay(0);
   }
 
+  private async hasLiveProcesses(host: NodeKernelHost): Promise<boolean> {
+    const processes = await withTimeout(host.enumProcs(), 1_000, "enumProcs");
+    return processes.length > 0;
+  }
+
   private async terminateLiveProcesses(host: NodeKernelHost): Promise<boolean> {
     let processes: Array<{ pid: number }> = [];
     try {
@@ -801,7 +1010,9 @@ class NodePhpRunner implements PhpRunner {
     scriptArgs?: string[];
     env: string[];
     stdin?: string;
+    stdinIsPipe?: boolean;
     pipeStdio?: number[];
+    waitForChildOutput?: boolean;
     timeoutMs: number;
   }): Promise<PhpRunResult> {
     const scriptName = phptGeneratedScriptName(opts.test, opts.kind);
@@ -816,8 +1027,12 @@ class NodePhpRunner implements PhpRunner {
     if (!this.phpBytes) throw new Error("PHP wasm bytes not loaded");
     const output = { stdout: "", stderr: "", output: "" };
     this.activeOutput = output;
-    const stdin =
-      opts.stdin == null ? undefined : Buffer.from(opts.stdin, "latin1");
+    // PHPT execution provides a finite stdin stream. Tests without an
+    // explicit --STDIN-- section get immediate EOF, but keep fd 0 terminal-like
+    // unless the PHPT explicitly redirects/captures it. Upstream run-tests.php
+    // distinguishes "terminal with no input" from a pipe for isatty/fstat.
+    const stdin = Buffer.from(opts.stdin ?? "", "latin1");
+    const stdinIsPipe = opts.stdinIsPipe ?? true;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     let pid: number | null = null;
     try {
@@ -836,18 +1051,18 @@ class NodePhpRunner implements PhpRunner {
           cwd: "/php-src",
           env: [
             "HOME=/tmp",
+            "USER=kandelo",
+            "USERNAME=kandelo",
+            "LOGNAME=kandelo",
             "TMPDIR=/tmp",
-            "PATH=/bin:/usr/bin:/usr/local/bin",
+            "PATH=/kandelo-test-bin:/bin:/usr/bin:/usr/local/bin",
             `TEST_PHP_SRCDIR=/php-src`,
             `TEST_PHP_EXECUTABLE=${this.virtualPhpPath}`,
             `TEST_PHP_EXECUTABLE_ESCAPED=${shellEscape(this.virtualPhpPath)}`,
-            // Upstream run-tests.php uses this for additional CLI switches,
-            // not for the executable path. PHP_BINARY supplies the executable
-            // once the wasm artifact has execute permissions.
-            "TEST_PHP_EXTRA_ARGS=",
             ...opts.env,
           ],
           stdin,
+          stdinIsPipe,
           pipeStdio: opts.pipeStdio,
           onStarted: (startedPid) => {
             pid = startedPid;
@@ -861,6 +1076,14 @@ class NodePhpRunner implements PhpRunner {
         );
       });
       const exitCode = await Promise.race([exitPromise, timeoutPromise]);
+      // A PHP process may fork short-lived children that inherit the same
+      // stdio and produce PHPT-observed output after the original parent exits
+      // (matching native run-tests.php process-tree behavior). Only enable
+      // this bounded grace period for PHPTs that actually exercise fork-like
+      // APIs; doing it unconditionally would add seconds to every test.
+      if (opts.waitForChildOutput) {
+        await delay(1_000);
+      }
       // Process exit and stdio notifications are delivered over separate host
       // messages. Wait for output to quiesce before freezing the capture so
       // data written immediately before _exit() is not lost. A fixed short
@@ -919,12 +1142,25 @@ class NodePhpRunner implements PhpRunner {
     }
   }
 
+  async endTest(): Promise<void> {
+    if (this.hostResetInterval <= 0 || !this.host) return;
+    this.testsSinceReset++;
+    if (this.testsSinceReset < this.hostResetInterval) return;
+    const host = this.host;
+    this.testsSinceReset = 0;
+    await this.resetHost(host);
+  }
+
   async close(): Promise<void> {
     const host = this.host;
     this.host = null;
     if (host) await host.destroy().catch(() => {});
     if (this.ownsSourceRoot) {
       rmSync(this.sourceRoot, { recursive: true, force: true });
+    }
+    if (this.extensionMountRoot) {
+      rmSync(this.extensionMountRoot, { recursive: true, force: true });
+      this.extensionMountRoot = null;
     }
   }
 }
@@ -1098,7 +1334,9 @@ class BrowserPhpRunner implements PhpRunner {
     scriptArgs?: string[];
     env: string[];
     stdin?: string;
+    stdinIsPipe?: boolean;
     pipeStdio?: number[];
+    waitForChildOutput?: boolean;
     timeoutMs: number;
   }): Promise<PhpRunResult> {
     if (!this.page) throw new Error("browser page not ready");
@@ -1117,13 +1355,16 @@ class BrowserPhpRunner implements PhpRunner {
       cwd: "/php-src",
       env: [
         "PATH=/bin:/usr/bin:/usr/local/bin",
+        "USER=kandelo",
+        "USERNAME=kandelo",
+        "LOGNAME=kandelo",
         "TEST_PHP_SRCDIR=/php-src",
         "TEST_PHP_EXECUTABLE=/usr/local/bin/php",
         "TEST_PHP_EXECUTABLE_ESCAPED='/usr/local/bin/php'",
-        "TEST_PHP_EXTRA_ARGS=",
         ...opts.env,
       ],
-      stdin: opts.stdin,
+      stdin: opts.stdin ?? "",
+      stdinIsPipe: opts.stdinIsPipe ?? true,
       pipeStdio: opts.pipeStdio,
       timeoutMs: opts.timeoutMs,
     };
@@ -1221,11 +1462,19 @@ async function runPhpt(
     };
   }
 
-  const commonEnv = [...passthroughEnvArgs(), ...envArgs(test.sections.ENV, test)];
+  const commonEnv = mergeEnvArgs(
+    passthroughEnvArgs(),
+    defaultPhpTestEnvArgs(),
+    envArgs(test.sections.ENV, test),
+  );
   const defaultIniArgs = baseIniArgs();
   const testIniArgs = iniArgs(test.sections.INI, test);
   const args = splitArgs(test.sections.ARGS);
   const pipeStdio = captureStdioFds(test);
+  const stdinIsPipe =
+    test.sections.STDIN !== undefined ||
+    test.sections.CAPTURE_STDIO === undefined ||
+    pipeStdio.includes(0);
 
   const requiredExtensions = extensionArgs(test.sections.EXTENSIONS);
   const extensionIniArgs = runner.loadExtensionIniArgs(requiredExtensions);
@@ -1257,10 +1506,11 @@ async function runPhpt(
       argv: preTestArgv,
       env: envWithExtraArgs,
       pipeStdio,
+      stdinIsPipe,
       timeoutMs,
     });
     const skipOutput = normalizeOutput(`${skip.stdout}${skip.stderr}`);
-    if (/^skip\b/i.test(skipOutput)) {
+    if (/^(?:skip|skipped)\b/i.test(skipOutput)) {
       return {
         test: test.rel,
         status: "skip",
@@ -1295,7 +1545,11 @@ async function runPhpt(
       scriptArgs: args,
       env: envWithExtraArgs,
       stdin: test.sections.STDIN,
+      stdinIsPipe,
       pipeStdio,
+      waitForChildOutput: /\b(?:pcntl_fork|pcntl_rfork|forkx|proc_open|popen)\s*\(/.test(
+        test.sections.FILE ?? "",
+      ),
       timeoutMs,
     });
 
@@ -1357,6 +1611,7 @@ async function runPhpt(
         argv: preTestArgv,
         env: envWithExtraArgs,
         pipeStdio,
+        stdinIsPipe,
         timeoutMs: Math.min(timeoutMs, 30_000),
       })
       .catch(() => {});
@@ -1391,6 +1646,13 @@ Options:
   --offset <n>          Skip the first n selected tests
   --limit <n>           Run only the first n discovered tests
   --jobs <n>            Number of PHPTs to run concurrently (Node host only; default: 1)
+  --host-reset-interval <n>
+                        Reboot each Node-host Kandelo kernel after n PHPTs
+                        per worker to reclaim host-side Wasm memory
+                        (default: PHP_TEST_HOST_RESET_INTERVAL or 50; 0 disables)
+  --disable-tcp-network Disable Node-host outbound TCP/DNS bridging
+                        (enabled by default; set PHP_TEST_ENABLE_TCP_NETWORK=0
+                        for the same effect)
   --json                Emit JSON lines
   --report              Write docs/php-upstream-test-report.md
   --rebuild-vfs         Rebuild php-test.vfs.zst before browser runs
@@ -1409,6 +1671,11 @@ async function main() {
   let offset = 0;
   let limit: number | null = null;
   let jobs = 1;
+  let hostResetInterval = parseInt(
+    process.env.PHP_TEST_HOST_RESET_INTERVAL ?? "50",
+    10,
+  );
+  let enableTcpNetwork = process.env.PHP_TEST_ENABLE_TCP_NETWORK !== "0";
   let json = false;
   let report = false;
   let rebuildVfs = false;
@@ -1454,6 +1721,13 @@ async function main() {
       if (!Number.isFinite(jobs) || jobs < 1) {
         throw new Error(`invalid jobs: ${jobs}`);
       }
+    } else if (arg === "--host-reset-interval" && args[i + 1]) {
+      hostResetInterval = parseInt(args[++i], 10);
+      if (!Number.isFinite(hostResetInterval) || hostResetInterval < 0) {
+        throw new Error(`invalid host reset interval: ${hostResetInterval}`);
+      }
+    } else if (arg === "--disable-tcp-network") {
+      enableTcpNetwork = false;
     } else if (arg === "--json") {
       json = true;
     } else if (arg === "--report") {
@@ -1468,6 +1742,7 @@ async function main() {
   }
 
   const sourceRoot = resolvePhpSource();
+  preparePhpTestFixtures(sourceRoot);
   const phpPath = resolvePhpBinary();
   const availableSharedExtensions = sharedExtensionsForPhp(phpPath);
   const availableExtensions = new Set([
@@ -1499,6 +1774,12 @@ async function main() {
     }
     if (offset > 0) console.error(`Offset: ${offset}`);
     if (jobs > 1) console.error(`Jobs: ${jobs}`);
+    if (host === "node") {
+      console.error(`Node host reset interval: ${hostResetInterval}`);
+      console.error(
+        `Node TCP/DNS bridge: ${enableTcpNetwork ? "enabled" : "disabled"}`,
+      );
+    }
     console.error(`Tests: ${tests.length}`);
     console.error("");
   }
@@ -1522,6 +1803,8 @@ async function main() {
           phpPath,
           availableSharedExtensions,
           runnerSourceRoot !== sourceRoot,
+          hostResetInterval,
+          enableTcpNetwork,
         ),
       );
     }
@@ -1540,6 +1823,8 @@ async function main() {
   let completed = 0;
   const pendingTests = new Set(tests.map((_test, index) => index));
   const activeConflicts = new Set<string>();
+  let activeTests = 0;
+  let exclusiveActive = false;
   let schedulerWaiters: Array<() => void> = [];
 
   async function acquireTest(): Promise<{
@@ -1550,11 +1835,17 @@ async function main() {
       if (pendingTests.size === 0) return null;
       for (const index of pendingTests) {
         const conflicts = phptConflictTokens(tests[index]);
+        const exclusive = requiresExclusiveScheduling(conflicts);
+        if (exclusiveActive || (exclusive && activeTests > 0)) {
+          continue;
+        }
         if (conflicts.some((conflict) => activeConflicts.has(conflict))) {
           continue;
         }
         pendingTests.delete(index);
         for (const conflict of conflicts) activeConflicts.add(conflict);
+        activeTests++;
+        if (exclusive) exclusiveActive = true;
         return { index, conflicts };
       }
       await new Promise<void>((resolve) => schedulerWaiters.push(resolve));
@@ -1563,6 +1854,8 @@ async function main() {
 
   function releaseTest(conflicts: string[]) {
     for (const conflict of conflicts) activeConflicts.delete(conflict);
+    if (requiresExclusiveScheduling(conflicts)) exclusiveActive = false;
+    activeTests = Math.max(0, activeTests - 1);
     const waiters = schedulerWaiters;
     schedulerWaiters = [];
     for (const wake of waiters) wake();
@@ -1589,6 +1882,7 @@ async function main() {
           counts[result.status]++;
           results[index] = result;
           completed++;
+          await runner.endTest?.();
           if (json) {
             console.log(JSON.stringify(result));
           } else {

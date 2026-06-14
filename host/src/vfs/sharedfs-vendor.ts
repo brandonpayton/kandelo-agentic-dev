@@ -1739,7 +1739,8 @@ export class SharedFS {
     try {
       const off = this.inodeOffset(ino);
       const oldMode = this.r32(off + INO_MODE);
-      this.w32(off + INO_MODE, (oldMode & S_IFMT) | (mode & 0o7777));
+      const fileType = (mode & S_IFMT) || (oldMode & S_IFMT);
+      this.w32(off + INO_MODE, fileType | (mode & 0o7777));
       this.w64(off + INO_CTIME, Date.now());
     } finally {
       this.inodeWriteUnlock(ino);
@@ -1753,7 +1754,8 @@ export class SharedFS {
     try {
       const off = this.inodeOffset(entry.ino);
       const oldMode = this.r32(off + INO_MODE);
-      this.w32(off + INO_MODE, (oldMode & S_IFMT) | (mode & 0o7777));
+      const fileType = (mode & S_IFMT) || (oldMode & S_IFMT);
+      this.w32(off + INO_MODE, fileType | (mode & 0o7777));
       this.w64(off + INO_CTIME, Date.now());
     } finally {
       this.inodeWriteUnlock(entry.ino);

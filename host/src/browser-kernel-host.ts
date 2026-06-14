@@ -106,6 +106,8 @@ export interface BrowserKernelBootOptions {
   pty?: boolean;
   /** Initial stdin bytes (with implicit EOF). */
   stdin?: Uint8Array;
+  /** Whether supplied stdin should make fd 0 pipe-like for isatty/fstat. */
+  stdinIsPipe?: boolean;
   /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
   pipeStdio?: number[];
 }
@@ -405,6 +407,7 @@ export class BrowserKernel {
       gid: options.gid,
       pty: options.pty,
       stdin: options.stdin,
+      stdinIsPipe: options.stdinIsPipe,
       pipeStdio: options.pipeStdio,
       maxPages: this.maxPages,
     }) as number;
@@ -448,6 +451,7 @@ export class BrowserKernel {
       env?: string[];
       cwd?: string;
       stdin?: Uint8Array;
+      stdinIsPipe?: boolean;
       pipeStdio?: number[];
       pty?: boolean;
       uid?: number;
@@ -479,6 +483,7 @@ export class BrowserKernel {
       ptyCols: options?.ptyCols,
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
+      stdinIsPipe: options?.stdinIsPipe,
       pipeStdio: options?.pipeStdio,
       maxPages: this.maxPages,
     }, [bytesToSend]);
@@ -514,7 +519,7 @@ export class BrowserKernel {
   async spawnFromVfs(
     programPath: string,
     argv: string[],
-    options?: { env?: string[]; cwd?: string; uid?: number; gid?: number; pty?: boolean; stdin?: Uint8Array; pipeStdio?: number[] },
+    options?: { env?: string[]; cwd?: string; uid?: number; gid?: number; pty?: boolean; stdin?: Uint8Array; stdinIsPipe?: boolean; pipeStdio?: number[] },
   ): Promise<{ pid: number; exit: Promise<number> }> {
     const requestId = this.nextRequestId++;
     const pid = await this.request(requestId, {
@@ -528,6 +533,7 @@ export class BrowserKernel {
       gid: options?.gid,
       pty: options?.pty,
       stdin: options?.stdin,
+      stdinIsPipe: options?.stdinIsPipe,
       pipeStdio: options?.pipeStdio,
       maxPages: this.maxPages,
     }) as number;

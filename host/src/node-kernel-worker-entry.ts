@@ -18,6 +18,7 @@ import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { CentralizedKernelWorker } from "./kernel-worker";
 import type {
   ForkFromThreadContext,
@@ -99,6 +100,9 @@ interface ProcessInfo {
 const processes = new Map<number, ProcessInfo>();
 const processTeardowns = new Map<number, Promise<void>>();
 const reportedExits = new Set<number>();
+const compiledProgramModules = new Map<string, Promise<WebAssembly.Module>>();
+const MAX_COMPILED_PROGRAM_MODULES = 16;
+const vmInterruptTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
 // Workers terminated by the kernel-worker entry itself (handleExit /
 // handleExec / handleTerminate). The crash safety-net listener checks
@@ -182,6 +186,44 @@ function reportProcessExit(pid: number, status: number): void {
   post({ type: "exit", pid, status });
 }
 
+function clearVmInterruptTimer(pid: number): void {
+  const timer = vmInterruptTimers.get(pid);
+  if (timer) clearTimeout(timer);
+  vmInterruptTimers.delete(pid);
+}
+
+function handleVmInterruptTimer(msg: {
+  pid: number;
+  timedOutPtr: number;
+  vmInterruptPtr: number;
+  seconds: number;
+}): void {
+  clearVmInterruptTimer(msg.pid);
+  if (!(msg.seconds > 0)) return;
+  const requestedDelayMs = Math.min(msg.seconds, 999999999) * 1000;
+  // The cooperative VM interrupt is paired with runtimes that also arm a real
+  // POSIX timer for the same deadline. Fire the cooperative interrupt slightly
+  // before that deadline so a runtime that reaches a VM safepoint can cancel
+  // its POSIX timer before the signal becomes pending. If the Wasm program is
+  // executing long-running native/runtime code and cannot observe the VM
+  // interrupt, the POSIX timer still fires at the requested time and preserves
+  // normal hard-timeout behaviour.
+  const delayMs = Math.max(1, requestedDelayMs - 100);
+  const timer = setTimeout(() => {
+    vmInterruptTimers.delete(msg.pid);
+    const info = processes.get(msg.pid);
+    if (!info) return;
+    const flags = new Uint8Array(info.memory.buffer);
+    if (msg.timedOutPtr >= 0 && msg.timedOutPtr < flags.length) {
+      Atomics.store(flags, msg.timedOutPtr, 1);
+    }
+    if (msg.vmInterruptPtr >= 0 && msg.vmInterruptPtr < flags.length) {
+      Atomics.store(flags, msg.vmInterruptPtr, 1);
+    }
+  }, delayMs);
+  vmInterruptTimers.set(msg.pid, timer);
+}
+
 function reclaimExitedThreadWorker(
   pid: number,
   tid: number,
@@ -260,6 +302,7 @@ async function finalizeProcessWorker(
 ): Promise<void> {
   const cur = processes.get(pid);
   if (cur && cur.worker === worker) {
+    clearVmInterruptTimer(pid);
     // Synthesize a SIGSEGV-style reap *before* `deactivateProcess` in
     // case the worker died without sending SYS_EXIT_GROUP (uncaught
     // wasm trap, instantiation failure → `{type:"error"}` path).
@@ -363,6 +406,28 @@ function bufferToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const out = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(out).set(bytes);
   return out;
+}
+
+function programModuleCacheKey(programBytes: ArrayBuffer): string {
+  const bytes = new Uint8Array(programBytes);
+  return `${bytes.byteLength}:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+async function getCompiledProgramModule(
+  programBytes: ArrayBuffer,
+): Promise<WebAssembly.Module> {
+  const key = programModuleCacheKey(programBytes);
+  let promise = compiledProgramModules.get(key);
+  if (!promise) {
+    promise = WebAssembly.compile(programBytes);
+    compiledProgramModules.set(key, promise);
+    promise.catch(() => compiledProgramModules.delete(key));
+    if (compiledProgramModules.size > MAX_COMPILED_PROGRAM_MODULES) {
+      const oldest = compiledProgramModules.keys().next().value;
+      if (oldest) compiledProgramModules.delete(oldest);
+    }
+  }
+  return promise;
 }
 
 function resolveExecLocal(path: string): ArrayBuffer | null {
@@ -651,6 +716,7 @@ async function handleInit(msg: InitMessage) {
 function failProcess(pid: number, reason: string) {
   const text = `[kernel-worker] pid=${pid}: ${reason}\n`;
   post({ type: "stderr", pid, data: new TextEncoder().encode(text) });
+  clearVmInterruptTimer(pid);
   try {
     kernelWorker.deactivateProcess(pid);
   } catch {}
@@ -664,7 +730,7 @@ function failProcess(pid: number, reason: string) {
 
 // --- Spawn ---
 
-function handleSpawn(msg: SpawnMessage) {
+async function handleSpawn(msg: SpawnMessage) {
   try {
     // Allocate PID internally — skip any PIDs already occupied by fork children
     while (processes.has(nextSpawnPid)) {
@@ -718,16 +784,19 @@ function handleSpawn(msg: SpawnMessage) {
       if (msg.stdin) {
         const stdinData =
           msg.stdin instanceof Uint8Array ? msg.stdin : new Uint8Array(msg.stdin);
-        kernelWorker.setStdinData(pid, stdinData);
+        kernelWorker.setStdinData(pid, stdinData, msg.stdinIsPipe ?? true);
       }
     }
+
+    const programModule =
+      msg.programModule ?? (await getCompiledProgramModule(msg.programBytes));
 
     const initData: CentralizedWorkerInitMessage = {
       type: "centralized_init",
       pid,
       ppid: 0,
       programBytes: msg.programBytes,
-      programModule: msg.programModule,
+      programModule,
       memory,
       channelOffset,
       env: msg.env,
@@ -740,7 +809,7 @@ function handleSpawn(msg: SpawnMessage) {
     processes.set(pid, {
       memory,
       programBytes: msg.programBytes,
-      programModule: msg.programModule,
+      programModule,
       worker,
       channelOffset,
       ptrWidth,
@@ -767,6 +836,9 @@ function handleSpawn(msg: SpawnMessage) {
         pid?: number;
         message?: string;
         status?: number;
+        timedOutPtr?: number;
+        vmInterruptPtr?: number;
+        seconds?: number;
       };
       if (m.type === "error" && m.pid === pid) {
         const errBytes = new TextEncoder().encode(
@@ -780,6 +852,8 @@ function handleSpawn(msg: SpawnMessage) {
         // the kernel didn't process a SYS_exit_group first, the kernel
         // still has the process registered and host.spawn() would hang.
         void finalizeProcessWorker(pid, worker, m.status ?? 0);
+      } else if (m.type === "vm_interrupt_timer" && m.pid === pid) {
+        handleVmInterruptTimer(m as Required<typeof m>);
       }
     });
 
@@ -879,6 +953,9 @@ async function handleFork(
       pid?: number;
       message?: string;
       status?: number;
+      timedOutPtr?: number;
+      vmInterruptPtr?: number;
+      seconds?: number;
     };
     if (m.type === "error" && m.pid === childPid) {
       const errBytes = new TextEncoder().encode(
@@ -888,6 +965,8 @@ async function handleFork(
       void finalizeProcessWorker(childPid, childWorker, -1);
     } else if (m.type === "exit" && m.pid === childPid) {
       void finalizeProcessWorker(childPid, childWorker, m.status ?? 0);
+    } else if (m.type === "vm_interrupt_timer" && m.pid === childPid) {
+      handleVmInterruptTimer(m as Required<typeof m>);
     }
   });
 
@@ -905,6 +984,7 @@ async function handleExec(
   const resolved = await resolveExecutableForLaunch(path, argv);
   if (!resolved) return -2; // ENOENT
   const { programBytes, argv: launchArgv } = resolved;
+  const programModule = await getCompiledProgramModule(programBytes);
 
   const newPtrWidth = detectPtrWidth(programBytes);
   const setupResult = kernelWorker.kernelExecSetup(pid);
@@ -913,6 +993,7 @@ async function handleExec(
   kernelWorker.prepareProcessForExec(pid);
 
   const oldInfo = processes.get(pid);
+  clearVmInterruptTimer(pid);
   await terminateThreadWorkers(pid);
   if (oldInfo?.worker) {
     intentionallyTerminated.add(oldInfo.worker as object);
@@ -947,6 +1028,7 @@ async function handleExec(
     pid,
     ppid: 0,
     programBytes,
+    programModule,
     memory: newMemory,
     channelOffset: newChannelOffset,
     argv: launchArgv,
@@ -959,6 +1041,7 @@ async function handleExec(
   processes.set(pid, {
     memory: newMemory,
     programBytes,
+    programModule,
     worker: newWorker,
     channelOffset: newChannelOffset,
     ptrWidth: newPtrWidth,
@@ -983,6 +1066,9 @@ async function handleExec(
       pid?: number;
       message?: string;
       status?: number;
+      timedOutPtr?: number;
+      vmInterruptPtr?: number;
+      seconds?: number;
     };
     if (m.type === "error" && m.pid === pid) {
       const errBytes = new TextEncoder().encode(
@@ -992,6 +1078,8 @@ async function handleExec(
       void finalizeProcessWorker(pid, newWorker, -1);
     } else if (m.type === "exit" && m.pid === pid) {
       void finalizeProcessWorker(pid, newWorker, m.status ?? 0);
+    } else if (m.type === "vm_interrupt_timer" && m.pid === pid) {
+      handleVmInterruptTimer(m as Required<typeof m>);
     }
   });
 
@@ -1047,6 +1135,7 @@ async function handlePosixSpawn(
   envp: string[],
 ): Promise<number> {
   post({ type: "proc_event", kind: "spawn", pid: childPid });
+  const programModule = await getCompiledProgramModule(programBytes);
 
   const ptrWidth = detectPtrWidth(programBytes);
   const {
@@ -1073,6 +1162,7 @@ async function handlePosixSpawn(
     pid: childPid,
     ppid: 0,
     programBytes,
+    programModule,
     memory,
     channelOffset,
     argv,
@@ -1085,6 +1175,7 @@ async function handlePosixSpawn(
   processes.set(childPid, {
     memory,
     programBytes,
+    programModule,
     worker: newWorker,
     channelOffset,
     ptrWidth,
@@ -1106,6 +1197,9 @@ async function handlePosixSpawn(
       pid?: number;
       message?: string;
       status?: number;
+      timedOutPtr?: number;
+      vmInterruptPtr?: number;
+      seconds?: number;
     };
     if (m.type === "error" && m.pid === childPid) {
       const errBytes = new TextEncoder().encode(
@@ -1115,6 +1209,8 @@ async function handlePosixSpawn(
       void finalizeProcessWorker(childPid, newWorker, -1);
     } else if (m.type === "exit" && m.pid === childPid) {
       void finalizeProcessWorker(childPid, newWorker, m.status ?? 0);
+    } else if (m.type === "vm_interrupt_timer" && m.pid === childPid) {
+      handleVmInterruptTimer(m as Required<typeof m>);
     }
   });
 
@@ -1227,6 +1323,8 @@ async function handleClone(
       void terminateCurrentThreadEntry();
     } else if (m.type === "error") {
       failThread(m.message);
+    } else if (m.type === "vm_interrupt_timer") {
+      handleVmInterruptTimer(m);
     }
   });
   threadWorker.on("error", (err: Error) =>
@@ -1388,7 +1486,7 @@ port.on("message", (msg: MainToKernelMessage) => {
       handleInit(msg);
       break;
     case "spawn":
-      handleSpawn(msg);
+      void handleSpawn(msg);
       break;
     case "append_stdin_data":
       kernelWorker.appendStdinData(msg.pid, msg.data);

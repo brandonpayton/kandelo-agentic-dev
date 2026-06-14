@@ -9,7 +9,7 @@
  * The Playwright-side runner parses each .phpt file and writes transient
  * PHP scripts into the restored image before spawning /usr/local/bin/php.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { MemoryFileSystem } from "../../../host/src/vfs/memory-fs";
 import {
@@ -29,6 +29,8 @@ const PHP_WASM = process.env.PHP_WASM
   ?? join(LOCAL_PHP_SRC, "sapi/cli/php");
 const OPCACHE_SO = process.env.PHP_OPCACHE_SO
   ?? tryResolveBinary("programs/php/opcache.so");
+const PHP_EXTENSION_DIR = process.env.PHP_EXTENSION_DIR
+  ?? (OPCACHE_SO ? dirname(OPCACHE_SO) : undefined);
 const DASH_WASM = process.env.DASH_WASM
   ?? tryResolveBinary("programs/dash.wasm");
 const COREUTILS_WASM = process.env.COREUTILS_WASM
@@ -79,6 +81,16 @@ function collectPhptDirs(root: string): string[] {
   return [...dirs].sort();
 }
 
+function preparePhpTestFixtures(sourceRoot: string): void {
+  const fixtureDir = join(REPO_ROOT, "tests/php-fixtures/openssl-sni-2036");
+  const destDir = join(sourceRoot, "ext/openssl/tests");
+  if (!existsSync(fixtureDir) || !existsSync(destDir)) return;
+  for (const entry of readdirSync(fixtureDir)) {
+    if (!entry.startsWith("sni_server_") || !entry.endsWith(".pem")) continue;
+    cpSync(join(fixtureDir, entry), join(destDir, entry));
+  }
+}
+
 function shouldExclude(sourceRoot: string, relPath: string): boolean {
   const base = relPath.split("/").pop() ?? relPath;
   if (relPath.includes("/.git/") || relPath.includes("/.deps/") || relPath.includes("/.libs/")) return true;
@@ -112,6 +124,7 @@ async function main() {
   if (!existsSync(phpSrc)) {
     throw new Error(`php-src not found at ${phpSrc}`);
   }
+  preparePhpTestFixtures(phpSrc);
 
   console.log("==> Building PHP PHPT test VFS image");
   console.log(`  php-src: ${phpSrc}`);
@@ -143,12 +156,16 @@ async function main() {
   symlink(fs, "/usr/bin/sed", "/bin/sed");
 
   writeVfsBinary(fs, "/usr/local/bin/php", new Uint8Array(readFileSync(PHP_WASM)));
-  if (OPCACHE_SO && existsSync(OPCACHE_SO)) {
-    writeVfsBinary(
-      fs,
-      "/usr/lib/php/extensions/opcache.so",
-      new Uint8Array(readFileSync(OPCACHE_SO)),
-    );
+  if (PHP_EXTENSION_DIR && existsSync(PHP_EXTENSION_DIR)) {
+    for (const entry of readdirSync(PHP_EXTENSION_DIR)) {
+      if (!entry.endsWith(".so")) continue;
+      const src = join(PHP_EXTENSION_DIR, entry);
+      writeVfsBinary(
+        fs,
+        `/usr/lib/php/extensions/${entry}`,
+        new Uint8Array(readFileSync(src)),
+      );
+    }
   }
 
   const phptDirs = collectPhptDirs(phpSrc);

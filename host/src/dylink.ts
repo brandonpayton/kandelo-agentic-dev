@@ -209,8 +209,8 @@ export interface LoadSharedLibraryOptions {
   heapPointer?: { value: number };
   /** Allocate side-module linear-memory data in the process address space */
   allocateMemory?: (size: number, align: number) => number;
-  /** Global symbol table: name → function or WebAssembly.Global */
-  globalSymbols: Map<string, Function | WebAssembly.Global>;
+  /** Global symbol table: name → exported function, data global, or tag */
+  globalSymbols: Map<string, WebAssembly.ExportValue>;
   /** GOT entries: symbol name → mutable i32 WebAssembly.Global */
   got: Map<string, WebAssembly.Global>;
   /** Already-loaded libraries for dedup and dependency resolution */
@@ -336,14 +336,16 @@ function instantiateSharedLibrary(
   };
 
   // Tag imported by side modules compiled with clang's wasm SjLj lowering
-  // (`-mllvm -wasm-enable-sjlj`). The host doesn't actually catch these — the
-  // main process either has its own __c_longjmp tag (LLVM 22) or doesn't use
-  // SjLj (LLVM 21). A stub Tag lets the side module's import type-check and
-  // instantiate; behavior at throw time is undefined but the side module
-  // typically never throws this tag itself.
-  const longjmpTag = (typeof (WebAssembly as any).Tag === "function")
+  // (`-mllvm -wasm-enable-sjlj`). It must be the same tag object exported by
+  // the main module so longjmp/bailout exceptions thrown from a side module
+  // are catchable by setjmp frames in the main program. Falling back to a stub
+  // preserves instantiation for binaries that import the tag but whose main
+  // module does not export it; any actual cross-module throw then correctly
+  // remains a platform bug to fix for that binary.
+  const longjmpTag = options.globalSymbols.get("__c_longjmp")
+    ?? ((typeof (WebAssembly as any).Tag === "function")
     ? new (WebAssembly as any).Tag({ parameters: ["i32"] })
-    : undefined;
+    : undefined);
 
   // Construct imports
   const imports: WebAssembly.Imports = {

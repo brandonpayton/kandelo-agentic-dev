@@ -143,6 +143,11 @@ impl PerThreadSignalState {
         self.raise_internal(signum, si_value, -1) // SI_QUEUE
     }
 
+    /// Mark a signal as pending with explicit siginfo metadata.
+    pub fn raise_with_info(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
+        self.raise_internal(signum, si_value, si_code)
+    }
+
     fn raise_internal(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
         if signum == 0 || signum >= NSIG {
             return false;
@@ -328,6 +333,11 @@ impl SignalState {
     /// Mark a signal as pending with an si_value (for sigqueue — SI_QUEUE).
     pub fn raise_with_value(&mut self, signum: u32, si_value: i32) -> bool {
         self.raise_internal(signum, si_value, -1) // SI_QUEUE
+    }
+
+    /// Mark a signal as pending with explicit siginfo metadata.
+    pub fn raise_with_info(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
+        self.raise_internal(signum, si_value, si_code)
     }
 
     fn raise_internal(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {

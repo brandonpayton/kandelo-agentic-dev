@@ -2,7 +2,7 @@
 //!
 //! The binary format is little-endian and consists of:
 //! - Header (12 bytes): magic, version, total_size
-//! - Scalars (32 bytes): ppid, uid, gid, euid, egid, pgid, sid, umask
+//! - Scalars: ppid, uid, gid, euid, egid, pgid, sid, umask and process flags
 //! - Signal state (variable): blocked mask + non-default handlers
 //! - FD table (variable): max_fds, then each open fd entry
 //! - OFD table (variable): each open file description
@@ -35,7 +35,7 @@ use crate::terminal::{NCCS, TerminalState, WinSize};
 
 const FORK_MAGIC: u32 = 0x464F524B; // "FORK"
 const EXEC_MAGIC: u32 = 0x45584543; // "EXEC"
-const FORK_VERSION: u32 = 8;
+const FORK_VERSION: u32 = 9;
 
 // Bounds for deserialization to prevent OOM from malformed buffers.
 const MAX_FDS: u32 = 65536;
@@ -312,6 +312,14 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u32(proc.umask)?;
     w.write_u32(proc.nice as u32)?;
     w.write_u32(proc.is_session_leader as u32)?;
+    let child_pid_ns_vpid = proc.pid_ns_next_child_pid;
+    w.write_u32(child_pid_ns_vpid)?;
+    w.write_u32(if child_pid_ns_vpid != 0 {
+        child_pid_ns_vpid.saturating_add(1)
+    } else {
+        0
+    })?;
+    w.write_u32(proc.net_namespace_isolated as u32)?;
 
     // ── Signal state ──
     w.write_u64(proc.signals.blocked)?;
@@ -570,6 +578,9 @@ struct ForkScalars {
     sid: u32,
     umask: u32,
     nice: i32,
+    pid_ns_vpid: u32,
+    pid_ns_next_child_pid: u32,
+    net_namespace_isolated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -584,6 +595,10 @@ struct ExecScalars {
     is_session_leader: bool,
     umask: u32,
     nice: i32,
+    parent_death_signal: u32,
+    pid_ns_vpid: u32,
+    pid_ns_next_child_pid: u32,
+    net_namespace_isolated: bool,
 }
 
 #[inline(never)]
@@ -602,19 +617,33 @@ fn read_fork_header(r: &mut Reader<'_>) -> Result<(), Errno> {
 
 #[inline(never)]
 fn read_fork_scalars(r: &mut Reader<'_>) -> Result<ForkScalars, Errno> {
-    let scalars = ForkScalars {
-        ppid: r.read_u32()?,
-        uid: r.read_u32()?,
-        gid: r.read_u32()?,
-        euid: r.read_u32()?,
-        egid: r.read_u32()?,
-        pgid: r.read_u32()?,
-        sid: r.read_u32()?,
-        umask: r.read_u32()?,
-        nice: r.read_u32()? as i32,
-    };
+    let ppid = r.read_u32()?;
+    let uid = r.read_u32()?;
+    let gid = r.read_u32()?;
+    let euid = r.read_u32()?;
+    let egid = r.read_u32()?;
+    let pgid = r.read_u32()?;
+    let sid = r.read_u32()?;
+    let umask = r.read_u32()?;
+    let nice = r.read_u32()? as i32;
     let _parent_is_session_leader = r.read_u32()? != 0;
-    Ok(scalars)
+    let pid_ns_vpid = if r.remaining() >= 12 { r.read_u32()? } else { 0 };
+    let pid_ns_next_child_pid = if r.remaining() >= 8 { r.read_u32()? } else { 0 };
+    let net_namespace_isolated = if r.remaining() >= 4 { r.read_u32()? != 0 } else { false };
+    Ok(ForkScalars {
+        ppid,
+        uid,
+        gid,
+        euid,
+        egid,
+        pgid,
+        sid,
+        umask,
+        nice,
+        pid_ns_vpid,
+        pid_ns_next_child_pid,
+        net_namespace_isolated,
+    })
 }
 
 #[inline(never)]
@@ -1031,6 +1060,7 @@ fn new_fork_child_shell(child_pid: u32, scalars: ForkScalars) -> Box<Process> {
         ptr::addr_of_mut!((*child_ptr).state).write(ProcessState::Running);
         ptr::addr_of_mut!((*child_ptr).exit_status).write(0);
         ptr::addr_of_mut!((*child_ptr).exit_signal).write(0);
+        ptr::addr_of_mut!((*child_ptr).stop_signal).write(0);
         ptr::addr_of_mut!((*child_ptr).fd_table).write(FdTable::new());
         ptr::addr_of_mut!((*child_ptr).ofd_table).write(OfdTable::new());
         ptr::addr_of_mut!((*child_ptr).lock_table).write(LockTable::new());
@@ -1062,6 +1092,9 @@ fn new_fork_child_shell(child_pid: u32, scalars: ForkScalars) -> Box<Process> {
         ptr::addr_of_mut!((*child_ptr).timerfds).write(Vec::new());
         ptr::addr_of_mut!((*child_ptr).signalfds).write(Vec::new());
         ptr::addr_of_mut!((*child_ptr).posix_timers).write(Vec::new());
+        // Linux clears PR_SET_PDEATHSIG across fork. The setting is
+        // process-local and children must opt in for their own parent.
+        ptr::addr_of_mut!((*child_ptr).parent_death_signal).write(0);
         ptr::addr_of_mut!((*child_ptr).alt_stack_sp).write(0);
         ptr::addr_of_mut!((*child_ptr).alt_stack_flags).write(2); // SS_DISABLE
         ptr::addr_of_mut!((*child_ptr).alt_stack_size).write(0);
@@ -1075,6 +1108,11 @@ fn new_fork_child_shell(child_pid: u32, scalars: ForkScalars) -> Box<Process> {
         // gets a private mmap copy in its own Memory but is not registered
         // as a host display target.
         ptr::addr_of_mut!((*child_ptr).fb_binding).write(None);
+        ptr::addr_of_mut!((*child_ptr).pid_ns_vpid).write(scalars.pid_ns_vpid);
+        ptr::addr_of_mut!((*child_ptr).pid_ns_next_child_pid)
+            .write(scalars.pid_ns_next_child_pid);
+        ptr::addr_of_mut!((*child_ptr).net_namespace_isolated)
+            .write(scalars.net_namespace_isolated);
         ptr::addr_of_mut!((*child_ptr).fork_count).write(0);
 
         boxed.assume_init()
@@ -1134,7 +1172,7 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     let total_size_offset = w.pos;
     w.write_u32(0)?; // placeholder for total_size
 
-    // ── Scalars (32 bytes) ──
+    // ── Scalars ──
     // Preserve the process's own ppid (exec replaces the image, not the process)
     w.write_u32(proc.ppid)?;
     w.write_u32(proc.uid)?;
@@ -1146,6 +1184,11 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u32(proc.is_session_leader as u32)?;
     w.write_u32(proc.umask)?;
     w.write_u32(proc.nice as u32)?;
+    // PR_SET_PDEATHSIG is preserved across exec on Linux.
+    w.write_u32(proc.parent_death_signal)?;
+    w.write_u32(proc.pid_ns_vpid)?;
+    w.write_u32(proc.pid_ns_next_child_pid)?;
+    w.write_u32(proc.net_namespace_isolated as u32)?;
 
     // ── Signal state ──
     w.write_u64(proc.signals.blocked)?;
@@ -1365,6 +1408,10 @@ fn read_exec_scalars(r: &mut Reader<'_>) -> Result<ExecScalars, Errno> {
         is_session_leader: r.read_u32()? != 0,
         umask: r.read_u32()?,
         nice: r.read_u32()? as i32,
+        parent_death_signal: r.read_u32()?,
+        pid_ns_vpid: if r.remaining() >= 12 { r.read_u32()? } else { 0 },
+        pid_ns_next_child_pid: if r.remaining() >= 8 { r.read_u32()? } else { 0 },
+        net_namespace_isolated: if r.remaining() >= 4 { r.read_u32()? != 0 } else { false },
     })
 }
 
@@ -1381,8 +1428,13 @@ fn apply_exec_scalars(proc: &mut Process, scalars: ExecScalars) {
     proc.state = ProcessState::Running;
     proc.exit_status = 0;
     proc.exit_signal = 0;
+    proc.stop_signal = 0;
     proc.umask = scalars.umask;
     proc.nice = scalars.nice;
+    proc.parent_death_signal = scalars.parent_death_signal;
+    proc.pid_ns_vpid = scalars.pid_ns_vpid;
+    proc.pid_ns_next_child_pid = scalars.pid_ns_next_child_pid;
+    proc.net_namespace_isolated = scalars.net_namespace_isolated;
 }
 
 #[inline(never)]
@@ -1616,6 +1668,31 @@ mod tests {
         assert_eq!(restored.pid, 1);
         assert_eq!(restored.ppid, 0); // default ppid
         assert_eq!(restored.signals.pending, 0);
+    }
+
+    #[test]
+    fn test_fork_clears_parent_death_signal() {
+        let mut proc = Process::new(1);
+        proc.parent_death_signal = 15;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_fork_state(&proc, &mut buf).unwrap();
+        let child = deserialize_fork_state(&buf[..written], 2).unwrap();
+
+        assert_eq!(child.parent_death_signal, 0);
+        assert_eq!(child.ppid, 1);
+    }
+
+    #[test]
+    fn test_exec_preserves_parent_death_signal() {
+        let mut proc = Process::new(1);
+        proc.parent_death_signal = 15;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 1).unwrap();
+
+        assert_eq!(restored.parent_death_signal, 15);
     }
 
     #[test]

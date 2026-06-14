@@ -1229,20 +1229,12 @@ static long __do_syscall(long n, long a1, long a2, long a3,
 
     /* recvfrom — (fd, buf, len, flags, addr, addrlen_ptr) */
     case SYS_RECVFROM: {
-        uint32_t addr_buf_len = 0;
         uint32_t *addrlen_ptr = (uint32_t *)(uintptr_t)a6;
-        if (addrlen_ptr) {
-            addr_buf_len = *addrlen_ptr;
-        }
         int32_t ret = kernel_recvfrom((int32_t)a1,
                                       (uint8_t *)(uintptr_t)a2,
                                       (uint32_t)a3, (uint32_t)a4,
                                       (uint8_t *)(uintptr_t)a5,
-                                      addr_buf_len);
-        if (ret >= 0 && addrlen_ptr && a5) {
-            /* kernel_recvfrom returns data bytes; addr is 16 bytes for sockaddr_in */
-            *addrlen_ptr = 16;
-        }
+                                      addrlen_ptr);
         return (long)ret;
     }
 
@@ -1422,14 +1414,14 @@ static long __do_syscall(long n, long a1, long a2, long a3,
 
     case SYS_PRCTL: {
         /* prctl(option, arg2, arg3, arg4, arg5)
-         * For PR_SET_NAME(15): arg2 is pointer to name string
-         * For PR_GET_NAME(16): arg2 is pointer to name buffer
-         * We pass arg2 as buf_ptr for both cases.
+         * For PR_SET_NAME(15)/PR_GET_NAME(16): arg2 is pointer to name buffer.
+         * For PR_SET_PDEATHSIG(1): arg2 is the signal number value.
+         * For PR_GET_PDEATHSIG(2): arg2 is pointer to an int output slot.
          */
         uint32_t option = (uint32_t)a1;
         uint8_t *buf = (uint8_t *)(uintptr_t)a2;
         uint32_t buf_len = 16; /* thread name is always 16 bytes */
-        return (long)kernel_prctl(option, (uint32_t)a3, buf, buf_len);
+        return (long)kernel_prctl(option, (uint32_t)a2, buf, buf_len);
     }
 
     /* ============================================================== */

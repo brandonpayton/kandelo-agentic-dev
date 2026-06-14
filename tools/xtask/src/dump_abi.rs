@@ -478,6 +478,7 @@ fn render_ts_module() -> String {
     out.push_str("  direction: SyscallArgDirection;\n");
     out.push_str("  size: SyscallArgSizeSpec;\n");
     out.push_str("  copyRetvalAdd?: number;\n");
+    out.push_str("  copyRetvalLimit?: boolean;\n");
     out.push_str("}\n\n");
 
     out.push_str("export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {\n");
@@ -502,6 +503,9 @@ fn ts_syscall_arg_desc(desc: &shared::host_abi::SyscallArgDesc) -> String {
     );
     if desc.copy_retval_add != 0 {
         s.push_str(&format!(", copyRetvalAdd: {}", desc.copy_retval_add));
+    }
+    if !desc.copy_retval_limit {
+        s.push_str(", copyRetvalLimit: false");
     }
     s.push_str(" }");
     s
@@ -1268,6 +1272,9 @@ fn syscall_arg_desc_json(desc: &shared::host_abi::SyscallArgDesc) -> Value {
     m.insert("size".into(), syscall_arg_size_json(desc.size));
     if desc.copy_retval_add != 0 {
         m.insert("copyRetvalAdd".into(), json!(desc.copy_retval_add));
+    }
+    if !desc.copy_retval_limit {
+        m.insert("copyRetvalLimit".into(), json!(false));
     }
     Value::Object(m.into_iter().collect())
 }

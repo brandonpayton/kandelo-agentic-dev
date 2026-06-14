@@ -2,6 +2,7 @@ import type { Stats } from "node:fs";
 import type { StatResult } from "../types";
 
 const MODE_CHANGE_MASK = 0o7777;
+const FILE_TYPE_MASK = 0o170000;
 const UID_GID_UNCHANGED = 0xffffffff;
 const X_OK = 0o1;
 const W_OK = 0o2;
@@ -26,25 +27,38 @@ export class NativeMetadataOverlay {
 
   toStatResult(s: Stats): StatResult {
     const metadata = this.entries.get(this.key(s));
+    const nativeType = s.mode & FILE_TYPE_MASK;
+    const virtualMode = metadata?.mode;
+    const mode = virtualMode === undefined
+      ? s.mode
+      : ((virtualMode & FILE_TYPE_MASK) || nativeType) |
+        (virtualMode & MODE_CHANGE_MASK);
     return {
       dev: s.dev,
       ino: s.ino,
-      mode: metadata?.mode === undefined
-        ? s.mode
-        : (s.mode & ~MODE_CHANGE_MASK) | (metadata.mode & MODE_CHANGE_MASK),
+      mode,
       nlink: s.nlink,
       uid: metadata?.uid ?? 0,
       gid: metadata?.gid ?? 0,
       size: s.size,
       atimeMs: s.atimeMs,
       mtimeMs: s.mtimeMs,
-      ctimeMs: metadata?.ctimeMs ?? s.ctimeMs,
+      // The overlay only owns virtual metadata changes (chmod/chown).
+      // Native filesystem mutations such as write(2), truncate(2), link(2),
+      // and utimensat(2) still update the host inode's ctime. Report the
+      // newest ctime so a virtual chmod/chown is visible, without freezing
+      // ctime after later native changes to the same inode.
+      ctimeMs: metadata?.ctimeMs === undefined
+        ? s.ctimeMs
+        : Math.max(metadata.ctimeMs, s.ctimeMs),
     };
   }
 
   chmod(s: Stats, mode: number): void {
     const metadata = this.metadataFor(s);
-    metadata.mode = mode & MODE_CHANGE_MASK;
+    const currentMode = this.toStatResult(s).mode;
+    const fileType = (mode & FILE_TYPE_MASK) || (currentMode & FILE_TYPE_MASK);
+    metadata.mode = fileType | (mode & MODE_CHANGE_MASK);
     metadata.ctimeMs = Date.now();
   }
 

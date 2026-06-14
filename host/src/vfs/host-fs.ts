@@ -12,6 +12,9 @@ import { NativeMetadataOverlay } from "../platform/native-metadata";
 import type { FileSystemBackend, DirEntry } from "./types";
 import { DEFAULT_STATFS_BLOCK_SIZE, DEFAULT_STATFS_NAMELEN } from "../statfs";
 
+const UTIME_NOW = 0x3fffffff;
+const UTIME_OMIT = 0x3ffffffe;
+
 /**
  * Translate Linux/POSIX open flags (as used by musl libc) to the
  * platform-native flag values that Node.js `fs.openSync` expects.
@@ -88,6 +91,8 @@ export class HostFileSystem implements FileSystemBackend {
   private dirHandles = new Map<number, fs.Dir>();
   private nextDirHandle = 1;
   private metadata = new NativeMetadataOverlay();
+  private dirPathCache = new Map<string, string>();
+  private readonly maxDirPathCacheEntries = 4096;
 
   constructor(rootPath: string, guestMountPoint = "/") {
     const resolvedRoot = nodePath.resolve(rootPath);
@@ -115,18 +120,34 @@ export class HostFileSystem implements FileSystemBackend {
    */
   private safePath(relative: string, followFinal = true): string {
     const hadTrailingSlash = relative.length > 1 && /\/+$/.test(relative);
+    const originalParts = this.pathParts(relative);
     let current = this.rootPath;
-    let pending = this.pathParts(relative);
+    let pending = [...originalParts];
+    let processed: string[] = [];
     let symlinkDepth = 0;
+    let cacheable = !originalParts.includes("..");
+
+    if (cacheable) {
+      for (let i = originalParts.length; i > 0; i--) {
+        const cached = this.dirPathCache.get(originalParts.slice(0, i).join("/"));
+        if (cached === undefined) continue;
+        current = cached;
+        pending = originalParts.slice(i);
+        processed = originalParts.slice(0, i);
+        break;
+      }
+    }
 
     while (pending.length > 0) {
       const part = pending.shift()!;
       if (part === ".") continue;
       if (part === "..") {
+        cacheable = false;
         if (current === this.rootPath) {
           throw new Error("EACCES: path traversal blocked");
         }
         current = nodePath.dirname(current);
+        processed.pop();
         continue;
       }
 
@@ -146,6 +167,7 @@ export class HostFileSystem implements FileSystemBackend {
       }
 
       if (shouldFollow && lst.isSymbolicLink()) {
+        cacheable = false;
         if (++symlinkDepth > 40) throw new Error("ELOOP: too many symbolic links");
         const target = fs.readlinkSync(candidate, "utf8");
         if (target.startsWith("/")) {
@@ -168,6 +190,8 @@ export class HostFileSystem implements FileSystemBackend {
       if (!isFinal) {
         current = fs.realpathSync(candidate);
         this.assertWithinRoot(current);
+        processed.push(part);
+        if (cacheable) this.setCachedDirPath(processed, current);
       } else {
         current = candidate;
       }
@@ -182,6 +206,19 @@ export class HostFileSystem implements FileSystemBackend {
     }
     this.assertWithinRoot(current);
     return current;
+  }
+
+  private setCachedDirPath(parts: string[], nativePath: string): void {
+    if (parts.length === 0) return;
+    this.dirPathCache.set(parts.join("/"), nativePath);
+    if (this.dirPathCache.size > this.maxDirPathCacheEntries) {
+      const oldest = this.dirPathCache.keys().next().value;
+      if (oldest !== undefined) this.dirPathCache.delete(oldest);
+    }
+  }
+
+  private clearDirPathCache(): void {
+    this.dirPathCache.clear();
   }
 
   private normalizeGuestMountPoint(mountPoint: string): string {
@@ -334,6 +371,7 @@ export class HostFileSystem implements FileSystemBackend {
     const nativePath = this.safePath(path, false);
     const stat = fs.lstatSync(nativePath);
     fs.rmdirSync(nativePath);
+    this.clearDirPathCache();
     this.metadata.forget(stat);
   }
 
@@ -341,6 +379,7 @@ export class HostFileSystem implements FileSystemBackend {
     const nativePath = this.safePath(path, false);
     const stat = fs.lstatSync(nativePath);
     fs.unlinkSync(nativePath);
+    if (stat.isSymbolicLink()) this.clearDirPathCache();
     if (stat.nlink <= 1) this.metadata.forget(stat);
   }
 
@@ -351,6 +390,7 @@ export class HostFileSystem implements FileSystemBackend {
       replaced = fs.lstatSync(nativeNewPath);
     } catch {}
     fs.renameSync(this.safePath(oldPath, false), nativeNewPath);
+    this.clearDirPathCache();
     if (replaced !== undefined && replaced.nlink <= 1) this.metadata.forget(replaced);
   }
 
@@ -379,9 +419,22 @@ export class HostFileSystem implements FileSystemBackend {
   }
 
   utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
-    const atime = atimeSec + atimeNsec / 1e9;
-    const mtime = mtimeSec + mtimeNsec / 1e9;
-    fs.utimesSync(this.safePath(path), atime, mtime);
+    const nativePath = this.safePath(path);
+    if (atimeNsec === UTIME_OMIT && mtimeNsec === UTIME_OMIT) return;
+
+    const stat = fs.statSync(nativePath);
+    const nowMs = Date.now();
+    const atimeMs = atimeNsec === UTIME_OMIT
+      ? stat.atimeMs
+      : atimeNsec === UTIME_NOW
+        ? nowMs
+        : atimeSec * 1000 + Math.floor(atimeNsec / 1_000_000);
+    const mtimeMs = mtimeNsec === UTIME_OMIT
+      ? stat.mtimeMs
+      : mtimeNsec === UTIME_NOW
+        ? nowMs
+        : mtimeSec * 1000 + Math.floor(mtimeNsec / 1_000_000);
+    fs.utimesSync(nativePath, atimeMs / 1000, mtimeMs / 1000);
   }
 
   // ── Directory iteration ─────────────────────────────────────

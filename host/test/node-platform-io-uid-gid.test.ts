@@ -4,6 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodePlatformIO } from "../src/platform/node";
 
+const UTIME_NOW = 0x3fffffff;
+const UTIME_OMIT = 0x3ffffffe;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe("NodePlatformIO uid/gid normalization", () => {
   let dir: string;
   let file: string;
@@ -111,5 +118,23 @@ describe("NodePlatformIO uid/gid normalization", () => {
     } finally {
       io.close(fd);
     }
+  });
+
+  it("does not freeze ctime after a virtual chmod overlay exists", async () => {
+    const p = join(dir, "ctime.txt");
+    writeFileSync(p, "hi");
+
+    const io = new NodePlatformIO();
+    io.chmod(p, 0o751);
+    const before = io.stat(p);
+
+    await delay(25);
+    io.utimensat(p, 0, UTIME_OMIT, 0, UTIME_NOW);
+    const after = io.stat(p);
+
+    expect(after.mode & 0o7777).toBe(0o751);
+    expect(after.atimeMs).toBe(before.atimeMs);
+    expect(after.mtimeMs).toBeGreaterThanOrEqual(before.mtimeMs);
+    expect(after.ctimeMs).toBeGreaterThan(before.ctimeMs);
   });
 });

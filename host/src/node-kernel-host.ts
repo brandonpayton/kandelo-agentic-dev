@@ -106,6 +106,8 @@ export interface SpawnOptions {
   /** Initial real/effective group ID for the process. */
   gid?: number;
   stdin?: Uint8Array;
+  /** Whether supplied stdin should make fd 0 pipe-like for isatty/fstat. */
+  stdinIsPipe?: boolean;
   /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
   pipeStdio?: number[];
   /** Optional pre-compiled module for the supplied program bytes. */
@@ -233,6 +235,7 @@ export class NodeKernelHost {
       ptyCols: options?.ptyCols,
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
+      stdinIsPipe: options?.stdinIsPipe,
       pipeStdio: options?.pipeStdio,
       maxAddr: options?.maxAddr,
     })) as number;

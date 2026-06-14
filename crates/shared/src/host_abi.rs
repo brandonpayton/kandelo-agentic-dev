@@ -46,6 +46,12 @@ pub struct SyscallArgDesc {
     /// length is based on the syscall return value. `msgrcv` returns only
     /// `mtext` length, but the scratch buffer also includes the leading mtype.
     pub copy_retval_add: u32,
+    /// Whether output copy-back for an `Arg`-sized buffer is capped by the
+    /// syscall return value. This is correct for byte-count syscalls such as
+    /// read(2), recv(2), and getdents(2), but not for syscalls whose return
+    /// value is an element count while the buffer size is expressed in bytes
+    /// (for example getgroups(2)).
+    pub copy_retval_limit: bool,
 }
 
 /// All pointer argument descriptors for one syscall number.
@@ -106,6 +112,7 @@ macro_rules! desc {
             direction: SyscallArgDirection::$direction,
             size: $size,
             copy_retval_add: 0,
+            copy_retval_limit: true,
         }
     };
     ($arg_index:expr, $direction:ident, $size:expr, copy_retval_add $copy_retval_add:expr) => {
@@ -114,6 +121,16 @@ macro_rules! desc {
             direction: SyscallArgDirection::$direction,
             size: $size,
             copy_retval_add: $copy_retval_add,
+            copy_retval_limit: true,
+        }
+    };
+    ($arg_index:expr, $direction:ident, $size:expr, no_copy_retval_limit) => {
+        SyscallArgDesc {
+            arg_index: $arg_index,
+            direction: SyscallArgDirection::$direction,
+            size: $size,
+            copy_retval_add: 0,
+            copy_retval_limit: false,
         }
     };
 }
@@ -233,14 +250,24 @@ pub const SYSCALL_ARG_DESCRIPTORS: &[SyscallArgDescriptor] = &[
     entry!(Syscall::Socketpair as u32, [desc!(3, Out, fixed!(8))]),
     entry!(
         Syscall::Sendto as u32,
-        [desc!(1, In, arg!(2)), desc!(4, In, arg!(5)),]
+        [
+            // Keep the small control address ahead of the payload in the
+            // shared scratch buffer. A maximum-sized datagram may be capped
+            // to fit the channel, but the destination sockaddr must never be
+            // starved or the kernel would see a process-memory pointer.
+            desc!(4, In, arg!(5)),
+            desc!(1, In, arg!(2)),
+        ]
     ),
     entry!(
         Syscall::Recvfrom as u32,
         [
-            desc!(1, Out, arg!(2)),
+            // Keep sockaddr/socklen_t ahead of the receive buffer for the
+            // same reason as sendto(): a large caller-provided data buffer
+            // must not prevent address copy-in/copy-back.
             desc!(4, Out, deref!(5)),
             desc!(5, InOut, fixed!(4)),
+            desc!(1, Out, arg!(2)),
         ]
     ),
     entry!(Syscall::Pread as u32, [desc!(1, Out, arg!(2))]),
@@ -294,6 +321,7 @@ pub const SYSCALL_ARG_DESCRIPTORS: &[SyscallArgDescriptor] = &[
         [desc!(0, In, cstring!()), desc!(1, Out, arg!(2)),]
     ),
     entry!(Syscall::Sigsuspend as u32, [desc!(0, In, fixed!(8))]),
+    entry!(Syscall::Pathconf as u32, [desc!(0, In, cstring!())]),
     entry!(
         Syscall::Getsockname as u32,
         [desc!(1, Out, deref!(2)), desc!(2, InOut, fixed!(4)),]
@@ -347,6 +375,10 @@ pub const SYSCALL_ARG_DESCRIPTORS: &[SyscallArgDescriptor] = &[
             desc!(2, Out, fixed!(4)),
         ]
     ),
+    entry!(
+        Syscall::Getgroups as u32,
+        [desc!(1, Out, arg!(0, mul 4), no_copy_retval_limit)]
+    ),
     entry!(Syscall::Sendmsg as u32, [desc!(1, In, arg!(2))]),
     entry!(Syscall::Recvmsg as u32, [desc!(1, InOut, arg!(2))]),
     entry!(
@@ -384,7 +416,10 @@ pub const SYSCALL_ARG_DESCRIPTORS: &[SyscallArgDescriptor] = &[
         crate::abi::host_intercepted::SYS_EXECVE,
         [desc!(0, In, cstring!())]
     ),
-    entry!(extra_syscalls::SYS_PRCTL, [desc!(1, InOut, fixed!(16))]),
+    // prctl's argument shapes are option-dependent: PR_SET_PDEATHSIG uses
+    // arg2 as a scalar signal number, PR_GET_PDEATHSIG uses arg2 as a u32*,
+    // PR_SET_NAME/PR_GET_NAME use arg2 as a 16-byte char*. The host marshals
+    // these cases dynamically instead of advertising one static pointer shape.
     entry!(
         extra_syscalls::SYS_GETITIMER,
         [desc!(1, Out, fixed!(ITIMERVAL_SIZE))]
@@ -509,6 +544,23 @@ mod tests {
             }
         );
         assert_eq!(msgrcv.copy_retval_add, 4);
+        assert!(msgrcv.copy_retval_limit);
+
+        let getgroups = find(Syscall::Getgroups as u32).args[0];
+        assert_eq!(
+            getgroups.size,
+            SyscallArgSize::Arg {
+                arg_index: 0,
+                multiplier: 4,
+                add: 0,
+            }
+        );
+        assert!(!getgroups.copy_retval_limit);
+
+        let pathconf = find(Syscall::Pathconf as u32).args[0];
+        assert_eq!(pathconf.arg_index, 0);
+        assert_eq!(pathconf.direction, SyscallArgDirection::In);
+        assert_eq!(pathconf.size, SyscallArgSize::CString);
 
         let semop = find(extra_syscalls::SYS_SEMOP).args[0].size;
         assert_eq!(
@@ -524,6 +576,15 @@ mod tests {
         assert_eq!(lchown.arg_index, 0);
         assert_eq!(lchown.direction, SyscallArgDirection::In);
         assert_eq!(lchown.size, SyscallArgSize::CString);
+
+        let sendto = find(Syscall::Sendto as u32).args;
+        assert_eq!(sendto[0].arg_index, 4);
+        assert_eq!(sendto[1].arg_index, 1);
+
+        let recvfrom = find(Syscall::Recvfrom as u32).args;
+        assert_eq!(recvfrom[0].arg_index, 4);
+        assert_eq!(recvfrom[1].arg_index, 5);
+        assert_eq!(recvfrom[2].arg_index, 1);
     }
 
     #[test]

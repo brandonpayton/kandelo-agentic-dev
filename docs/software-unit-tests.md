@@ -3,7 +3,7 @@
 This project proves Kandelo by running real upstream/project test suites for
 large guest software on both Node.js and browser hosts where possible.
 
-Status date: 2026-06-11.
+Status date: 2026-06-14.
 
 ## Current Status
 
@@ -18,6 +18,109 @@ Status date: 2026-06-11.
 | Node.js library | Upstream Node.js `test/parallel/test-*.js` and `test/sequential/test-*.js` through the SpiderMonkey-backed Node-compatible runtime | Completed 3925 tests: 336 PASS, 3264 FAIL, 325 TIME | Completed 3925 tests: 339 PASS, 3564 FAIL, 22 TIME |
 
 Logs from the 2026-05-28 full runs are under `test-runs/software-unit-tests/`.
+
+
+## 2026-06-14 PHP PHPT Node Chunked Full Run
+
+php-src discovery still finds **19,017** `.phpt` files from PHP **8.3.15**.
+The current no-skip-env Node run is using the restartable chunk harness added in
+this PR update:
+
+```bash
+PHP_WASM="$PWD/packages/registry/php/bin/php.wasm" \
+PHP_OPCACHE_SO="$PWD/packages/registry/php/bin/opcache.so" \
+  scripts/run-php-upstream-node-chunks.sh \
+  --chunk-size 500 --jobs 4 --timeout 600000 \
+  --host-reset-interval 25 \
+  --out-dir /tmp/kad-1-test-logs/php-node-chunks-20260614225117
+```
+
+This wrapper runs the same reusable PHPT harness in fresh Node.js processes per
+chunk and writes resumable `chunk-<offset>.jsonl`, `.stderr`, `.exit`, `.done`,
+`summary.json`, and `summary.md` artifacts. It avoids the previous monolithic
+Node run shape, which reached **1,275 results** (**1,265 pass**, **10 skip**)
+but grew to about **7.3 GiB RSS** and was killed before completion.
+
+Latest observed partial no-skip-env Node counts while the chunked run continues:
+
+| Host | Scope | Pass | XFAIL | Fail | Timeout | Skip | Unsupported | Untested | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Node | Chunked `--all`, offsets 0..current partial chunk | 1,519 | 0 | 1 | 0 | 18 | 0 | 17,479 | 19,017 |
+
+Current failing test observed in the partial run:
+
+- `Zend/tests/concat_003.phpt`: pure PHP performance threshold check. The test
+  expects concatenating a large set of strings to finish below the upstream
+  native-runtime threshold of 1.0 second; the Wasm PHP runtime currently reports
+  `bool(false)`. This is not yet tied to a POSIX/kernel semantic failure and
+  should not be papered over with PHP-specific kernel behavior.
+
+Current skips observed in the partial run are upstream `SKIPIF` gates for
+64-bit-only Zend tests, Zend MM, and missing optional extensions (`curl`,
+`intl`). These remain coverage gaps to reduce through general PHP runtime
+packaging/host support, not through Kandelo kernel special cases.
+
+New general platform fix in this update:
+
+- AF_INET6 loopback stream listeners are registered through the same
+  cross-process host TCP bridge used for AF_INET loopback while preserving guest
+  IPv6 socket metadata. This lets a child process listen on `::1` and a sibling
+  process connect to `::1`, matching normal loopback behavior. Targeted Node
+  verification now passes:
+
+```bash
+PHP_WASM="$PWD/packages/registry/php/bin/php.wasm" \
+PHP_OPCACHE_SO="$PWD/packages/registry/php/bin/opcache.so" \
+  scripts/run-php-upstream-tests.sh --host node --timeout 180000 --json \
+  ext/openssl/tests/san_ipv6_peer_matching.phpt
+# => PASS
+```
+
+Additional local validation for this update:
+
+- `cargo test -p kandelo inet6_loopback --target x86_64-unknown-linux-gnu` — 3 pass
+- `bash packages/registry/kernel/build-kernel.sh` — rebuilt and installed `local-binaries/kernel.wasm` / `host/wasm/kandelo-kernel.wasm`
+
+## 2026-06-12 PHP PHPT Node Iteration
+
+php-src discovery currently finds **19,017** `.phpt` files from PHP **8.3.15**.
+
+Current no-skip-env Node full run command:
+
+```bash
+PHP_WASM="$PWD/packages/registry/php/bin/php.wasm" \
+PHP_OPCACHE_SO="$PWD/packages/registry/php/bin/opcache.so" \
+  scripts/run-php-upstream-tests.sh --host node --all --jobs 4 \
+  --timeout 600000 --host-reset-interval 25 --json
+```
+
+The active log is recorded in `/tmp/kad-1-current-node-full-log`.
+
+Changes since the 2026-06-11 handoff:
+
+- The PHPT harness now has `--host-reset-interval` for Node. This reboots each
+  runner's Kandelo kernel after a bounded number of PHPTs, reclaiming
+  host-side WebAssembly memory the same way native `make test` gets OS process
+  reclamation between PHP invocations. `0` disables the reset.
+- The PHP package now builds and ships `zend_test.so` as an opt-in shared
+  extension. Upstream php-src uses `zend_test` for engine coverage; making it a
+  normal loadable module removes those skips without loading test-only code by
+  default or special-casing the harness.
+- PHP configure now passes `--disable-rpath`; wasm-ld does not support ELF
+  runtime library search path flags, and the Wasm PHP package links static
+  dependency archives and explicit side modules instead.
+- Targeted Node checks after the rebuild:
+  - `Zend/tests/attributes/016_custom_attribute_validation.phpt`: PASS
+  - `Zend/tests/bug74093.phpt`: PASS, validating POSIX timer delivery for Zend
+    max-execution timers.
+  - `Zend/tests/new_oom.phpt`: PASS with `--timeout 600000`; it takes about
+    177 seconds on this AO worker and can false-timeout under the older 180s
+    full-run timeout.
+  - The previous opcache/OpenSSL targeted failure set remains PASS.
+  - `Zend/tests/concat_003.phpt`: still FAIL. The measured timed section takes
+    about 4.3 seconds on the Wasm PHP runtime versus the upstream native
+    performance threshold of 1.0 second. This is not currently attributable to
+    a POSIX/kernel semantic failure.
 
 
 ## 2026-06-11 PHP PHPT Handoff Status

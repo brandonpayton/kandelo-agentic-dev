@@ -657,6 +657,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_get_process_state",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_get_robust_list",
       "signature": "(i32,i32,i32) -> (i32)"
     },
@@ -804,6 +809,11 @@
       "kind": "func",
       "name": "kernel_handle_channel",
       "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_handle_parent_exit",
+      "signature": "(i32) -> (i32)"
     },
     {
       "kind": "func",
@@ -1067,6 +1077,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_posix_timer_fire",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_posix_timer_interval_fire",
       "signature": "(i32,i32) -> (i32)"
     },
@@ -1129,6 +1144,11 @@
       "kind": "func",
       "name": "kernel_pwritev",
       "signature": "(i32,i32,i32,i64) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_queue_sigchld",
+      "signature": "(i32,i32) -> (i32)"
     },
     {
       "kind": "func",
@@ -1638,7 +1658,7 @@
     {
       "kind": "func",
       "name": "kernel_wait4_poll",
-      "signature": "(i32,i32,i32) -> (i32)"
+      "signature": "(i32,i32,i32,i32) -> (i32)"
     },
     {
       "kind": "func",
@@ -2347,6 +2367,15 @@
         }
       }
     ],
+    "112": [
+      {
+        "argIndex": 0,
+        "direction": "in",
+        "size": {
+          "type": "cstring"
+        }
+      }
+    ],
     "114": [
       {
         "argIndex": 1,
@@ -2552,6 +2581,18 @@
         "size": {
           "size": 4,
           "type": "fixed"
+        }
+      }
+    ],
+    "135": [
+      {
+        "argIndex": 1,
+        "copyRetvalLimit": false,
+        "direction": "out",
+        "size": {
+          "argIndex": 0,
+          "multiplier": 4,
+          "type": "arg"
         }
       }
     ],
@@ -2790,16 +2831,6 @@
         "direction": "in",
         "size": {
           "type": "cstring"
-        }
-      }
-    ],
-    "223": [
-      {
-        "argIndex": 1,
-        "direction": "inout",
-        "size": {
-          "size": 16,
-          "type": "fixed"
         }
       }
     ],
@@ -3441,31 +3472,23 @@
     ],
     "62": [
       {
-        "argIndex": 1,
-        "direction": "in",
-        "size": {
-          "argIndex": 2,
-          "type": "arg"
-        }
-      },
-      {
         "argIndex": 4,
         "direction": "in",
         "size": {
           "argIndex": 5,
           "type": "arg"
         }
-      }
-    ],
-    "63": [
+      },
       {
         "argIndex": 1,
-        "direction": "out",
+        "direction": "in",
         "size": {
           "argIndex": 2,
           "type": "arg"
         }
-      },
+      }
+    ],
+    "63": [
       {
         "argIndex": 4,
         "direction": "out",
@@ -3480,6 +3503,14 @@
         "size": {
           "size": 4,
           "type": "fixed"
+        }
+      },
+      {
+        "argIndex": 1,
+        "direction": "out",
+        "size": {
+          "argIndex": 2,
+          "type": "arg"
         }
       }
     ],

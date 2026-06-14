@@ -112,7 +112,7 @@ SOURCES=(
     schematron.c
 )
 
-CFLAGS="-O2 -DHAVE_CONFIG_H -I. -I./include"
+CFLAGS="-O2 -DHAVE_CONFIG_H -I. -I./include -I$ZLIB_PREFIX/include"
 
 echo "==> Compiling libxml2 source files..."
 OBJS=()

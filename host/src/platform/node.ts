@@ -16,6 +16,8 @@ import { NativeMetadataOverlay } from "./native-metadata";
 const POSIX_BYTES_SEGMENT_PREFIX = ".kandelo-posix-bytes-";
 const PATH_DISPLAY_DECODER = new TextDecoder("utf-8", { fatal: false });
 const ASCII_DEV_SHM = new TextEncoder().encode("/dev/shm");
+const UTIME_NOW = 0x3fffffff;
+const UTIME_OMIT = 0x3ffffffe;
 
 function pathBytesToDisplay(bytes: Uint8Array): string {
   return PATH_DISPLAY_DECODER.decode(bytes);
@@ -464,9 +466,21 @@ export class NodePlatformIO implements PlatformIO {
   }
 
   private utimensatNative(nativePath: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
-    const atime = atimeSec + atimeNsec / 1e9;
-    const mtime = mtimeSec + mtimeNsec / 1e9;
-    fs.utimesSync(nativePath, atime, mtime);
+    if (atimeNsec === UTIME_OMIT && mtimeNsec === UTIME_OMIT) return;
+
+    const stat = fs.statSync(nativePath);
+    const nowMs = Date.now();
+    const atimeMs = atimeNsec === UTIME_OMIT
+      ? stat.atimeMs
+      : atimeNsec === UTIME_NOW
+        ? nowMs
+        : atimeSec * 1000 + Math.floor(atimeNsec / 1_000_000);
+    const mtimeMs = mtimeNsec === UTIME_OMIT
+      ? stat.mtimeMs
+      : mtimeNsec === UTIME_NOW
+        ? nowMs
+        : mtimeSec * 1000 + Math.floor(mtimeNsec / 1_000_000);
+    fs.utimesSync(nativePath, atimeMs / 1000, mtimeMs / 1000);
   }
 
   opendirBytes(path: Uint8Array): number {

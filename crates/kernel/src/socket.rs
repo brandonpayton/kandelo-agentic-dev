@@ -93,8 +93,19 @@ pub struct Datagram {
     pub data: Vec<u8>,
     pub src_addr: [u8; 4],
     pub src_addr6: [u8; 16],
+    pub dst_addr: [u8; 4],
+    pub dst_addr6: [u8; 16],
     pub src_port: u16,
     pub src_sock_idx: Option<usize>,
+    /// IPv6 traffic class associated with this datagram.
+    pub ipv6_tclass: u32,
+    /// Sender credentials captured when the datagram was queued. AF_UNIX
+    /// SO_PASSCRED reports these with SCM_CREDENTIALS.
+    pub src_pid: u32,
+    pub src_uid: u32,
+    pub src_gid: u32,
+    /// Ancillary file descriptors sent with this datagram via SCM_RIGHTS.
+    pub ancillary_fds: Vec<crate::pipe::InFlightFd>,
 }
 
 /// One AF_INET UDP endpoint bound in the in-kernel virtual network.
@@ -267,6 +278,15 @@ pub struct SocketInfo {
     pub host_net_handle: Option<i32>,
     /// Stored socket options as (level, optname, value) tuples.
     pub options: Vec<(u32, u32, u32)>,
+    /// SO_LINGER state. This is a structured option (`struct linger`), so it
+    /// is kept separately from integer-valued socket options.
+    pub linger_onoff: i32,
+    pub linger_seconds: i32,
+    /// SO_BINDTODEVICE binds a socket to a named virtual network interface.
+    pub bind_device: Option<Vec<u8>>,
+    /// TCP_CONGESTION algorithm name for this socket. Kandelo's virtual TCP
+    /// stack currently exposes the standard Linux default, "cubic".
+    pub tcp_congestion: Vec<u8>,
     /// Bound IPv4 address (for AF_INET sockets).
     pub bind_addr: [u8; 4],
     /// Bound IPv6 address (for AF_INET6 sockets).
@@ -328,6 +348,10 @@ impl SocketInfo {
             shut_wr: false,
             host_net_handle: None,
             options: Vec::new(),
+            linger_onoff: 0,
+            linger_seconds: 0,
+            bind_device: None,
+            tcp_congestion: b"cubic".to_vec(),
             bind_addr: [0; 4],
             bind_addr6: [0; 16],
             bind_port: 0,
@@ -404,6 +428,10 @@ impl Clone for SocketInfo {
             shut_wr: self.shut_wr,
             host_net_handle: self.host_net_handle,
             options: self.options.clone(),
+            linger_onoff: self.linger_onoff,
+            linger_seconds: self.linger_seconds,
+            bind_device: self.bind_device.clone(),
+            tcp_congestion: self.tcp_congestion.clone(),
             bind_addr: self.bind_addr,
             bind_addr6: self.bind_addr6,
             bind_port: self.bind_port,

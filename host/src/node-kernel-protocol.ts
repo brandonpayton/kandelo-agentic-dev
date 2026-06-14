@@ -63,6 +63,8 @@ export interface SpawnMessage {
   ptyCols?: number;
   ptyRows?: number;
   stdin?: Uint8Array;
+  /** Whether supplied stdin should make fd 0 pipe-like for isatty/fstat. */
+  stdinIsPipe?: boolean;
   /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
   pipeStdio?: number[];
   /** Limit heap growth to protect thread channel pages */

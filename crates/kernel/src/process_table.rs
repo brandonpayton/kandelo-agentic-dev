@@ -473,6 +473,7 @@ impl ProcessTable {
             ptr::addr_of_mut!((*slot).state).write(ProcessState::Limbo);
             ptr::addr_of_mut!((*slot).exit_status).write(proc.exit_status);
             ptr::addr_of_mut!((*slot).exit_signal).write(proc.exit_signal);
+            ptr::addr_of_mut!((*slot).stop_signal).write(proc.stop_signal);
             ptr::addr_of_mut!((*slot).fd_table).write(crate::fd::FdTable::new());
             ptr::addr_of_mut!((*slot).ofd_table).write(crate::ofd::OfdTable::new());
             ptr::addr_of_mut!((*slot).lock_table).write(crate::lock::LockTable::new());
@@ -504,6 +505,7 @@ impl ProcessTable {
             ptr::addr_of_mut!((*slot).timerfds).write(Vec::new());
             ptr::addr_of_mut!((*slot).signalfds).write(Vec::new());
             ptr::addr_of_mut!((*slot).posix_timers).write(Vec::new());
+            ptr::addr_of_mut!((*slot).parent_death_signal).write(0);
             ptr::addr_of_mut!((*slot).alt_stack_sp).write(0);
             ptr::addr_of_mut!((*slot).alt_stack_flags).write(2);
             ptr::addr_of_mut!((*slot).alt_stack_size).write(0);
@@ -573,6 +575,114 @@ impl ProcessTable {
         self.processes.get_mut(&pid).map(Box::as_mut)
     }
 
+    fn priority_target_pids(
+        &self,
+        caller_pid: u32,
+        which: i32,
+        who: u32,
+    ) -> Result<Vec<u32>, Errno> {
+        match which {
+            // PRIO_PROCESS: who == 0 means the calling process.
+            0 => {
+                let pid = if who == 0 { caller_pid } else { who };
+                if self.processes.contains_key(&pid) {
+                    Ok(alloc::vec![pid])
+                } else {
+                    Err(Errno::ESRCH)
+                }
+            }
+            // PRIO_PGRP: who == 0 means the caller's process group.
+            1 => {
+                let pgid = if who == 0 {
+                    self.processes.get(&caller_pid).ok_or(Errno::ESRCH)?.pgid
+                } else {
+                    who
+                };
+                let pids: Vec<u32> = self
+                    .processes
+                    .iter()
+                    .filter_map(|(&pid, proc)| (proc.pgid == pgid).then_some(pid))
+                    .collect();
+                if pids.is_empty() {
+                    Err(Errno::ESRCH)
+                } else {
+                    Ok(pids)
+                }
+            }
+            // PRIO_USER: who == 0 means the caller's real uid.
+            2 => {
+                let uid = if who == 0 {
+                    self.processes.get(&caller_pid).ok_or(Errno::ESRCH)?.uid
+                } else {
+                    who
+                };
+                let pids: Vec<u32> = self
+                    .processes
+                    .iter()
+                    .filter_map(|(&pid, proc)| (proc.uid == uid).then_some(pid))
+                    .collect();
+                if pids.is_empty() {
+                    Err(Errno::ESRCH)
+                } else {
+                    Ok(pids)
+                }
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// Linux-compatible getpriority(2) for centralized process metadata.
+    ///
+    /// The raw Linux syscall returns `20 - nice` so that a legitimate nice
+    /// value of -20 does not collide with the negative errno convention. libc
+    /// translates this raw value back to the POSIX nice range for callers.
+    pub fn getpriority(&self, caller_pid: u32, which: i32, who: u32) -> Result<i32, Errno> {
+        let pids = self.priority_target_pids(caller_pid, which, who)?;
+        let best_nice = pids
+            .iter()
+            .filter_map(|pid| self.processes.get(pid).map(|proc| proc.nice))
+            .min()
+            .ok_or(Errno::ESRCH)?;
+        Ok(20 - best_nice)
+    }
+
+    /// Linux/POSIX setpriority(2) for centralized process metadata.
+    ///
+    /// Kandelo does not have a host CPU scheduler, but nice is observable
+    /// process state through getpriority(2), nice(3), and /proc/<pid>/stat.
+    /// Store it on the addressed Process records and enforce the standard
+    /// privilege rule that unprivileged callers cannot raise scheduling
+    /// priority (numerically lower nice values) or modify unrelated users.
+    pub fn setpriority(
+        &mut self,
+        caller_pid: u32,
+        which: i32,
+        who: u32,
+        prio: i32,
+    ) -> Result<(), Errno> {
+        let clamped = prio.clamp(-20, 19);
+        let pids = self.priority_target_pids(caller_pid, which, who)?;
+        let caller = self.processes.get(&caller_pid).ok_or(Errno::ESRCH)?;
+        let caller_euid = caller.euid;
+
+        for pid in &pids {
+            let target = self.processes.get(pid).ok_or(Errno::ESRCH)?;
+            if caller_euid != 0 && caller_euid != target.uid && caller_euid != target.euid {
+                return Err(Errno::EPERM);
+            }
+            if caller_euid != 0 && clamped < target.nice {
+                return Err(Errno::EPERM);
+            }
+        }
+
+        for pid in pids {
+            if let Some(target) = self.processes.get_mut(&pid) {
+                target.nice = clamped;
+            }
+        }
+        Ok(())
+    }
+
     /// Replace an existing process table entry without moving the Process
     /// record through the wasm stack.
     pub fn replace_process(&mut self, pid: u32, process: Box<Process>) -> Result<(), Errno> {
@@ -620,6 +730,7 @@ impl ProcessTable {
         // earlier code held an immutable `&parent`.
         if let Some(parent) = self.processes.get_mut(&parent_pid) {
             parent.increment_fork_count();
+            parent.note_forked_child_namespace_pid();
         }
 
         Ok(())
@@ -898,6 +1009,40 @@ impl ProcessTable {
         self.processes.get(&pid).map(|proc| proc.ppid)
     }
 
+    /// Prepare parent-death side effects for a process that has just exited.
+    ///
+    /// Linux PR_SET_PDEATHSIG requires a direct child that configured a
+    /// parent-death signal to receive that signal when its parent dies. The
+    /// same transition also orphans all children; reparent them to init so
+    /// /proc and future wait ownership no longer point at the dead parent.
+    ///
+    /// Returns `(child_pid, signal)` pairs for running direct children that
+    /// need signal delivery. The caller performs actual signal delivery after
+    /// this method releases the table-wide mutation pass.
+    pub fn prepare_parent_exit(&mut self, parent_pid: u32) -> Vec<(u32, u32)> {
+        let mut recipients = Vec::new();
+
+        for (&child_pid, child) in self.processes.iter() {
+            if child.ppid == parent_pid
+                && child.state == ProcessState::Running
+                && child.parent_death_signal != 0
+            {
+                recipients.push((child_pid, child.parent_death_signal));
+            }
+        }
+
+        if parent_pid != 1 {
+            self.ensure_init();
+            for child in self.processes.values_mut() {
+                if child.ppid == parent_pid {
+                    child.ppid = 1;
+                }
+            }
+        }
+
+        recipients
+    }
+
     /// Mark a process as terminated by a host-observed signal death.
     ///
     /// Used when the worker dies without reaching the normal `SYS_EXIT`
@@ -908,6 +1053,26 @@ impl ProcessTable {
         proc.state = ProcessState::Exited;
         proc.exit_status = 0;
         proc.exit_signal = signum & 0x7f;
+        proc.stop_signal = 0;
+        Ok(())
+    }
+
+    pub fn stop_process(&mut self, pid: u32, signum: u32) -> Result<(), Errno> {
+        let proc = self.processes.get_mut(&pid).ok_or(Errno::ESRCH)?;
+        if proc.state == ProcessState::Exited || proc.state == ProcessState::Limbo {
+            return Err(Errno::ESRCH);
+        }
+        proc.state = ProcessState::Stopped;
+        proc.stop_signal = signum & 0x7f;
+        Ok(())
+    }
+
+    pub fn continue_process(&mut self, pid: u32) -> Result<(), Errno> {
+        let proc = self.processes.get_mut(&pid).ok_or(Errno::ESRCH)?;
+        if proc.state == ProcessState::Stopped {
+            proc.state = ProcessState::Running;
+            proc.stop_signal = 0;
+        }
         Ok(())
     }
 
@@ -922,6 +1087,7 @@ impl ProcessTable {
         &self,
         parent_pid: u32,
         target_pid: i32,
+        options: u32,
     ) -> Result<Option<(u32, i32)>, Errno> {
         let parent = self.processes.get(&parent_pid).ok_or(Errno::ESRCH)?;
         let mut saw_matching_child = false;
@@ -939,6 +1105,9 @@ impl ProcessTable {
                     child_pid,
                     Self::wait_status_from_process(child),
                 )));
+            }
+            if child.state == ProcessState::Stopped && (options & 2) != 0 {
+                return Ok(Some((child_pid, Self::wait_status_from_process(child))));
             }
         }
 
@@ -981,6 +1150,8 @@ impl ProcessTable {
     fn wait_status_from_process(proc: &Process) -> i32 {
         if proc.exit_signal != 0 {
             (proc.exit_signal as i32) & 0x7f
+        } else if proc.state == ProcessState::Stopped {
+            ((proc.stop_signal as i32) << 8) | 0x7f
         } else {
             (proc.exit_status & 0xff) << 8
         }
@@ -1071,6 +1242,80 @@ mod wait_tests {
             Err(Errno::ECHILD)
         ));
     }
+
+    #[test]
+    fn parent_exit_reparents_children_and_reports_pdeath_signal_recipients() {
+        let mut table = ProcessTable::new();
+        table.create_process(100).unwrap();
+        table.fork_process(100, 101).unwrap();
+        table.fork_process(100, 102).unwrap();
+        table.get_mut(101).unwrap().parent_death_signal = 15;
+        table.get_mut(102).unwrap().parent_death_signal = 10;
+        table.get_mut(102).unwrap().state = ProcessState::Exited;
+
+        let recipients = table.prepare_parent_exit(100);
+
+        assert_eq!(recipients, alloc::vec![(101, 15)]);
+        assert_eq!(table.parent_pid(101), Some(1));
+        assert_eq!(table.parent_pid(102), Some(1));
+        assert!(table.has_process(1), "orphaned children are reparented to init");
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    #[test]
+    fn process_priority_updates_are_visible_through_table_procfs() {
+        let mut table = ProcessTable::new();
+        table.create_process(100).unwrap();
+
+        assert_eq!(table.getpriority(100, 0, 0).unwrap(), 20);
+        table.setpriority(100, 0, 0, 5).unwrap();
+
+        let proc = table.get(100).unwrap();
+        assert_eq!(proc.nice, 5);
+        assert_eq!(table.getpriority(100, 0, 100).unwrap(), 15);
+        let stat = crate::procfs::generate_stat(proc);
+        let stat = core::str::from_utf8(&stat).unwrap();
+        assert!(
+            stat.contains(" 25 5 "),
+            "procfs stat should expose priority=20+nice and nice: {stat}"
+        );
+    }
+
+    #[test]
+    fn unprivileged_priority_changes_cannot_raise_priority() {
+        let mut table = ProcessTable::new();
+        table.create_process(100).unwrap();
+        let proc = table.get_mut(100).unwrap();
+        proc.uid = 1000;
+        proc.euid = 1000;
+        proc.nice = 5;
+
+        assert!(matches!(
+            table.setpriority(100, 0, 0, 0),
+            Err(Errno::EPERM)
+        ));
+        table.setpriority(100, 0, 0, 10).unwrap();
+        assert_eq!(table.get(100).unwrap().nice, 10);
+    }
+
+    #[test]
+    fn process_group_priority_targets_all_group_members() {
+        let mut table = ProcessTable::new();
+        table.create_process(100).unwrap();
+        table.fork_process(100, 101).unwrap();
+        table.get_mut(100).unwrap().pgid = 77;
+        table.get_mut(101).unwrap().pgid = 77;
+
+        table.setpriority(100, 1, 77, 7).unwrap();
+
+        assert_eq!(table.get(100).unwrap().nice, 7);
+        assert_eq!(table.get(101).unwrap().nice, 7);
+        assert_eq!(table.getpriority(100, 1, 77).unwrap(), 13);
+    }
 }
 
 /// Global process table wrapper for static storage.
@@ -1114,7 +1359,7 @@ mod tests {
         child.exit_status = 7;
 
         assert_eq!(
-            table.poll_waitable_child(10, -1).unwrap(),
+            table.poll_waitable_child(10, -1, 0).unwrap(),
             Some((11, 7 << 8))
         );
     }
@@ -1131,7 +1376,7 @@ mod tests {
         child.exit_signal = 0;
 
         assert_eq!(
-            table.poll_waitable_child(10, -1).unwrap(),
+            table.poll_waitable_child(10, -1, 0).unwrap(),
             Some((11, 255 << 8))
         );
     }
@@ -1144,7 +1389,24 @@ mod tests {
         table.mark_process_signaled(11, 15).unwrap();
         table.processes.get_mut(&11).unwrap().ppid = 10;
 
-        assert_eq!(table.poll_waitable_child(10, 11).unwrap(), Some((11, 15)));
+        assert_eq!(table.poll_waitable_child(10, 11, 0).unwrap(), Some((11, 15)));
+    }
+
+    #[test]
+    fn poll_waitable_child_reports_stopped_with_wuntraced() {
+        let mut table = ProcessTable::new();
+        table.create_process(10).unwrap();
+        table.create_process(11).unwrap();
+        table.processes.get_mut(&11).unwrap().ppid = 10;
+        table.stop_process(11, 19).unwrap();
+
+        assert_eq!(table.poll_waitable_child(10, 11, 0).unwrap(), None);
+        assert_eq!(
+            table.poll_waitable_child(10, 11, 2).unwrap(),
+            Some((11, (19 << 8) | 0x7f))
+        );
+        table.continue_process(11).unwrap();
+        assert_eq!(table.poll_waitable_child(10, 11, 2).unwrap(), None);
     }
 
     #[test]
@@ -1154,8 +1416,8 @@ mod tests {
         table.create_process(11).unwrap();
         table.processes.get_mut(&11).unwrap().ppid = 10;
 
-        assert_eq!(table.poll_waitable_child(10, -1).unwrap(), None);
-        assert_eq!(table.poll_waitable_child(10, 12), Err(Errno::ECHILD));
+        assert_eq!(table.poll_waitable_child(10, -1, 0).unwrap(), None);
+        assert_eq!(table.poll_waitable_child(10, 12, 0), Err(Errno::ECHILD));
     }
 
     #[test]
@@ -1180,9 +1442,9 @@ mod tests {
             child.exit_status = 1;
         }
 
-        assert_eq!(table.poll_waitable_child(10, 0).unwrap(), Some((11, 0)));
+        assert_eq!(table.poll_waitable_child(10, 0, 0).unwrap(), Some((11, 0)));
         assert_eq!(
-            table.poll_waitable_child(10, -30).unwrap(),
+            table.poll_waitable_child(10, -30, 0).unwrap(),
             Some((12, 1 << 8))
         );
     }

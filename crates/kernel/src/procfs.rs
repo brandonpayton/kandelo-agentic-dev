@@ -667,6 +667,21 @@ fn validate_pid(proc: &Process, pid: u32) -> Result<(), Errno> {
     Err(Errno::ENOENT)
 }
 
+/// Validate that a parsed procfs entry names an existing process.
+///
+/// Path parsing alone is not existence: Linux procfs only exposes
+/// `/proc/<pid>/...` while that pid has a process-table entry. Callers that
+/// service metadata-only operations (stat/access/chdir) must perform the same
+/// validation as `procfs_open`, otherwise probes such as
+/// `test -r /proc/123/stat` incorrectly succeed for already-reaped pids.
+pub fn validate_entry(proc: &Process, entry: &ProcfsEntry) -> Result<(), Errno> {
+    let pid = entry_pid(entry);
+    if pid != 0 {
+        validate_pid(proc, pid)?;
+    }
+    Ok(())
+}
+
 /// Allocate a procfs buffer slot, reusing freed slots.
 fn alloc_procfs_buf(proc: &mut Process, data: Vec<u8>) -> usize {
     for (i, slot) in proc.procfs_bufs.iter().enumerate() {

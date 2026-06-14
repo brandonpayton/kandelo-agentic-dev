@@ -219,6 +219,7 @@ pub trait HostIO {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Running,
+    Stopped,
     Exited,
     /// Reaped process-group leader retained only as a pgid/session identity
     /// placeholder while live or zombie members remain in the group.
@@ -317,8 +318,14 @@ pub struct TimerFdState {
 #[derive(Debug, Clone)]
 pub struct PosixTimerState {
     pub clock_id: u32,
+    /// Notification mode from struct sigevent (SIGEV_SIGNAL, SIGEV_NONE, or
+    /// Linux SIGEV_THREAD_ID).
+    pub sigev_notify: u32,
     pub sigev_signo: u32,
     pub sigev_value: i32,
+    /// Target TID for Linux SIGEV_THREAD_ID timers. The main thread's TID is
+    /// the process PID. Zero is unused for active thread-directed timers.
+    pub sigev_tid: u32,
     /// Interval for repeating timers (0 = one-shot).
     pub interval_sec: i64,
     pub interval_nsec: i64,
@@ -377,6 +384,7 @@ pub struct Process {
     /// from signal termination; `exit_signal != 0` records the latter.
     pub exit_status: i32,
     pub exit_signal: u32,
+    pub stop_signal: u32,
     pub fd_table: FdTable,
     pub ofd_table: OfdTable,
     pub lock_table: LockTable,
@@ -423,6 +431,10 @@ pub struct Process {
     pub signalfds: Vec<Option<SignalFdState>>,
     /// POSIX timers (timer_create / timer_settime).
     pub posix_timers: Vec<Option<PosixTimerState>>,
+    /// Linux PR_SET_PDEATHSIG value: signal delivered when this process's
+    /// parent dies. Zero disables delivery. This is process state, not signal
+    /// disposition; it is cleared across fork and preserved across exec.
+    pub parent_death_signal: u32,
     /// Alternate signal stack (sigaltstack): ss_sp, ss_flags, ss_size.
     pub alt_stack_sp: usize,
     pub alt_stack_flags: u32,
@@ -444,6 +456,17 @@ pub struct Process {
     /// Live mmap of `/dev/fb0`, if any. `Some` between successful
     /// `mmap` and the matching `munmap`/process-exit/exec.
     pub fb_binding: Option<FbBinding>,
+    /// Namespace-local PID visible through getpid(). Zero means the process is
+    /// in the initial PID namespace and its global pid is visible.
+    pub pid_ns_vpid: u32,
+    /// Next namespace-local PID to assign to fork children. Nonzero means this
+    /// process is creating children inside a PID namespace (after
+    /// unshare(CLONE_NEWPID), or because it is already namespace init/member).
+    pub pid_ns_next_child_pid: u32,
+    /// True when the process is in an isolated network namespace. The initial
+    /// namespace has host DNS/TCP bridging; isolated namespaces intentionally
+    /// start without external network routes, matching Linux's new netns.
+    pub net_namespace_isolated: bool,
     /// Counts how many times this process has called fork() (parent side, on success).
     /// Read-only from outside the kernel via `kernel_get_fork_count`.
     /// Used as a regression guardrail by the spawn test suite to confirm
@@ -499,6 +522,7 @@ impl Process {
             ptr::addr_of_mut!((*proc_ptr).state).write(ProcessState::Running);
             ptr::addr_of_mut!((*proc_ptr).exit_status).write(0);
             ptr::addr_of_mut!((*proc_ptr).exit_signal).write(0);
+            ptr::addr_of_mut!((*proc_ptr).stop_signal).write(0);
             ptr::addr_of_mut!((*proc_ptr).fd_table).write(fd_table);
             ptr::addr_of_mut!((*proc_ptr).ofd_table).write(ofd_table);
             ptr::addr_of_mut!((*proc_ptr).lock_table).write(LockTable::new());
@@ -530,6 +554,7 @@ impl Process {
             ptr::addr_of_mut!((*proc_ptr).timerfds).write(Vec::new());
             ptr::addr_of_mut!((*proc_ptr).signalfds).write(Vec::new());
             ptr::addr_of_mut!((*proc_ptr).posix_timers).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).parent_death_signal).write(0);
             ptr::addr_of_mut!((*proc_ptr).alt_stack_sp).write(0);
             ptr::addr_of_mut!((*proc_ptr).alt_stack_flags).write(2); // SS_DISABLE
             ptr::addr_of_mut!((*proc_ptr).alt_stack_size).write(0);
@@ -539,6 +564,9 @@ impl Process {
             ptr::addr_of_mut!((*proc_ptr).procfs_bufs).write(Vec::new());
             ptr::addr_of_mut!((*proc_ptr).has_exec).write(false);
             ptr::addr_of_mut!((*proc_ptr).fb_binding).write(None);
+            ptr::addr_of_mut!((*proc_ptr).pid_ns_vpid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).pid_ns_next_child_pid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).net_namespace_isolated).write(false);
             ptr::addr_of_mut!((*proc_ptr).fork_count).write(0);
 
             boxed.assume_init()
@@ -554,6 +582,13 @@ impl Process {
     /// the parent after a child is successfully created.
     pub(crate) fn increment_fork_count(&mut self) {
         self.fork_count += 1;
+    }
+
+    /// Record that a fork child consumed one namespace-local PID.
+    pub(crate) fn note_forked_child_namespace_pid(&mut self) {
+        if self.pid_ns_next_child_pid != 0 {
+            self.pid_ns_next_child_pid = self.pid_ns_next_child_pid.saturating_add(1);
+        }
     }
 
     /// Allocate a process-local pipe buffer, reusing the first free slot.
@@ -1158,8 +1193,15 @@ mod tests {
             data: b"hello".to_vec(),
             src_addr: [127, 0, 0, 1],
             src_addr6: [0; 16],
+            dst_addr: [127, 0, 0, 1],
+            dst_addr6: [0; 16],
             src_port: 12345,
             src_sock_idx: None,
+            ipv6_tclass: 0,
+            src_pid: 0,
+            src_uid: 0,
+            src_gid: 0,
+            ancillary_fds: Vec::new(),
         });
         let mut tcp = SocketInfo::new(SocketDomain::Inet, SocketType::Stream, 0);
         tcp.oob_byte = Some(0xAB);
