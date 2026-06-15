@@ -48,22 +48,26 @@ OPENSSL_PREFIX="${WASM_POSIX_DEP_OPENSSL_DIR:-}"
 [ -z "$OPENSSL_PREFIX" ] && { echo "==> Resolving openssl..."; OPENSSL_PREFIX="$(resolve_dep openssl)"; }
 LIBXML2_PREFIX="${WASM_POSIX_DEP_LIBXML2_DIR:-}"
 [ -z "$LIBXML2_PREFIX" ] && { echo "==> Resolving libxml2..."; LIBXML2_PREFIX="$(resolve_dep libxml2)"; }
+LIBICONV_PREFIX="${WASM_POSIX_DEP_LIBICONV_DIR:-}"
+[ -z "$LIBICONV_PREFIX" ] && { echo "==> Resolving GNU libiconv..."; LIBICONV_PREFIX="$(resolve_dep libiconv)"; }
 [ -f "$ZLIB_PREFIX/lib/libz.a" ] || { echo "ERROR: zlib resolve missing libz.a"; exit 1; }
 [ -f "$SQLITE_PREFIX/lib/libsqlite3.a" ] || { echo "ERROR: sqlite resolve missing libsqlite3.a"; exit 1; }
 [ -f "$OPENSSL_PREFIX/lib/libssl.a" ] || { echo "ERROR: openssl resolve missing libssl.a"; exit 1; }
 [ -f "$LIBXML2_PREFIX/lib/libxml2.a" ] || { echo "ERROR: libxml2 resolve missing libxml2.a"; exit 1; }
+[ -f "$LIBICONV_PREFIX/lib/libiconv.a" ] || { echo "ERROR: GNU libiconv resolve missing libiconv.a"; exit 1; }
 echo "==> zlib at $ZLIB_PREFIX"
 echo "==> sqlite at $SQLITE_PREFIX"
 echo "==> openssl at $OPENSSL_PREFIX"
 echo "==> libxml2 at $LIBXML2_PREFIX"
+echo "==> GNU libiconv at $LIBICONV_PREFIX"
 
-# Compose PKG_CONFIG_PATH for all 4 deps so wasm32posix-configure's
+# Compose PKG_CONFIG_PATH for all deps so wasm32posix-configure's
 # pkg-config probes can find them in the cache instead of the sysroot.
-DEP_PKG_CONFIG_PATH="$ZLIB_PREFIX/lib/pkgconfig:$SQLITE_PREFIX/lib/pkgconfig:$OPENSSL_PREFIX/lib/pkgconfig:$LIBXML2_PREFIX/lib/pkgconfig"
+DEP_PKG_CONFIG_PATH="$ZLIB_PREFIX/lib/pkgconfig:$SQLITE_PREFIX/lib/pkgconfig:$OPENSSL_PREFIX/lib/pkgconfig:$LIBXML2_PREFIX/lib/pkgconfig:$LIBICONV_PREFIX/lib/pkgconfig"
 
 # Compose -I and -L flags for defense-in-depth (autoconf raw probes).
-DEP_CPPFLAGS="-I$ZLIB_PREFIX/include -I$SQLITE_PREFIX/include -I$OPENSSL_PREFIX/include -I$LIBXML2_PREFIX/include"
-DEP_LDFLAGS="-L$ZLIB_PREFIX/lib -L$SQLITE_PREFIX/lib -L$OPENSSL_PREFIX/lib -L$LIBXML2_PREFIX/lib"
+DEP_CPPFLAGS="-I$ZLIB_PREFIX/include -I$SQLITE_PREFIX/include -I$OPENSSL_PREFIX/include -I$LIBXML2_PREFIX/include -I$LIBICONV_PREFIX/include"
+DEP_LDFLAGS="-L$ZLIB_PREFIX/lib -L$SQLITE_PREFIX/lib -L$OPENSSL_PREFIX/lib -L$LIBXML2_PREFIX/lib -L$LIBICONV_PREFIX/lib"
 
 # Some locally rebuilt dependency prefixes used during PHP/kernel
 # conformance iteration intentionally contain only headers and static
@@ -78,7 +82,9 @@ SQLITE_LIBS_VALUE="-L$SQLITE_PREFIX/lib -lsqlite3"
 OPENSSL_CFLAGS_VALUE="-I$OPENSSL_PREFIX/include"
 OPENSSL_LIBS_VALUE="-L$OPENSSL_PREFIX/lib -lssl -lcrypto"
 LIBXML_CFLAGS_VALUE="-I$LIBXML2_PREFIX/include/libxml2 -I$LIBXML2_PREFIX/include"
-LIBXML_LIBS_VALUE="-L$LIBXML2_PREFIX/lib -lxml2"
+LIBXML_LIBS_VALUE="-L$LIBXML2_PREFIX/lib -lxml2 -L$LIBICONV_PREFIX/lib -liconv -lcharset -lz"
+ICONV_CFLAGS_VALUE="-I$LIBICONV_PREFIX/include"
+ICONV_LIBS_VALUE="-L$LIBICONV_PREFIX/lib -liconv -lcharset"
 
 if [ ! -d "$SRC_DIR" ]; then
     echo "==> Downloading PHP $PHP_VERSION..."
@@ -311,6 +317,10 @@ if [ -f Makefile ]; then
         fi
     done
 fi
+if [ -f Makefile ] && ! grep -q '#define ICONV_ALIASED_LIBICONV 1' main/php_config.h 2>/dev/null; then
+    echo "==> Existing PHP Makefile does not use GNU libiconv aliases; reconfiguring..."
+    rm -f Makefile config.cache
+fi
 if [ ! -f Makefile ]; then
     # LDFLAGS notes (kept OUTSIDE the line-continuation block below
     # because `# comment` lines inside a `\`-continued bash block
@@ -351,6 +361,15 @@ if [ ! -f Makefile ]; then
     # out of bounds" because it tries to dereference the now-bogus heap
     # pointer. 4 MB gives PASS_6 enough headroom for any function that
     # passes its own `blocks*vars > 4M` size guard.
+    #
+    # ac_cv_lib_iconv_libiconv=yes: PHP's autoconf probe calls `libiconv()`
+    # with an old-style no-argument prototype. That is tolerated by native ELF
+    # linkers but invalid for WebAssembly's typed call graph, so wasm-ld rejects
+    # the probe before configure can discover that GNU libiconv's header maps
+    # iconv/iconv_open/iconv_close to libiconv/libiconv_open/libiconv_close.
+    # Preseeding the cache with the known result keeps the cross-compile build
+    # aligned with the actual library/header ABI rather than falling back to
+    # musl's narrower iconv implementation.
     PKG_CONFIG_PATH="$DEP_PKG_CONFIG_PATH" \
     CPPFLAGS="$DEP_CPPFLAGS" \
     LDFLAGS="$DEP_LDFLAGS -ldl -Wl,--export-all \
@@ -364,6 +383,9 @@ if [ ! -f Makefile ]; then
     OPENSSL_LIBS="$OPENSSL_LIBS_VALUE" \
     LIBXML_CFLAGS="$LIBXML_CFLAGS_VALUE" \
     LIBXML_LIBS="$LIBXML_LIBS_VALUE" \
+    ICONV_CFLAGS="$ICONV_CFLAGS_VALUE" \
+    ICONV_LIBS="$ICONV_LIBS_VALUE" \
+    ac_cv_lib_iconv_libiconv=yes \
     wasm32posix-configure \
         --disable-all \
         --disable-rpath \
@@ -381,7 +403,7 @@ if [ ! -f Makefile ]; then
         --enable-calendar \
         --enable-dba \
         --enable-ftp \
-        --with-iconv \
+        --with-iconv="$LIBICONV_PREFIX" \
         --enable-pcntl \
         --enable-phar=shared \
         --enable-posix \
@@ -506,6 +528,12 @@ if [ -f main/php_config.h ]; then
     # fopencookie instead of falling back to wrapper-specific stream_cast hooks.
     rm -f main/streams/cast.o main/streams/cast.lo main/streams/.libs/cast.o
     rm -f ext/pcntl/pcntl.o ext/pcntl/pcntl.lo ext/pcntl/.libs/pcntl.o
+    # The same dependency-tracking gap can leave ext/iconv compiled against an
+    # older config after switching from musl iconv to GNU libiconv. Rebuild this
+    # unit so the libiconv header aliases are reflected in the final binary.
+    if grep -q '#define ICONV_ALIASED_LIBICONV 1' main/php_config.h; then
+        rm -f ext/iconv/iconv.o ext/iconv/iconv.lo ext/iconv/.libs/iconv.o
+    fi
 fi
 
 # `make` per-file rules embed `INCLUDES` from configure but ignore
