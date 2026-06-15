@@ -385,6 +385,10 @@ pub enum ReachReason {
     DirectCall {
         callee: FunctionId,
     },
+    ExternalDynamicCall {
+        table: TableId,
+        ty: TypeId,
+    },
     IndirectCall {
         target: FunctionId,
         table: TableId,
@@ -435,6 +439,14 @@ pub fn reaching_closure(module: &Module, seed: FunctionId) -> HashSet<FunctionId
 pub fn reaching_closure_with_reasons(module: &Module, seed: FunctionId) -> ReachingTrace {
     let profiles = profile_functions(module);
     let table_targets = table_targets(module, &profiles);
+    let has_dynamic_linker_imports = module.imports.iter().any(|import| {
+        import.module == "env"
+            && matches!(import.kind, ImportKind::Function(_))
+            && matches!(
+                import.name.as_str(),
+                "__wasm_dlopen" | "__wasm_dlsym" | "__wasm_dlclose" | "__wasm_dlerror"
+            )
+    });
 
     // Reverse direct-call graph: `callee -> set of callers`.
     let mut reverse_direct: HashMap<FunctionId, HashSet<FunctionId>> = HashMap::new();
@@ -502,6 +514,45 @@ pub fn reaching_closure_with_reasons(module: &Module, seed: FunctionId) -> Reach
             reasons.insert(func, reason);
             result.insert(func);
             worklist.push_back((func, indirect_depth));
+        }
+    }
+
+    // A main module that uses Kandelo's dynamic linker can receive new
+    // function-table entries from dlopened side modules after static
+    // instrumentation has already run. If a side module imports and calls
+    // `fork`, the main module frame above the callback/function-pointer
+    // dispatch must also be serializable; otherwise the side module can unwind
+    // itself but the parent cannot resume through the original C call stack.
+    //
+    // The static call graph cannot see future host-inserted table entries, so
+    // treat each `call_indirect` in a dynamic-linking main module as a possible
+    // fork boundary. This is deliberately scoped to modules importing the
+    // project dynamic-linking ABI; ordinary modules keep the narrower
+    // table-target analysis above.
+    if has_dynamic_linker_imports {
+        let dynamic_indirect_roots: Vec<(FunctionId, IndirectCall)> = profiles
+            .iter()
+            .flat_map(|(caller, profile)| {
+                profile
+                    .indirect
+                    .iter()
+                    .copied()
+                    .map(move |indirect| (*caller, indirect))
+            })
+            .collect();
+        for (caller, indirect) in dynamic_indirect_roots {
+            enqueue(
+                caller,
+                1,
+                &mut best_indirect_depth,
+                &mut reasons,
+                &mut result,
+                &mut worklist,
+                ReachReason::ExternalDynamicCall {
+                    table: indirect.table,
+                    ty: indirect.ty,
+                },
+            );
         }
     }
 

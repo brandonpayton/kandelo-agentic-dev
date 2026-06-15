@@ -553,6 +553,8 @@ make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" EXTRA_CFLAGS="$EXTRA_INC_LIBX
 
 echo "==> Both PHP binaries built successfully!"
 
+FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+
 # Build opcache as a shared Zend extension (.so side module).
 # PHP's `make` produces PIC-compiled `.libs/ext/opcache/*.o` because
 # opcache's `[[outputs]]` config is "always shared", but the bundled
@@ -577,6 +579,9 @@ wasm32posix-cc -shared -fPIC -o "$SCRIPT_DIR/bin/opcache.so" \
     ext/opcache/.libs/shared_alloc_shm.o \
     ext/opcache/.libs/shared_alloc_mmap.o \
     ext/opcache/.libs/shared_alloc_posix.o
+echo "==> Applying fork instrumentation to opcache.so side module..."
+"$FORK_INSTRUMENT" "$SCRIPT_DIR/bin/opcache.so" -o "$SCRIPT_DIR/bin/opcache.so.instr" --entry env.fork
+mv "$SCRIPT_DIR/bin/opcache.so.instr" "$SCRIPT_DIR/bin/opcache.so"
 echo "==> opcache.so: $(wc -c < "$SCRIPT_DIR/bin/opcache.so") bytes"
 
 # Build Phar as a shared extension too. The PHP package intentionally keeps
@@ -629,7 +634,6 @@ if [ -n "$WASM_OPT" ]; then
     "$WASM_OPT" -O2 "$SCRIPT_DIR/bin/php-fpm.wasm" -o "$SCRIPT_DIR/bin/php-fpm.wasm"
 fi
 
-FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
 echo "==> Applying fork instrumentation to CLI..."
 "$FORK_INSTRUMENT" "$SCRIPT_DIR/bin/php.wasm" -o "$SCRIPT_DIR/bin/php.wasm.instr"
 mv "$SCRIPT_DIR/bin/php.wasm.instr" "$SCRIPT_DIR/bin/php.wasm"

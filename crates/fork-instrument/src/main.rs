@@ -143,6 +143,14 @@ fn print_function_explanation(input: &[u8], opts: &Options, name: &str) -> Resul
                         );
                         current = *callee;
                     }
+                    Some(ReachReason::ExternalDynamicCall { table, ty }) => {
+                        println!(
+                            "  {step}: {} has call_indirect table={table:?} type={ty:?}; \
+                             dynamic-linking imports allow future side-module functions to occupy that table",
+                            func_label(&module, current),
+                        );
+                        break;
+                    }
                     Some(ReachReason::IndirectCall {
                         target,
                         table,
