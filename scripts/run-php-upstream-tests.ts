@@ -250,6 +250,7 @@ const PASSTHROUGH_ENV_NAMES = [
   "SKIP_ONLINE_TESTS",
   "SKIP_PERF_SENSITIVE",
   "SKIP_SLOW_TESTS",
+  "TEST_FPM_RUN_AS_ROOT",
   "TEST_NON_ROOT_USER",
 ];
 
@@ -304,6 +305,15 @@ function resolvePhpBinary(): string {
     );
   }
   return candidate;
+}
+
+function resolvePhpFpmBinary(phpPath: string): string | null {
+  const explicit = process.env.PHP_FPM_WASM;
+  if (explicit) return resolve(explicit);
+  const resolved = tryResolveBinary("programs/php/php-fpm.wasm");
+  if (resolved) return resolved;
+  const sibling = join(dirname(phpPath), "php-fpm.wasm");
+  return existsSync(sibling) ? sibling : null;
 }
 
 function resolvePhpSource(): string {
@@ -872,6 +882,8 @@ class NodePhpRunner implements PhpRunner {
   private virtualPhpPath: string;
   private host: NodeKernelHost | null = null;
   private phpBytes: ArrayBuffer | null = null;
+  private fpmBytes: ArrayBuffer | null = null;
+  private binaryMountRoot: string | null = null;
   private extensionMountRoot: string | null = null;
   private testsSinceReset = 0;
   private activeOutput: { stdout: string; stderr: string; output: string } | null =
@@ -880,6 +892,7 @@ class NodePhpRunner implements PhpRunner {
   constructor(
     private sourceRoot: string,
     private phpPath: string,
+    private phpFpmPath: string | null,
     private sharedExtensionPaths: Map<string, string>,
     private ownsSourceRoot = false,
     private hostResetInterval = 50,
@@ -908,9 +921,31 @@ class NodePhpRunner implements PhpRunner {
     return root;
   }
 
+  private ensureBinaryMountRoot(): string {
+    if (this.binaryMountRoot) return this.binaryMountRoot;
+    const root = mkdtempSync(join(tmpdir(), "kandelo-php-bin-"));
+    cpSync(this.phpPath, join(root, basename(this.phpPath)));
+    if (this.phpFpmPath && existsSync(this.phpFpmPath)) {
+      const sbin = join(root, "sbin");
+      mkdirSync(sbin, { recursive: true });
+      // php-src's FPM PHPT helper searches for TEST_PHP_EXECUTABLE's
+      // prefix + /sbin/php-fpm (or /fpm/php-fpm). Provide that normal
+      // package layout in the guest rather than teaching individual tests
+      // about Kandelo's .wasm artifact name.
+      cpSync(this.phpFpmPath, join(sbin, "php-fpm"));
+    }
+    this.binaryMountRoot = root;
+    return root;
+  }
+
   private async ensureHost(): Promise<NodeKernelHost> {
     if (this.host) return this.host;
     this.phpBytes = loadBytes(this.phpPath);
+    this.fpmBytes =
+      this.phpFpmPath && existsSync(this.phpFpmPath)
+        ? loadBytes(this.phpFpmPath)
+        : null;
+    const binaryMountRoot = this.ensureBinaryMountRoot();
     const extensionMountRoot = this.ensureExtensionMountRoot();
     const host = new NodeKernelHost({
       maxWorkers: 4,
@@ -920,7 +955,7 @@ class NodePhpRunner implements PhpRunner {
         { mountPoint: "/php-src", hostPath: this.sourceRoot },
         {
           mountPoint: "/kandelo-bin",
-          hostPath: dirname(this.phpPath),
+          hostPath: binaryMountRoot,
           readonly: true,
         },
         {
@@ -950,7 +985,14 @@ class NodePhpRunner implements PhpRunner {
       },
       onResolveExec: (path) => {
         const base = path.split("/").pop();
-        if (base === "php" || base === "php.wasm") return this.phpBytes;
+        if (
+          base === "php" ||
+          base === "php.wasm" ||
+          base === basename(this.phpPath)
+        )
+          return this.phpBytes;
+        if (base === "php-fpm" || base === "php-fpm.wasm")
+          return this.fpmBytes;
         return null;
       },
     });
@@ -1169,6 +1211,10 @@ class NodePhpRunner implements PhpRunner {
     if (this.extensionMountRoot) {
       rmSync(this.extensionMountRoot, { recursive: true, force: true });
       this.extensionMountRoot = null;
+    }
+    if (this.binaryMountRoot) {
+      rmSync(this.binaryMountRoot, { recursive: true, force: true });
+      this.binaryMountRoot = null;
     }
   }
 }
@@ -1667,6 +1713,7 @@ Options:
 
 Environment:
   PHP_WASM              Path to php.wasm
+  PHP_FPM_WASM          Optional path to php-fpm.wasm for FPM PHPTs
   PHP_EXTENSION_DIR     Additional directory/directories to scan for shared
                         extensions when PHP_WASM is outside the package bin dir
   PHP_SOURCE_DIR        Path to a php-src checkout/extract
@@ -1754,6 +1801,7 @@ async function main() {
   const sourceRoot = resolvePhpSource();
   preparePhpTestFixtures(sourceRoot);
   const phpPath = resolvePhpBinary();
+  const phpFpmPath = resolvePhpFpmBinary(phpPath);
   const sharedExtensionPaths = sharedExtensionPathsForPhp(phpPath);
   const availableSharedExtensions = new Set(sharedExtensionPaths.keys());
   const availableExtensions = new Set([
@@ -1775,6 +1823,9 @@ async function main() {
     console.error(`Host: ${host}`);
     console.error(`php-src: ${sourceRoot}`);
     console.error(`PHP wasm: ${phpPath}`);
+    if (phpFpmPath) {
+      console.error(`PHP-FPM wasm: ${phpFpmPath}`);
+    }
     if (availableSharedExtensions.size > 0) {
       console.error(
         `Shared extensions: ${[...availableSharedExtensions].join(", ")}`,
@@ -1812,6 +1863,7 @@ async function main() {
         new NodePhpRunner(
           runnerSourceRoot,
           phpPath,
+          phpFpmPath,
           sharedExtensionPaths,
           runnerSourceRoot !== sourceRoot,
           hostResetInterval,

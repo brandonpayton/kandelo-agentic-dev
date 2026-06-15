@@ -3,7 +3,7 @@
 This project proves Kandelo by running real upstream/project test suites for
 large guest software on both Node.js and browser hosts where possible.
 
-Status date: 2026-06-14.
+Status date: 2026-06-15.
 
 ## Current Status
 
@@ -18,6 +18,63 @@ Status date: 2026-06-14.
 | Node.js library | Upstream Node.js `test/parallel/test-*.js` and `test/sequential/test-*.js` through the SpiderMonkey-backed Node-compatible runtime | Completed 3925 tests: 336 PASS, 3264 FAIL, 325 TIME | Completed 3925 tests: 339 PASS, 3564 FAIL, 22 TIME |
 
 Logs from the 2026-05-28 full runs are under `test-runs/software-unit-tests/`.
+
+## 2026-06-15 PHP PHPT Node Current-Head Full Run
+
+php-src discovery finds **19,017** `.phpt` files from PHP **8.3.15**. The
+current-head Node run on PR #2 completed the full discovered set:
+
+| Host | Scope | Pass | XFAIL | Fail | Timeout | Skip | Unsupported | Untested | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Node | Chunked `--all`, current PR head `091dc220c05f` | 14,443 | 9 | 0 | 0 | 4,099 | 466 | 0 | 19,017 |
+
+The run used the restartable chunk harness:
+
+```bash
+TEST_NON_ROOT_USER=nobody \
+PHP_WASM=/tmp/kad-php-dynfork.wasm \
+PHP_OPCACHE_SO=/tmp/kad-opcache-sidefork.so \
+PHP_EXTENSION_DIR="$PWD/packages/registry/php/bin" \
+scripts/run-php-upstream-node-chunks.sh \
+  --chunk-size 250 --jobs 4 --timeout 600000 \
+  --host-reset-interval 10 \
+  --out-dir /tmp/kad-1-test-logs/php-node-chunks-20260615173607-mmap-hints
+```
+
+The aggregate initially had 141 untested `Zend/tests/type_declarations/*`
+PHPTs because chunk `03750` was interrupted by a local `node_modules/tsx`
+race during `npm ci`. Rerunning exactly those PHPTs and appending the JSONL
+results completed coverage with **0 fail** and **0 timeout**.
+
+Current skip/unsupported coverage gaps should be reduced through normal
+runtime packaging and harness support:
+
+- Missing optional PHP extensions/dependencies: `intl`, `oci8`, `gd`, `curl`,
+  `ldap`, `ffi`, `gmp`, `imap`, `zip`, `pgsql`, and related extension suites.
+- External services: MySQL/PDO MySQL connection tests require a running
+  compatible database service.
+- FPM/CGI/web PHPTs: the Node harness can now stage `php-fpm` when
+  `PHP_FPM_WASM` is set, and passes upstream's `TEST_FPM_RUN_AS_ROOT` control
+  env through to guest tests. This exposes real FPM coverage instead of
+  treating every FPM helper test as a CLI test:
+
+  ```bash
+  TEST_FPM_RUN_AS_ROOT=1 \
+  PHP_WASM="$PWD/packages/registry/php/bin/php.wasm" \
+  PHP_FPM_WASM="$PWD/packages/registry/php/bin/php-fpm.wasm" \
+  PHP_OPCACHE_SO="$PWD/packages/registry/php/bin/opcache.so" \
+  scripts/run-php-upstream-tests.sh --host node --json \
+    sapi/fpm/tests/<test>.phpt
+  ```
+
+  Some opcache/FPM preload tests currently expose a php-src fixture mismatch
+  (`FPM\Tester::getLogLines()` is referenced but absent from this PHP 8.3.15
+  `sapi/fpm/tests/tester.inc`), so they are not force-counted as passing.
+- Fibers require a real general `getcontext`/`makecontext`/`swapcontext`
+  implementation or another Wasm context-switching backend.
+- phpdbg PHPTs require building and packaging the phpdbg SAPI.
+- DNS record-query PHPTs require enabling a correct resolver backend in the
+  PHP build/runtime.
 
 
 ## 2026-06-14 PHP PHPT Node Chunked Full Run
