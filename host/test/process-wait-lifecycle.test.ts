@@ -35,7 +35,7 @@ describe("Rust-owned process wait lifecycle", () => {
 
     worker.handleWaitpid(createChannel(7, processMemory), [-1, statusPtr, 0, 0]);
 
-    expect(wait4Poll).toHaveBeenCalledWith(7, -1, 128);
+    expect(wait4Poll).toHaveBeenCalledWith(7, -1, 128, 0);
     expect(reapExitedChild).toHaveBeenCalledWith(7, 42);
     expect(new DataView(processMemory.buffer).getInt32(statusPtr, true)).toBe(waitStatus);
     expect(worker.completeWaitpid).toHaveBeenCalledWith(
@@ -115,7 +115,7 @@ describe("Rust-owned process wait lifecycle", () => {
 
     worker.handleWaitpid(createChannel(7, createSharedMemory()), [-1, 0, WNOHANG, 0]);
 
-    expect(wait4Poll).toHaveBeenCalledWith(7, -1, BigInt(128));
+    expect(wait4Poll).toHaveBeenCalledWith(7, -1, BigInt(128), WNOHANG);
     expect(worker.waitingForChild).toEqual([]);
     expect(worker.completeWaitpid).toHaveBeenCalledWith(
       expect.any(Object),
@@ -183,6 +183,23 @@ describe("Rust-owned process wait lifecycle", () => {
       [42, { pid: 42, memory, channels: [channel], ptrWidth: 4 }],
     ]);
     worker.activeChannels = [channel];
+    worker.stoppedSyscalls = new Map();
+    worker.stdinFinite = new Set();
+    worker.stdinBuffers = new Map();
+    worker.alarmTimers = new Map();
+    worker.posixTimers = new Map();
+    worker.pendingSleeps = new Map();
+    worker.pendingPollRetries = new Map();
+    worker.pendingSelectRetries = new Map();
+    worker.pendingSigTimedWaits = new Map();
+    worker.udpBindings = new Set();
+    worker.pendingPipeReaders = new Map();
+    worker.pendingPipeWriters = new Map();
+    worker.socketTimeoutTimers = new Map();
+    worker.tcpListeners = new Map();
+    worker.tcpListenerTargets = new Map();
+    worker.sharedMappings = new Map();
+    worker.shmMappings = new Map();
     worker.hostReaped = new Set();
     worker.scheduleWakeBlockedRetries = vi.fn();
 
@@ -258,6 +275,10 @@ function createWorkerHarness(exports: Record<string, unknown>, kernelPtrWidth: 4
     pendingPipeReaders: new Map(),
     pendingPipeWriters: new Map(),
     socketTimeoutTimers: new Map(),
+    waitingForChild: [],
+    stoppedSyscalls: new Map(),
+    pendingSigTimedWaits: new Map(),
+    udpBindings: new Set(),
     pendingCancels: new Set(),
     tcpListeners: new Map(),
     tcpListenerTargets: new Map(),

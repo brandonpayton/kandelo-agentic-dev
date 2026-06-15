@@ -366,12 +366,14 @@ describe("CentralizedKernelWorker Process Management", () => {
       tcpListenerTargets: new Map(),
       epollInterests: new Map(),
       inheritSharedMappings: vi.fn(),
+      inheritSysvShmMappings: vi.fn(),
       completeChannel,
       kernelInstance: {
         exports: {
           kernel_fork_process: kernelForkProcess,
           kernel_clear_fork_child: vi.fn(() => 0),
           kernel_reset_signal_mask: vi.fn(() => 0),
+          kernel_remove_process: vi.fn(() => 0),
         },
       },
     });
