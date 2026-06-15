@@ -6912,9 +6912,12 @@ pub fn sys_getsockopt(proc: &mut Process, fd: i32, level: u32, optname: u32) -> 
             }),
             SO_RCVBUF | SO_SNDBUF => Ok(DEFAULT_PIPE_CAPACITY as u32),
             SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE | SO_LINGER | SO_BROADCAST
-            | SO_PASSCRED | SO_BINDTODEVICE | SO_ATTACH_REUSEPORT_CBPF | SO_ZEROCOPY => {
+            | SO_PASSCRED | SO_ATTACH_REUSEPORT_CBPF | SO_ZEROCOPY => {
                 Ok(sock.get_option(level, optname).unwrap_or(0))
             }
+            // SO_BINDTODEVICE is string-valued and handled by
+            // sys_getsockopt_bindtodevice/kernel_getsockopt.
+            SO_BINDTODEVICE => Err(Errno::ENOPROTOOPT),
             // SO_RCVTIMEO/SO_SNDTIMEO handled by sys_getsockopt_timeout
             _ => Err(Errno::ENOPROTOOPT),
         },
@@ -7092,6 +7095,22 @@ pub fn sys_setsockopt_bindtodevice(
         1,
     );
     Ok(())
+}
+
+/// Get SO_BINDTODEVICE's bound interface name.
+///
+/// Linux exposes SO_BINDTODEVICE as a string-valued socket option. A socket
+/// that has not been explicitly bound to an interface reports a zero-length
+/// name; route-selected interfaces are not reported as implicit bindings.
+pub fn sys_getsockopt_bindtodevice(proc: &Process, fd: i32) -> Result<Vec<u8>, Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+    Ok(sock.bind_device.clone().unwrap_or_default())
 }
 
 /// Get TCP_CONGESTION's algorithm name.
@@ -14766,6 +14785,31 @@ mod tests {
         let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
         let val = sys_getsockopt(&mut proc, fd, SOL_SOCKET, SO_DOMAIN).unwrap();
         assert_eq!(val, AF_UNIX);
+    }
+
+    #[test]
+    fn test_getsockopt_bindtodevice_defaults_to_empty_name() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_DGRAM, 0).unwrap();
+
+        let name = sys_getsockopt_bindtodevice(&proc, fd).unwrap();
+
+        assert!(name.is_empty());
+    }
+
+    #[test]
+    fn test_getsockopt_bindtodevice_returns_explicit_binding() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_DGRAM, 0).unwrap();
+
+        sys_setsockopt_bindtodevice(&mut proc, fd, b"lo\0").unwrap();
+        let name = sys_getsockopt_bindtodevice(&proc, fd).unwrap();
+
+        assert_eq!(name, b"lo");
     }
 
     #[test]

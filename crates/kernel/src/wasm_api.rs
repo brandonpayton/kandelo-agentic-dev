@@ -8173,6 +8173,42 @@ pub extern "C" fn kernel_getsockopt(
         return result;
     }
 
+    // Handle string-valued SO_BINDTODEVICE. Linux returns the explicitly
+    // bound interface name (NUL-terminated when non-empty) and reports length
+    // 0 when no SO_BINDTODEVICE binding exists. Connecting a UDP socket does
+    // not implicitly bind this option to the route-selected interface.
+    if level == SOL_SOCKET && optname == SO_BINDTODEVICE {
+        let result = match syscalls::sys_getsockopt_bindtodevice(proc, fd) {
+            Ok(name) => {
+                let needed = if name.is_empty() { 0 } else { name.len() + 1 };
+                let avail = if !optlen_ptr.is_null() {
+                    unsafe { *optlen_ptr as usize }
+                } else {
+                    needed
+                };
+                let write_len = avail.min(needed);
+                if write_len > 0 {
+                    let out = unsafe { slice::from_raw_parts_mut(optval_ptr, write_len) };
+                    let name_copy = write_len.min(name.len());
+                    out[..name_copy].copy_from_slice(&name[..name_copy]);
+                    if write_len > name_copy {
+                        out[name_copy] = 0;
+                    }
+                }
+                if !optlen_ptr.is_null() {
+                    unsafe {
+                        *optlen_ptr = needed as u32;
+                    }
+                }
+                0
+            }
+            Err(e) => -(e as i32),
+        };
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return result;
+    }
+
     // Handle string-valued TCP_CONGESTION. Linux returns a NUL-terminated
     // algorithm name in the caller's buffer.
     if level == IPPROTO_TCP && optname == TCP_CONGESTION {
