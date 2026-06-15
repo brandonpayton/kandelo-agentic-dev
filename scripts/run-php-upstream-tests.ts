@@ -25,6 +25,7 @@ import {
 import { tmpdir } from "node:os";
 import {
   basename,
+  delimiter,
   dirname,
   isAbsolute,
   join,
@@ -580,14 +581,22 @@ function normalizeExtensionName(extension: string): string {
 
 function sharedExtensionPathsForPhp(phpPath: string): Map<string, string> {
   const out = new Map<string, string>();
-  const phpDir = dirname(phpPath);
-  if (existsSync(phpDir)) {
-    for (const entry of readdirSync(phpDir)) {
+  const extensionDirs = [
+    dirname(phpPath),
+    ...((process.env.PHP_EXTENSION_DIR ?? "")
+      .split(delimiter)
+      .map((dir) => dir.trim())
+      .filter(Boolean)),
+  ];
+  for (const dir of extensionDirs) {
+    if (!existsSync(dir)) continue;
+    for (const entry of readdirSync(dir)) {
       if (entry.endsWith(".so")) {
-        out.set(normalizeExtensionName(entry), join(phpDir, entry));
+        out.set(normalizeExtensionName(entry), join(dir, entry));
       }
     }
   }
+  const phpDir = dirname(phpPath);
   const opcachePath =
     process.env.PHP_OPCACHE_SO ??
     tryResolveBinary("programs/php/opcache.so") ??
@@ -1658,6 +1667,8 @@ Options:
 
 Environment:
   PHP_WASM              Path to php.wasm
+  PHP_EXTENSION_DIR     Additional directory/directories to scan for shared
+                        extensions when PHP_WASM is outside the package bin dir
   PHP_SOURCE_DIR        Path to a php-src checkout/extract
 `);
 }
