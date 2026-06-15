@@ -9,9 +9,11 @@ import { NodePlatformIO } from "../src/platform/node";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "../..");
 const crossProcessFixture = join(repoRoot, "examples/mmap_shared_cross_process.wasm");
+const anonymousForkFixture = join(repoRoot, "examples/mmap_shared_anonymous_fork.wasm");
 const munmapReuseFixture = join(repoRoot, "examples/mmap_shared_munmap_reuse.wasm");
 const largePwriteFixture = join(repoRoot, "examples/mmap_shared_large_pwrite.wasm");
 const itIfCrossProcessFixture = existsSync(crossProcessFixture) ? it : it.skip;
+const itIfAnonymousForkFixture = existsSync(anonymousForkFixture) ? it : it.skip;
 const itIfMunmapReuseFixture = existsSync(munmapReuseFixture) ? it : it.skip;
 const itIfLargePwriteFixture = existsSync(largePwriteFixture) ? it : it.skip;
 
@@ -40,6 +42,18 @@ describe("MAP_SHARED mmap + msync", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("inherited mapping coherent");
     expect(result.stdout).toContain("separate mapping coherent");
+    expect(result.stdout).toContain("PASS");
+  });
+
+  itIfAnonymousForkFixture("keeps anonymous MAP_SHARED mappings coherent after fork", async () => {
+    const result = await runCentralizedProgram({
+      programPath: anonymousForkFixture,
+      io: new NodePlatformIO(),
+      timeout: 10000,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("inherited anonymous mapping coherent");
+    expect(result.stdout).toContain("reused anonymous backing coherent");
     expect(result.stdout).toContain("PASS");
   });
 

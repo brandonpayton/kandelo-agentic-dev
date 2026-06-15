@@ -503,6 +503,7 @@ interface SharedMmapBacking {
   key: string;
   path: string;
   handle: number;
+  anonymous: boolean;
   writable: boolean;
   pages: Map<number, Uint8Array>;
   dirtyPages: Set<number>;
@@ -977,10 +978,12 @@ export class CentralizedKernelWorker {
   }>>();
   /** Per-process MAP_SHARED file-backed mappings: pid → Map<addr, info> */
   private sharedMappings = new Map<number, Map<number, SharedMmapMapping>>();
-  /** Host page-cache entries backing file-backed MAP_SHARED mappings. */
+  /** Host page-cache entries backing MAP_SHARED mappings. */
   private sharedMmapBackings = new Map<string, SharedMmapBacking>();
   /** Cached process-fd to shared-mmap backing resolution. Negative entries avoid per-read fstat/path probes. */
   private sharedMmapFdCache = new Map<string, { backingKey: string | null }>();
+  /** Monotonic id for anonymous MAP_SHARED backings. */
+  private nextAnonymousMmapBackingId = 1;
   /** Host-side mirror of epoll interest lists: "pid:epfd" → interests.
    *  Maintained by intercepting epoll_ctl results. Used by handleEpollPwait
    *  to convert epoll_pwait to poll without calling kernel_handle_channel
@@ -2307,7 +2310,7 @@ export class CentralizedKernelWorker {
       logEntry = this.formatSyscallEntry(channel, syscallNr, origArgs);
     }
 
-    this.synchronizeSharedMappingsForSyscallBoundary(channel);
+    this.synchronizeSharedMappingsForSyscallBoundary(channel, syscallNr);
     this.synchronizeSysvShmMappingsForSyscallBoundary(channel);
     this.flushSharedMappingsBeforeFileSyscall(channel, syscallNr, origArgs);
 
@@ -2794,21 +2797,23 @@ export class CentralizedKernelWorker {
       console.error(`[BRK ALERT] pid=${channel.pid} brk returned 0x${(retVal >>> 0).toString(16)} — IN THREAD REGION!`);
     }
 
-    // --- File-backed mmap: populate mapped region with file data ---
+    // --- mmap backing: populate file mappings and track MAP_SHARED mappings ---
     if (syscallNr === SYS_MMAP && retVal > 0 && (retVal >>> 0) !== 0xffffffff) {
       const mmapFd = origArgs[4];
       const mmapFlags = origArgs[3] >>> 0;
-      if (mmapFd >= 0 && (mmapFlags & MAP_ANONYMOUS) === 0) {
-        if (mmapFlags & MAP_SHARED) {
+      if (mmapFlags & MAP_SHARED) {
+        if (mmapFlags & MAP_ANONYMOUS) {
+          this.mapSharedAnonymousMmap(channel, retVal >>> 0, origArgs);
+        } else if (mmapFd >= 0) {
           if (!this.mapSharedMmapFromFile(channel, retVal >>> 0, origArgs)) {
             this.populateMmapFromFile(channel, retVal >>> 0, origArgs);
           }
-        } else {
-          this.populateMmapFromFile(channel, retVal >>> 0, origArgs);
         }
+      } else if (mmapFd >= 0 && (mmapFlags & MAP_ANONYMOUS) === 0) {
+        this.populateMmapFromFile(channel, retVal >>> 0, origArgs);
       }
     }
-    this.assertKernelStackStage("after mmap file population", kernelStackTrace, channel, syscallNr, origArgs);
+    this.assertKernelStackStage("after mmap backing population", kernelStackTrace, channel, syscallNr, origArgs);
 
     // --- msync: flush MAP_SHARED regions back to file ---
     if (syscallNr === SYS_MSYNC && retVal === 0) {
@@ -3073,8 +3078,9 @@ export class CentralizedKernelWorker {
     }
 
     if (options.syncSharedMappings !== false) {
-      this.syncSharedMappingsFromProcess(channel);
-      this.refreshSharedMappingsToProcess(channel);
+      const includeAnonymous = this.syscallSynchronizesAnonymousSharedMemory(syscallNr);
+      this.syncSharedMappingsFromProcess(channel, includeAnonymous);
+      this.refreshSharedMappingsToProcess(channel, includeAnonymous);
     }
 
     // Clear handling flag (channel is done — poller can pick it up for next syscall)
@@ -8025,6 +8031,53 @@ export class CentralizedKernelWorker {
     return true;
   }
 
+  private mapSharedAnonymousMmap(
+    channel: ChannelInfo,
+    mmapAddr: number,
+    origArgs: number[],
+  ): boolean {
+    const mapLen = origArgs[1] >>> 0;
+    const writable = (origArgs[2] & PROT_WRITE) !== 0;
+    if (mapLen === 0) return true;
+
+    const processMem = new Uint8Array(channel.memory.buffer);
+    if (mmapAddr + mapLen > processMem.length) return false;
+
+    const key = `anon:${channel.pid}:${mmapAddr}:${this.nextAnonymousMmapBackingId++}`;
+    const backing: SharedMmapBacking = {
+      key,
+      path: "",
+      handle: -1,
+      anonymous: true,
+      writable,
+      pages: new Map(),
+      dirtyPages: new Set(),
+      refCount: 0,
+      version: 0,
+    };
+    this.sharedMmapBackings.set(key, backing);
+
+    const initial = processMem.slice(mmapAddr, mmapAddr + mapLen);
+    this.copyRangeToBacking(backing, 0, initial, false);
+
+    let pidMap = this.sharedMappings.get(channel.pid);
+    if (!pidMap) {
+      pidMap = new Map();
+      this.sharedMappings.set(channel.pid, pidMap);
+    }
+    backing.refCount++;
+    pidMap.set(mmapAddr, {
+      fd: -1,
+      fileOffset: 0,
+      len: mapLen,
+      writable,
+      backingKey: key,
+      snapshot: initial,
+      version: backing.version,
+    });
+    return true;
+  }
+
   private getFdStatForSharedMapping(channel: ChannelInfo, fd: number): SharedMmapFdStat | null {
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
       (offset: KernelPointer, pid: number) => number;
@@ -8104,6 +8157,7 @@ export class CentralizedKernelWorker {
       key,
       path,
       handle,
+      anonymous: false,
       writable,
       pages: new Map(),
       dirtyPages: new Set(),
@@ -8142,6 +8196,9 @@ export class CentralizedKernelWorker {
 
   private readBackingPageFromFile(backing: SharedMmapBacking, page: number): Uint8Array {
     const data = new Uint8Array(FILE_PAGE_SIZE);
+    if (backing.handle < 0) {
+      return data;
+    }
     try {
       const bytesRead = this.io.read(
         backing.handle,
@@ -8243,12 +8300,34 @@ export class CentralizedKernelWorker {
     return false;
   }
 
-  private synchronizeSharedMappingsForSyscallBoundary(channel: ChannelInfo): void {
-    this.syncSharedMappingsFromProcess(channel);
-    this.refreshSharedMappingsToProcess(channel);
+  private synchronizeSharedMappingsForSyscallBoundary(channel: ChannelInfo, syscallNr: number): void {
+    const includeAnonymous = this.syscallSynchronizesAnonymousSharedMemory(syscallNr);
+    this.syncSharedMappingsFromProcess(channel, includeAnonymous);
+    this.refreshSharedMappingsToProcess(channel, includeAnonymous);
   }
 
-  private syncSharedMappingsFromProcess(channel: ChannelInfo): void {
+  private syscallSynchronizesAnonymousSharedMemory(syscallNr: number): boolean {
+    return syscallNr === SYS_FORK
+      || syscallNr === SYS_VFORK
+      || syscallNr === SYS_CLONE
+      || syscallNr === SYS_EXIT
+      || syscallNr === SYS_EXIT_GROUP
+      || syscallNr === SYS_WAIT4
+      || syscallNr === SYS_WAITID
+      || syscallNr === SYS_FUTEX
+      || syscallNr === SYS_POLL
+      || syscallNr === SYS_PPOLL
+      || syscallNr === SYS_SELECT
+      || syscallNr === SYS_PSELECT6
+      || syscallNr === SYS_EPOLL_WAIT
+      || syscallNr === SYS_EPOLL_PWAIT
+      || syscallNr === SYS_RT_SIGTIMEDWAIT
+      || syscallNr === SYS_MSYNC
+      || syscallNr === SYS_MUNMAP
+      || syscallNr === SYS_MREMAP;
+  }
+
+  private syncSharedMappingsFromProcess(channel: ChannelInfo, includeAnonymous = true): void {
     const pidMap = this.sharedMappings.get(channel.pid);
     if (!pidMap || pidMap.size === 0) return;
     const processMem = new Uint8Array(channel.memory.buffer);
@@ -8257,6 +8336,7 @@ export class CentralizedKernelWorker {
       if (!mapping.writable) continue;
       const backing = this.sharedMmapBackings.get(mapping.backingKey);
       if (!backing) continue;
+      if (backing.anonymous && !includeAnonymous) continue;
       if (mapAddr + mapping.len > processMem.length) continue;
 
       let changed = false;
@@ -8284,7 +8364,7 @@ export class CentralizedKernelWorker {
     }
   }
 
-  private refreshSharedMappingsToProcess(channel: ChannelInfo): void {
+  private refreshSharedMappingsToProcess(channel: ChannelInfo, includeAnonymous = true): void {
     const pidMap = this.sharedMappings.get(channel.pid);
     if (!pidMap || pidMap.size === 0) return;
     const processMem = new Uint8Array(channel.memory.buffer);
@@ -8292,6 +8372,7 @@ export class CentralizedKernelWorker {
     for (const [mapAddr, mapping] of pidMap) {
       const backing = this.sharedMmapBackings.get(mapping.backingKey);
       if (!backing || mapping.version === backing.version) continue;
+      if (backing.anonymous && !includeAnonymous) continue;
       if (mapAddr + mapping.len > processMem.length) continue;
 
       const latest = this.readBackingRange(backing, mapping.fileOffset, mapping.len);
@@ -8410,6 +8491,10 @@ export class CentralizedKernelWorker {
 
   private flushBackingRange(backing: SharedMmapBacking, offset: number, len: number): boolean {
     if (len <= 0 || backing.dirtyPages.size === 0) return true;
+    if (backing.handle < 0) {
+      backing.dirtyPages.clear();
+      return true;
+    }
     const end = offset + len;
     let ok = true;
 
@@ -8555,8 +8640,8 @@ export class CentralizedKernelWorker {
     errVal: number,
   ): void {
     this.handleSharedMappingsAfterFileSyscall(channel, syscallNr, origArgs, retVal, errVal);
-    this.syncSharedMappingsFromProcess(channel);
-    this.refreshSharedMappingsToProcess(channel);
+    this.syncSharedMappingsFromProcess(channel, false);
+    this.refreshSharedMappingsToProcess(channel, false);
   }
 
   private updateSharedBackingFromProcessBuffer(
@@ -8656,10 +8741,12 @@ export class CentralizedKernelWorker {
     if (backing.refCount > 0) return;
 
     this.flushBackingRange(backing, 0, Number.MAX_SAFE_INTEGER);
-    try {
-      this.io.close(backing.handle);
-    } catch {
-      // The kernel should not fail teardown because a host close raced.
+    if (backing.handle >= 0) {
+      try {
+        this.io.close(backing.handle);
+      } catch {
+        // The kernel should not fail teardown because a host close raced.
+      }
     }
     this.sharedMmapBackings.delete(backing.key);
     this.invalidateSharedMmapFdCache();
