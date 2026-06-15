@@ -578,13 +578,13 @@ function normalizeExtensionName(extension: string): string {
   return name.replace(/^(?:php_)?(.+?)(?:\.so)?$/, "$1");
 }
 
-function sharedExtensionsForPhp(phpPath: string): Set<string> {
-  const out = new Set<string>();
+function sharedExtensionPathsForPhp(phpPath: string): Map<string, string> {
+  const out = new Map<string, string>();
   const phpDir = dirname(phpPath);
   if (existsSync(phpDir)) {
     for (const entry of readdirSync(phpDir)) {
       if (entry.endsWith(".so")) {
-        out.add(normalizeExtensionName(entry));
+        out.set(normalizeExtensionName(entry), join(phpDir, entry));
       }
     }
   }
@@ -592,7 +592,7 @@ function sharedExtensionsForPhp(phpPath: string): Set<string> {
     process.env.PHP_OPCACHE_SO ??
     tryResolveBinary("programs/php/opcache.so") ??
     join(phpDir, "opcache.so");
-  if (opcachePath && existsSync(opcachePath)) out.add("opcache");
+  if (opcachePath && existsSync(opcachePath)) out.set("opcache", opcachePath);
   return out;
 }
 
@@ -871,7 +871,7 @@ class NodePhpRunner implements PhpRunner {
   constructor(
     private sourceRoot: string,
     private phpPath: string,
-    private availableSharedExtensions: Set<string>,
+    private sharedExtensionPaths: Map<string, string>,
     private ownsSourceRoot = false,
     private hostResetInterval = 50,
     private enableTcpNetwork = true,
@@ -882,7 +882,7 @@ class NodePhpRunner implements PhpRunner {
   loadExtensionIniArgs(requiredExtensions: string[]): string[] {
     return loadExtensionIniArgs(
       requiredExtensions,
-      this.availableSharedExtensions,
+      new Set(this.sharedExtensionPaths.keys()),
       BROWSER_EXTENSION_DIR,
     );
   }
@@ -892,10 +892,8 @@ class NodePhpRunner implements PhpRunner {
     const root = mkdtempSync(join(tmpdir(), "kandelo-php-ext-"));
     const destDir = join(root, "php", "extensions");
     mkdirSync(destDir, { recursive: true });
-    const srcDir = dirname(this.phpPath);
-    for (const entry of readdirSync(srcDir)) {
-      if (!entry.endsWith(".so")) continue;
-      cpSync(join(srcDir, entry), join(destDir, entry));
+    for (const [name, srcPath] of this.sharedExtensionPaths) {
+      cpSync(srcPath, join(destDir, `${name}.so`));
     }
     this.extensionMountRoot = root;
     return root;
@@ -1745,7 +1743,8 @@ async function main() {
   const sourceRoot = resolvePhpSource();
   preparePhpTestFixtures(sourceRoot);
   const phpPath = resolvePhpBinary();
-  const availableSharedExtensions = sharedExtensionsForPhp(phpPath);
+  const sharedExtensionPaths = sharedExtensionPathsForPhp(phpPath);
+  const availableSharedExtensions = new Set(sharedExtensionPaths.keys());
   const availableExtensions = new Set([
     ...staticExtensionsForPhpSource(sourceRoot),
     ...availableSharedExtensions,
@@ -1802,7 +1801,7 @@ async function main() {
         new NodePhpRunner(
           runnerSourceRoot,
           phpPath,
-          availableSharedExtensions,
+          sharedExtensionPaths,
           runnerSourceRoot !== sourceRoot,
           hostResetInterval,
           enableTcpNetwork,
