@@ -1807,9 +1807,19 @@ pub fn sys_write(
                             let _ = host.host_nanosleep(0, 1_000_000);
                         }
                     }
-                    // External path: delegate to host
+                    // External path: delegate to host.  A stream write that
+                    // fails with EPIPE must also generate SIGPIPE; the host
+                    // only reports the errno, so mirror the POSIX side effect
+                    // in the kernel just like the in-kernel pipe-backed TCP
+                    // path above.
                     let net_handle = sock.host_net_handle.ok_or(Errno::ENOTCONN)?;
-                    host.host_net_send(net_handle, buf, 0)
+                    match host.host_net_send(net_handle, buf, 0) {
+                        Err(Errno::EPIPE) => {
+                            proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
+                            Err(Errno::EPIPE)
+                        }
+                        other => other,
+                    }
                 }
                 SocketDomain::Unix => {
                     if sock.send_buf_idx.is_none()
@@ -6681,10 +6691,26 @@ pub fn sys_send(
         SocketDomain::Inet | SocketDomain::Inet6 => {
             // Loopback path: use pipe buffers if available
             if sock.send_buf_idx.is_some() {
-                return sys_write(proc, host, fd, buf);
+                let nosignal = flags & MSG_NOSIGNAL != 0;
+                let sigpipe_was_pending =
+                    proc.signals.is_pending(wasm_posix_shared::signal::SIGPIPE);
+                let result = sys_write(proc, host, fd, buf);
+                // MSG_NOSIGNAL: suppress SIGPIPE raised by write.
+                if nosignal && !sigpipe_was_pending {
+                    proc.signals.clear(wasm_posix_shared::signal::SIGPIPE);
+                }
+                return result;
             }
             let net_handle = sock.host_net_handle.ok_or(Errno::ENOTCONN)?;
-            host.host_net_send(net_handle, buf, flags)
+            match host.host_net_send(net_handle, buf, flags) {
+                Err(Errno::EPIPE) => {
+                    if flags & MSG_NOSIGNAL == 0 {
+                        proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
+                    }
+                    Err(Errno::EPIPE)
+                }
+                other => other,
+            }
         }
         SocketDomain::Unix => {
             // DGRAM bit-bucket (syslog pattern): data is discarded
@@ -12124,6 +12150,7 @@ mod tests {
         statfs_by_path: std::collections::HashMap<Vec<u8>, WasmStatfs>,
         net_connect_result: Result<(), Errno>,
         net_connect_status_result: Result<(), Errno>,
+        net_send_result: Result<usize, Errno>,
         net_connect_calls: Vec<(i32, Vec<u8>, u16)>,
         net_listen_calls: Vec<(i32, u16, [u8; 4])>,
     }
@@ -12149,6 +12176,7 @@ mod tests {
                 statfs_by_path: std::collections::HashMap::new(),
                 net_connect_result: Err(Errno::ECONNREFUSED),
                 net_connect_status_result: Err(Errno::ECONNREFUSED),
+                net_send_result: Err(Errno::ENOTCONN),
                 net_connect_calls: Vec::new(),
                 net_listen_calls: Vec::new(),
             }
@@ -12564,7 +12592,7 @@ mod tests {
             _data: &[u8],
             _flags: u32,
         ) -> Result<usize, Errno> {
-            Err(Errno::ENOTCONN)
+            self.net_send_result
         }
         fn host_net_recv(
             &mut self,
@@ -14441,6 +14469,25 @@ mod tests {
     }
 
     #[test]
+    fn test_write_external_tcp_epipe_raises_sigpipe() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        host.net_connect_result = Ok(());
+        host.net_connect_status_result = Ok(());
+        host.net_send_result = Err(Errno::EPIPE);
+
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let addr = [2, 0, 0, 80, 93, 184, 216, 34, 0, 0, 0, 0, 0, 0, 0, 0];
+        sys_connect(&mut proc, &mut host, fd, &addr).unwrap();
+
+        let result = sys_write(&mut proc, &mut host, fd, b"test");
+        assert_eq!(result, Err(Errno::EPIPE));
+        assert!(proc.signals.is_pending(wasm_posix_shared::signal::SIGPIPE));
+    }
+
+    #[test]
     fn test_socketpair_close_both_frees_pipes() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
@@ -14644,6 +14691,25 @@ mod tests {
 
         // Send with MSG_NOSIGNAL — should get EPIPE but NOT raise SIGPIPE
         let result = sys_send(&mut proc, &mut host, fd0, b"test", MSG_NOSIGNAL);
+        assert_eq!(result, Err(Errno::EPIPE));
+        assert!(!proc.signals.is_pending(wasm_posix_shared::signal::SIGPIPE));
+    }
+
+    #[test]
+    fn test_send_external_tcp_msg_nosignal_suppresses_sigpipe() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+
+        host.net_connect_result = Ok(());
+        host.net_connect_status_result = Ok(());
+        host.net_send_result = Err(Errno::EPIPE);
+
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let addr = [2, 0, 0, 80, 93, 184, 216, 34, 0, 0, 0, 0, 0, 0, 0, 0];
+        sys_connect(&mut proc, &mut host, fd, &addr).unwrap();
+
+        let result = sys_send(&mut proc, &mut host, fd, b"test", MSG_NOSIGNAL);
         assert_eq!(result, Err(Errno::EPIPE));
         assert!(!proc.signals.is_pending(wasm_posix_shared::signal::SIGPIPE));
     }
