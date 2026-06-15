@@ -249,6 +249,7 @@ const PASSTHROUGH_ENV_NAMES = [
   "SKIP_ONLINE_TESTS",
   "SKIP_PERF_SENSITIVE",
   "SKIP_SLOW_TESTS",
+  "TEST_NON_ROOT_USER",
 ];
 
 function forceNodeGc(): void {
