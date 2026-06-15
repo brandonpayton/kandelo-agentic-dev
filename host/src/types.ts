@@ -133,6 +133,7 @@ export interface TcpConnectionPeer {
   poll?(events: number): number;
   shutdown(how: number): void;
   close(): void;
+  abort?(): void;
 }
 
 export interface TcpListenTarget {
