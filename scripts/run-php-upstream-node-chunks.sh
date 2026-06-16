@@ -14,6 +14,7 @@ start_offset=0
 out_dir=""
 force=0
 summary_only=0
+rebuild_vfs=0
 
 die() {
   echo "run-php-upstream-node-chunks: $*" >&2
@@ -39,6 +40,7 @@ Options:
   --out-dir <dir>              Output directory (default: /tmp/kandelo-php-<host>-chunks-<timestamp>)
   --force                      Re-run chunks even if their .done marker exists
   --summary-only               Aggregate an existing --out-dir without running chunks
+  --rebuild-vfs                Rebuild the browser PHPT VFS image before running
   -h, --help                   Show this help
 
 Environment:
@@ -46,6 +48,7 @@ Environment:
   PHP_TEST_HOST                Host default for --host (node or browser)
   PHP_WASM                     PHP wasm binary (default resolved by downstream harness)
   PHP_OPCACHE_SO               opcache.so path when testing opcache (recommended)
+  PHP_EXTENSION_DIR            Directory of PHP .so side modules to include in the browser VFS
 
 Outputs:
   chunk-<offset>.jsonl         JSONL PHPT results for that chunk
@@ -68,6 +71,7 @@ while [ "$#" -gt 0 ]; do
     --out-dir) [ "$#" -ge 2 ] || die "--out-dir needs a value"; out_dir="$2"; shift 2 ;;
     --force) force=1; shift ;;
     --summary-only) summary_only=1; shift ;;
+    --rebuild-vfs) rebuild_vfs=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -112,6 +116,11 @@ echo "PHP source: $PHP_SRC"
 echo "Host: $host"
 echo "Total discovered PHPTs: $total"
 echo "Output directory: $out_dir"
+
+if [ "$summary_only" -eq 0 ] && [ "$host" = browser ] && [ "$rebuild_vfs" -eq 1 ]; then
+  echo "Rebuilding browser PHPT VFS image..."
+  npx tsx "$REPO_ROOT/images/vfs/scripts/build-php-test-vfs-image.ts"
+fi
 
 aggregate() {
   python3 - "$out_dir" "$total" <<'PY'
