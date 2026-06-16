@@ -732,6 +732,20 @@ function preparePhpTestFixtures(sourceRoot: string): void {
       writeFileSync(fpmLogReader, text.replace(from, to), "utf8");
     }
   }
+
+  const fpmIpv4Fallback = join(sourceRoot, "sapi/fpm/tests/socket-ipv4-fallback.phpt");
+  if (existsSync(fpmIpv4Fallback)) {
+    const text = readFileSync(fpmIpv4Fallback, "utf8");
+    const from = "Address already in use \\(\\d+\\)";
+    const to = "Address (?:already )?in use \\(\\d+\\)";
+    if (text.includes(from) && !text.includes(to)) {
+      // musl's strerror(EADDRINUSE) is "Address in use" while glibc's is
+      // "Address already in use". Both describe the same POSIX errno, so make
+      // this fixture regex libc-portable rather than changing Kandelo/libc
+      // message strings to match one C library.
+      writeFileSync(fpmIpv4Fallback, text.replace(from, to), "utf8");
+    }
+  }
 }
 
 function loadExtensionIniArgs(
