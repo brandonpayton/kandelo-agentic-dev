@@ -1061,10 +1061,15 @@ class NodePhpRunner implements PhpRunner {
   private ensureExtensionMountRoot(): string {
     if (this.extensionMountRoot) return this.extensionMountRoot;
     const root = mkdtempSync(join(tmpdir(), "kandelo-php-ext-"));
+    chmodSync(root, 0o755);
     const destDir = join(root, "php", "extensions");
     mkdirSync(destDir, { recursive: true });
+    chmodSync(join(root, "php"), 0o755);
+    chmodSync(destDir, 0o755);
     for (const [name, srcPath] of this.sharedExtensionPaths) {
-      cpSync(srcPath, join(destDir, `${name}.so`));
+      const destPath = join(destDir, `${name}.so`);
+      cpSync(srcPath, destPath);
+      chmodSync(destPath, 0o755);
     }
     this.extensionMountRoot = root;
     return root;
@@ -1073,15 +1078,21 @@ class NodePhpRunner implements PhpRunner {
   private ensureBinaryMountRoot(): string {
     if (this.binaryMountRoot) return this.binaryMountRoot;
     const root = mkdtempSync(join(tmpdir(), "kandelo-php-bin-"));
-    cpSync(this.phpPath, join(root, basename(this.phpPath)));
+    chmodSync(root, 0o755);
+    const phpDest = join(root, basename(this.phpPath));
+    cpSync(this.phpPath, phpDest);
+    chmodSync(phpDest, 0o755);
     if (this.phpFpmPath && existsSync(this.phpFpmPath)) {
       const sbin = join(root, "sbin");
       mkdirSync(sbin, { recursive: true });
+      chmodSync(sbin, 0o755);
       // php-src's FPM PHPT helper searches for TEST_PHP_EXECUTABLE's
       // prefix + /sbin/php-fpm (or /fpm/php-fpm). Provide that normal
       // package layout in the guest rather than teaching individual tests
       // about Kandelo's .wasm artifact name.
-      cpSync(this.phpFpmPath, join(sbin, "php-fpm"));
+      const fpmDest = join(sbin, "php-fpm");
+      cpSync(this.phpFpmPath, fpmDest);
+      chmodSync(fpmDest, 0o755);
     }
     this.binaryMountRoot = root;
     return root;
@@ -1100,6 +1111,16 @@ class NodePhpRunner implements PhpRunner {
       maxWorkers: 4,
       rootfsImage: "default",
       enableTcpNetwork: this.enableTcpNetwork,
+      execPrograms: {
+        [this.virtualPhpPath]: this.phpPath,
+        "/kandelo-bin/php": this.phpPath,
+        ...(this.phpFpmPath
+          ? {
+              "/kandelo-bin/sbin/php-fpm": this.phpFpmPath,
+              "/kandelo-bin/fpm/php-fpm": this.phpFpmPath,
+            }
+          : {}),
+      },
       extraMounts: [
         { mountPoint: "/php-src", hostPath: this.sourceRoot },
         {
