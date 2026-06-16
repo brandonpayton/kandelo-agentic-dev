@@ -250,6 +250,7 @@ const PASSTHROUGH_ENV_NAMES = [
   "SKIP_ONLINE_TESTS",
   "SKIP_PERF_SENSITIVE",
   "SKIP_SLOW_TESTS",
+  "TEST_FPM_DEBUG",
   "TEST_FPM_RUN_AS_ROOT",
   "TEST_NON_ROOT_USER",
 ];
@@ -486,6 +487,13 @@ function defaultPhpTestEnvArgs(): string[] {
     "REQUEST_METHOD=GET",
     "CONTENT_TYPE=",
     "CONTENT_LENGTH=",
+    // Kandelo runs FPM and its helper clients under emulation, so PHP-FPM
+    // startup notices can legitimately take longer than php-src's native
+    // three-second tester default (especially with OPcache preloading).
+    // The fixture patch below teaches the FPM tester helper to honor this.
+    `TEST_FPM_LOG_TIMEOUT_SECONDS=${process.env.TEST_FPM_LOG_TIMEOUT_SECONDS ?? "20"}`,
+    `TEST_FPM_CHECK_CONNECTION_ATTEMPTS=${process.env.TEST_FPM_CHECK_CONNECTION_ATTEMPTS ?? "200"}`,
+    "TEST_FPM_EXTENSION_DIR=/usr/lib/php/extensions",
     "TZ=",
   ];
 }
@@ -640,6 +648,89 @@ function preparePhpTestFixtures(sourceRoot: string): void {
   for (const entry of readdirSync(fixtureDir)) {
     if (!entry.startsWith("sni_server_") || !entry.endsWith(".pem")) continue;
     cpSync(join(fixtureDir, entry), join(destDir, entry));
+  }
+
+  // PHP 8.3.15's FPM test fixtures need small harness-side maintenance under
+  // Kandelo:
+  // - ext/opcache/tests/preload_user_004.phpt calls FPM\Tester::getLogLines(),
+  //   but the shipped FPM tester helper does not define that method.
+  // - logreader.inc has a native three-second default that is too short for
+  //   OPcache preload startup under emulation.
+  //
+  // These changes only affect the copied PHPT fixture tree used by the
+  // harness. They do not change PHP runtime behavior or Kandelo kernel
+  // behavior.
+  const fpmTester = join(sourceRoot, "sapi/fpm/tests/tester.inc");
+  if (existsSync(fpmTester)) {
+    const text = readFileSync(fpmTester, "utf8");
+    if (text.includes("class Tester")) {
+      const marker = "    /**\n     * Expect no log lines to be logged.\n";
+      const method = `    /**\n     * Return currently available FPM log lines.\n     *\n     * @param int $timeoutSeconds Seconds to wait for the first line.\n     * @param int $timeoutMicroseconds Additional microseconds to wait for the first line.\n     *\n     * @return array\n     * @throws \\Exception\n     */\n    public function getLogLines(int $timeoutSeconds = 3, int $timeoutMicroseconds = 0): array\n    {\n        $configuredTimeout = getenv('TEST_FPM_LOG_TIMEOUT_SECONDS');\n        if ($configuredTimeout !== false && is_numeric($configuredTimeout)) {\n            $timeoutSeconds = max($timeoutSeconds, (int) $configuredTimeout);\n        }\n\n        $lines = [];\n        $line = $this->logReader->getLine($timeoutSeconds, $timeoutMicroseconds);\n        while ($line !== null) {\n            if ($line !== '') {\n                $lines[] = $line;\n            }\n            $line = $this->logReader->getLine(timeoutSeconds: 0, timeoutMicroseconds: 1000);\n        }\n\n        return $lines;\n    }\n\n`;
+      let next = text;
+      if (text.includes("function getLogLines(")) {
+        const start = text.indexOf("    /**\n     * Return currently available FPM log lines.");
+        const end = text.indexOf(marker, start);
+        if (start < 0 || end <= start) {
+          throw new Error(
+            `Unable to update PHP FPM tester fixture: getLogLines block not found in ${fpmTester}`,
+          );
+        }
+        next = text.slice(0, start) + method + text.slice(end);
+      } else {
+        if (!text.includes(marker)) {
+          throw new Error(
+            `Unable to patch PHP FPM tester fixture: marker not found in ${fpmTester}`,
+          );
+        }
+        next = text.replace(marker, method + marker);
+      }
+      if (!next.includes("TEST_FPM_CHECK_CONNECTION_ATTEMPTS")) {
+        const from = `    ) {\n        $i = 0;\n        do {`;
+        const to = `    ) {\n        $configuredAttempts = getenv('TEST_FPM_CHECK_CONNECTION_ATTEMPTS');\n        if ($configuredAttempts !== false && is_numeric($configuredAttempts)) {\n            $attempts = max($attempts, (int) $configuredAttempts);\n        }\n\n        $i = 0;\n        do {`;
+        if (!next.includes(from)) {
+          throw new Error(
+            `Unable to patch PHP FPM tester fixture: checkConnection marker not found in ${fpmTester}`,
+          );
+        }
+        next = next.replace(from, to);
+      }
+      if (!next.includes("$cmd .= ' --allow-to-run-as-root';")) {
+        const from = `$cmd           = self::findExecutable() . " -n $configTestArg -y $configFile 2>&1";`;
+        const to = `$cmd           = self::findExecutable() . " -n $configTestArg -y $configFile";\n        if (getenv('TEST_FPM_RUN_AS_ROOT')) {\n            $cmd .= ' --allow-to-run-as-root';\n        }\n        $cmd .= " 2>&1";`;
+        if (!next.includes(from)) {
+          throw new Error(
+            `Unable to patch PHP FPM tester fixture: testConfig command marker not found in ${fpmTester}`,
+          );
+        }
+        next = next.replace(from, to);
+      }
+      if (!next.includes("file_exists($extensionDir . '/' . $extension . '.so')")) {
+        const from = `            foreach ($extensions as $extension) {\n                $cmd[] = '-dextension=' . $extension;\n            }`;
+        const to = `            foreach ($extensions as $extension) {\n                if (file_exists($extensionDir . '/' . $extension . '.so')) {\n                    $cmd[] = '-dextension=' . $extension;\n                }\n            }`;
+        if (!next.includes(from)) {
+          throw new Error(
+            `Unable to patch PHP FPM tester fixture: extension loading marker not found in ${fpmTester}`,
+          );
+        }
+        next = next.replace(from, to);
+      }
+      if (next !== text) writeFileSync(fpmTester, next, "utf8");
+    }
+  }
+
+  const fpmLogReader = join(sourceRoot, "sapi/fpm/tests/logreader.inc");
+  if (existsSync(fpmLogReader)) {
+    const text = readFileSync(fpmLogReader, "utf8");
+    if (!text.includes("TEST_FPM_LOG_TIMEOUT_SECONDS")) {
+      const from = `if (is_null($timeoutSeconds) && is_null($timeoutMicroseconds)) {\n            $timeoutSeconds      = 3;\n            $timeoutMicroseconds = 0;\n        }`;
+      const to = `if (is_null($timeoutSeconds) && is_null($timeoutMicroseconds)) {\n            $configuredTimeout = getenv('TEST_FPM_LOG_TIMEOUT_SECONDS');\n            $timeoutSeconds = $configuredTimeout !== false && is_numeric($configuredTimeout)\n                ? max(3, (int) $configuredTimeout)\n                : 3;\n            $timeoutMicroseconds = 0;\n        }`;
+      if (!text.includes(from)) {
+        throw new Error(
+          `Unable to patch PHP FPM logreader fixture: marker not found in ${fpmLogReader}`,
+        );
+      }
+      writeFileSync(fpmLogReader, text.replace(from, to), "utf8");
+    }
   }
 }
 
