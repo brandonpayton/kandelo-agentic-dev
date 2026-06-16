@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PHP_SRC="${PHP_SOURCE_DIR:-$REPO_ROOT/packages/registry/php/php-src}"
 
+host="${PHP_TEST_HOST:-node}"
 chunk_size="${PHP_TEST_CHUNK_SIZE:-500}"
 jobs="${PHP_TEST_JOBS:-4}"
 timeout_ms="${PHP_TEST_TIMEOUT_MS:-600000}"
@@ -23,23 +24,26 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/run-php-upstream-node-chunks.sh [options]
 
-Run the full php-src PHPT suite on the Kandelo Node host in restartable chunks.
-Each chunk invokes scripts/run-php-upstream-tests.sh in a fresh Node.js process,
-which prevents long monolithic runs from accumulating host/Wasm memory.
+Run the full php-src PHPT suite on a Kandelo host in restartable chunks.
+Each chunk invokes scripts/run-php-upstream-tests.sh in a fresh Node.js process.
+This prevents long monolithic Node-host runs from accumulating host/Wasm memory
+and gives browser-host runs resumable checkpoints.
 
 Options:
+  --host <node|browser>        Kandelo host to run (default: PHP_TEST_HOST or node)
   --chunk-size <n>             Tests per chunk (default: PHP_TEST_CHUNK_SIZE or 500)
   --jobs <n>                   PHPT concurrency inside each chunk (default: PHP_TEST_JOBS or 4)
   --timeout <ms>               Per PHPT section timeout (default: PHP_TEST_TIMEOUT_MS or 600000)
   --host-reset-interval <n>    Kernel reboot interval per worker (default: PHP_TEST_HOST_RESET_INTERVAL or 25)
   --start-offset <n>           Start at global sorted PHPT offset (default: 0)
-  --out-dir <dir>              Output directory (default: /tmp/kandelo-php-node-chunks-<timestamp>)
+  --out-dir <dir>              Output directory (default: /tmp/kandelo-php-<host>-chunks-<timestamp>)
   --force                      Re-run chunks even if their .done marker exists
   --summary-only               Aggregate an existing --out-dir without running chunks
   -h, --help                   Show this help
 
 Environment:
   PHP_SOURCE_DIR               php-src checkout (default: packages/registry/php/php-src)
+  PHP_TEST_HOST                Host default for --host (node or browser)
   PHP_WASM                     PHP wasm binary (default resolved by downstream harness)
   PHP_OPCACHE_SO               opcache.so path when testing opcache (recommended)
 
@@ -55,6 +59,7 @@ USAGE
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --host) [ "$#" -ge 2 ] || die "--host needs a value"; host="$2"; shift 2 ;;
     --chunk-size) [ "$#" -ge 2 ] || die "--chunk-size needs a value"; chunk_size="$2"; shift 2 ;;
     --jobs) [ "$#" -ge 2 ] || die "--jobs needs a value"; jobs="$2"; shift 2 ;;
     --timeout) [ "$#" -ge 2 ] || die "--timeout needs a value"; timeout_ms="$2"; shift 2 ;;
@@ -76,10 +81,14 @@ for numeric in chunk_size jobs timeout_ms host_reset_interval start_offset; do
 done
 [ "$chunk_size" -gt 0 ] || die "chunk_size must be > 0"
 [ "$jobs" -gt 0 ] || die "jobs must be > 0"
+case "$host" in
+  node|browser) ;;
+  *) die "--host must be node or browser, got: $host" ;;
+esac
 [ -d "$PHP_SRC" ] || die "PHP_SOURCE_DIR not found: $PHP_SRC"
 
 if [ -z "$out_dir" ]; then
-  out_dir="/tmp/kandelo-php-node-chunks-$(date -u +%Y%m%d%H%M%S)"
+  out_dir="/tmp/kandelo-php-$host-chunks-$(date -u +%Y%m%d%H%M%S)"
 fi
 mkdir -p "$out_dir"
 
@@ -87,6 +96,7 @@ metadata="$out_dir/metadata.env"
 {
   echo "REPO_ROOT=$REPO_ROOT"
   echo "PHP_SOURCE_DIR=$PHP_SRC"
+  echo "HOST=$host"
   echo "CHUNK_SIZE=$chunk_size"
   echo "JOBS=$jobs"
   echo "TIMEOUT_MS=$timeout_ms"
@@ -99,6 +109,7 @@ total=$(find "$PHP_SRC" -path '*/.git' -prune -o -path '*/.deps' -prune -o -path
 echo "$total" > "$out_dir/total-tests.txt"
 
 echo "PHP source: $PHP_SRC"
+echo "Host: $host"
 echo "Total discovered PHPTs: $total"
 echo "Output directory: $out_dir"
 
@@ -156,7 +167,7 @@ summary = {
 nonpassing = [r for r in results.values() if r.get("status") not in {"pass", "xfail"}]
 nonpassing.sort(key=lambda r: (r.get("status", ""), r.get("test", "")))
 lines = [
-    "# PHP Node PHPT Chunked Run Summary",
+    "# PHP PHPT Chunked Run Summary",
     "",
     f"Output directory: `{out_dir}`",
     f"Total discovered: {total}",
@@ -198,10 +209,10 @@ while [ "$offset" -lt "$total" ]; do
     continue
   fi
   rm -f "$jsonl" "$stderr" "$exit_file" "$done_file"
-  echo "[$(date -u +%H:%M:%S)] running chunk offset=$offset limit=$chunk_size jobs=$jobs timeout=$timeout_ms reset=$host_reset_interval"
+  echo "[$(date -u +%H:%M:%S)] running host=$host chunk offset=$offset limit=$chunk_size jobs=$jobs timeout=$timeout_ms reset=$host_reset_interval"
   set +e
   "$REPO_ROOT/scripts/run-php-upstream-tests.sh" \
-    --host node \
+    --host "$host" \
     --all \
     --offset "$offset" \
     --limit "$chunk_size" \

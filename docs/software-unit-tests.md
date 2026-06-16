@@ -30,7 +30,7 @@ results were invalidated by harness or external-service issues:
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Node | Chunked `--all`, current PR head `bc13ad8631a2` | 14,554 | 9 | 1 | 0 | 0 | 3,987 | 466 | 0 | 19,017 |
 
-The bounded final segment used the restartable chunk harness:
+The bounded final segment used the restartable chunk harness. The chunk wrapper defaults to `--host node` and can also checkpoint browser runs with `--host browser`:
 
 ```bash
 TEST_NON_ROOT_USER=nobody \
@@ -45,6 +45,7 @@ PHP_TEST_JOBS=2 \
 PHP_TEST_TIMEOUT_MS=240000 \
 PHP_TEST_HOST_RESET_INTERVAL=1 \
 scripts/run-php-upstream-node-chunks.sh \
+  --host node \
   --start-offset 8962 \
   --out-dir /tmp/kad-1-test-logs/php-node-bounded-chunks-from-8962-20260616075451 \
   --chunk-size 500 --jobs 2 --timeout 240000 --host-reset-interval 1
