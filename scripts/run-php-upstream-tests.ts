@@ -13,7 +13,9 @@ import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
 import {
   existsSync,
+  chmodSync,
   cpSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -257,6 +259,7 @@ const PASSTHROUGH_ENV_NAMES = [
   "SKIP_SLOW_TESTS",
   "TEST_FPM_DEBUG",
   "TEST_FPM_RUN_AS_ROOT",
+  "FPM_RUN_RESOURCE_HEAVY_TESTS",
   "TEST_NON_ROOT_USER",
 ];
 
@@ -502,6 +505,15 @@ function defaultPhpTestEnvArgs(): string[] {
     "TEST_FPM_EXTENSION_DIR=/usr/lib/php/extensions",
     "TZ=",
   ];
+}
+
+function parseOptionalNonNegativeInt(value: string | undefined, name: string): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer, got ${value}`);
+  }
+  return parsed;
 }
 
 function mergeEnvArgs(...groups: string[][]): string[] {
@@ -1032,6 +1044,8 @@ class NodePhpRunner implements PhpRunner {
     private ownsSourceRoot = false,
     private hostResetInterval = 50,
     private enableTcpNetwork = true,
+    private runUid?: number,
+    private runGid?: number,
   ) {
     this.virtualPhpPath = `/kandelo-bin/${basename(phpPath)}`;
   }
@@ -1249,6 +1263,8 @@ class NodePhpRunner implements PhpRunner {
           stdin,
           stdinIsPipe,
           pipeStdio: opts.pipeStdio,
+          uid: this.runUid,
+          gid: this.runGid,
           onStarted: (startedPid) => {
             pid = startedPid;
           },
@@ -1366,6 +1382,26 @@ function copySourceRootForNodeRunner(sourceRoot: string, index: number): string 
     },
   });
   return copyRoot;
+}
+
+function makeSourceTreeWritableByGuest(sourceRoot: string): void {
+  const stack = [sourceRoot];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const st = lstatSync(current);
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
+      chmodSync(current, 0o777);
+      for (const entry of readdirSync(current)) {
+        stack.push(join(current, entry));
+      }
+    } else {
+      // Non-root PHPT runs still generate per-test .php/.ini/.log fixtures in
+      // the mounted php-src checkout. Make the copied fixture tree writable
+      // to the guest user instead of weakening kernel credential checks.
+      chmodSync(current, (st.mode & 0o111) | 0o666);
+    }
+  }
 }
 
 async function startViteServer(): Promise<ChildProcess> {
@@ -1829,6 +1865,10 @@ Options:
   --offset <n>          Skip the first n selected tests
   --limit <n>           Run only the first n discovered tests
   --jobs <n>            Number of PHPTs to run concurrently (Node host only; default: 1)
+  --run-uid <n>         Run Node-host guest PHP processes as uid n
+                        (default: PHP_TEST_RUN_UID; root when unset)
+  --run-gid <n>         Run Node-host guest PHP processes as gid n
+                        (default: PHP_TEST_RUN_GID; root when unset)
   --host-reset-interval <n>
                         Reboot each Node-host Kandelo kernel after n PHPTs
                         per worker to reclaim host-side Wasm memory
@@ -1846,6 +1886,8 @@ Environment:
   PHP_EXTENSION_DIR     Additional directory/directories to scan for shared
                         extensions when PHP_WASM is outside the package bin dir
   PHP_SOURCE_DIR        Path to a php-src checkout/extract
+  PHP_TEST_RUN_UID      Optional Node-host guest uid for PHP processes
+  PHP_TEST_RUN_GID      Optional Node-host guest gid for PHP processes
 `);
 }
 
@@ -1857,6 +1899,8 @@ async function main() {
   let offset = 0;
   let limit: number | null = null;
   let jobs = 1;
+  let runUid = parseOptionalNonNegativeInt(process.env.PHP_TEST_RUN_UID, "PHP_TEST_RUN_UID");
+  let runGid = parseOptionalNonNegativeInt(process.env.PHP_TEST_RUN_GID, "PHP_TEST_RUN_GID");
   let hostResetInterval = parseInt(
     process.env.PHP_TEST_HOST_RESET_INTERVAL ?? "50",
     10,
@@ -1907,6 +1951,10 @@ async function main() {
       if (!Number.isFinite(jobs) || jobs < 1) {
         throw new Error(`invalid jobs: ${jobs}`);
       }
+    } else if (arg === "--run-uid" && args[i + 1]) {
+      runUid = parseOptionalNonNegativeInt(args[++i], "--run-uid");
+    } else if (arg === "--run-gid" && args[i + 1]) {
+      runGid = parseOptionalNonNegativeInt(args[++i], "--run-gid");
     } else if (arg === "--host-reset-interval" && args[i + 1]) {
       hostResetInterval = parseInt(args[++i], 10);
       if (!Number.isFinite(hostResetInterval) || hostResetInterval < 0) {
@@ -1970,6 +2018,11 @@ async function main() {
       console.error(
         `Node TCP/DNS bridge: ${enableTcpNetwork ? "enabled" : "disabled"}`,
       );
+      if (runUid !== undefined || runGid !== undefined) {
+        console.error(
+          `Node guest credentials: uid=${runUid ?? 0} gid=${runGid ?? runUid ?? 0}`,
+        );
+      }
     }
     console.error(`Tests: ${tests.length}`);
     console.error("");
@@ -1987,7 +2040,12 @@ async function main() {
   } else {
     for (let i = 0; i < jobs; i++) {
       const runnerSourceRoot =
-        jobs === 1 ? sourceRoot : copySourceRootForNodeRunner(sourceRoot, i + 1);
+        jobs === 1 && runUid === undefined && runGid === undefined
+          ? sourceRoot
+          : copySourceRootForNodeRunner(sourceRoot, i + 1);
+      if (runUid !== undefined || runGid !== undefined) {
+        makeSourceTreeWritableByGuest(runnerSourceRoot);
+      }
       runners.push(
         new NodePhpRunner(
           runnerSourceRoot,
@@ -1997,6 +2055,8 @@ async function main() {
           runnerSourceRoot !== sourceRoot,
           hostResetInterval,
           enableTcpNetwork,
+          runUid,
+          runGid,
         ),
       );
     }
