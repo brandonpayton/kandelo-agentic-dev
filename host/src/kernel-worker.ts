@@ -208,6 +208,8 @@ const SYS_RECVMSG = ABI_SYSCALLS.Recvmsg;
 const SYS_ACCEPT = ABI_SYSCALLS.Accept;
 const SYS_ACCEPT4 = ABI_SYSCALLS.Accept4;
 const SYS_CONNECT = ABI_SYSCALLS.Connect;
+const SYS_TIMES = ABI_SYSCALLS.Times;
+const CLK_TCK = 100;
 
 const MSG_DONTWAIT = 0x0040;
 const IPC_NOWAIT = 0o4000;
@@ -2366,6 +2368,11 @@ export class CentralizedKernelWorker {
       return;
     }
 
+    if (syscallNr === SYS_TIMES) {
+      this.handleTimes(channel, origArgs, logging ? logEntry : undefined);
+      return;
+    }
+
     // --- Futex: must operate on process memory, not kernel memory ---
     // The kernel's host_futex_wake/wait imports use kernel memory, but in
     // centralized mode the futex address is in process memory. Intercept
@@ -2860,7 +2867,7 @@ export class CentralizedKernelWorker {
     // After each syscall, check if the kernel has a pending Handler signal.
     // If so, dequeue it and write delivery info to the process channel.
     // The glue code (channel_syscall.c) will invoke the handler after waking.
-    this.dequeueSignalForDelivery(channel);
+    const deliveredSignal = this.dequeueSignalForDelivery(channel);
     this.assertKernelStackStage("after dequeueSignalForDelivery", kernelStackTrace, channel, syscallNr, origArgs);
 
     if (
@@ -2893,6 +2900,32 @@ export class CentralizedKernelWorker {
           SYSCALL_ARGS[syscallNr],
           retVal,
           errVal,
+        );
+        return;
+      }
+      if (deliveredSignal > 0) {
+        // A host-parked blocking syscall (accept/read/write/connect/etc.) uses
+        // EAGAIN as an internal "would block, retry later" marker. If a caught
+        // signal became deliverable during that park, POSIX requires the
+        // blocked syscall to return to user space so the signal handler can run
+        // instead of silently re-parking forever.
+        //
+        // Native kernels can run an SA_RESTART handler and then transparently
+        // restart some syscalls. Kandelo signal handlers execute cooperatively
+        // at syscall boundaries, so the correct boundary behavior here is to
+        // wake with EINTR; callers that want restart semantics can retry after
+        // observing the handler's side effects.
+        this.pollRetryDeadlines.delete(this.channelKey(channel));
+        if (logging) {
+          console.error(logEntry + ` = -1 (EINTR, interrupted by signal ${deliveredSignal})`);
+        }
+        this.completeChannel(
+          channel,
+          syscallNr,
+          origArgs,
+          SYSCALL_ARGS[syscallNr],
+          -1,
+          EINTR_ERRNO,
         );
         return;
       }
@@ -4473,6 +4506,49 @@ export class CentralizedKernelWorker {
     return Math.max(0, Math.min(delayMs, 0x7fffffff));
   }
 
+  private handleTimes(channel: ChannelInfo, origArgs: number[], logEntry?: string): void {
+    const tmsPtr = origArgs[0];
+    const ptrWidth = this.getPtrWidth(channel.pid);
+    const structSize = ptrWidth === 8 ? 32 : 16;
+    const processMem = new Uint8Array(channel.memory.buffer);
+
+    if (tmsPtr !== 0) {
+      if (!Number.isInteger(tmsPtr) || tmsPtr < 0 || tmsPtr + structSize > processMem.length) {
+        if (logEntry) console.error(logEntry + " = -1 (EFAULT)");
+        this.completeChannel(channel, SYS_TIMES, origArgs, undefined, -1, EFAULT);
+        return;
+      }
+
+      // POSIX times(2) reports CPU accounting in clock ticks. Kandelo does
+      // not currently account guest CPU time separately, which matches our
+      // getrusage baseline, so expose zero user/system ticks while still
+      // providing a valid tms struct. This is intentionally generic: callers
+      // can distinguish "no accounted CPU time" from "syscall unavailable".
+      const view = new DataView(channel.memory.buffer, tmsPtr, structSize);
+      if (ptrWidth === 8) {
+        for (let off = 0; off < structSize; off += 8) {
+          view.setBigInt64(off, 0n, true);
+        }
+      } else {
+        for (let off = 0; off < structSize; off += 4) {
+          view.setInt32(off, 0, true);
+        }
+      }
+    }
+
+    // Return elapsed real time in clock ticks since an arbitrary stable epoch.
+    // POSIX only requires a consistent epoch; Linux also documents that the
+    // return value may wrap. performance.now() keeps wasm32 results small
+    // enough to avoid immediate signed clock_t wrap in normal sessions.
+    const nowMs = typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+    const ticks = Math.floor((nowMs * CLK_TCK) / 1000);
+    if (logEntry) console.error(logEntry + ` = ${ticks}`);
+    this.dequeueSignalForDelivery(channel);
+    this.completeChannel(channel, SYS_TIMES, origArgs, undefined, ticks, 0);
+  }
+
   private completePendingSleep(pid: number): void {
     this.assertKernelStackContext("completePendingSleep entry", `pid=${pid}`);
     const entry = this.pendingSleeps.get(pid);
@@ -5145,6 +5221,7 @@ export class CentralizedKernelWorker {
     const eventsPtr = origArgs[1]; // output pointer in process memory
     const maxevents = origArgs[2];
     const timeoutMs = origArgs[3];
+    const retryKey = this.channelKey(channel);
     // origArgs[4] = sigmask ptr (process-space), origArgs[5] = sigset size
 
     if (maxevents <= 0) {
@@ -5165,19 +5242,37 @@ export class CentralizedKernelWorker {
       // No interests registered — return 0 immediately for timeout=0,
       // or block (EAGAIN) for non-zero timeout.
       if (timeoutMs === 0) {
+        this.pollRetryDeadlines.delete(retryKey);
         this.completeChannelRaw(channel, 0, 0);
         this.relistenChannel(channel);
         return;
       }
+      const deadline =
+        timeoutMs > 0
+          ? (this.pollRetryDeadlines.get(retryKey) ?? Date.now() + timeoutMs)
+          : -1;
+      if (deadline > 0) {
+        this.pollRetryDeadlines.set(retryKey, deadline);
+        if (Date.now() >= deadline) {
+          this.pendingPollRetries.delete(retryKey);
+          this.pollRetryDeadlines.delete(retryKey);
+          this.completeChannelRaw(channel, 0, 0);
+          this.relistenChannel(channel);
+          return;
+        }
+      } else {
+        this.pollRetryDeadlines.delete(retryKey);
+      }
       // For non-zero timeout with no interests, retry with delay to avoid starvation
       const retryFn = () => {
-        this.pendingPollRetries.delete(this.channelKey(channel));
+        this.pendingPollRetries.delete(retryKey);
         if (this.isChannelActive(channel)) {
           this.handleEpollPwait(channel, syscallNr, origArgs);
         }
       };
-      const timer = setTimeout(retryFn, 10);
-      this.pendingPollRetries.set(this.channelKey(channel), { timer, channel, pipeIndices: [] });
+      const retryMs = deadline > 0 ? Math.min(Math.max(deadline - Date.now(), 1), 10) : 10;
+      const timer = setTimeout(retryFn, retryMs);
+      this.pendingPollRetries.set(retryKey, { timer, channel, pipeIndices: [], deadline });
       return;
     }
 
@@ -5257,6 +5352,7 @@ export class CentralizedKernelWorker {
       return;
     }
     if (deliveredSignal > 0) {
+      this.pollRetryDeadlines.delete(retryKey);
       this.completeChannelRaw(channel, -EINTR_ERRNO, EINTR_ERRNO);
       this.relistenChannel(channel);
       return;
@@ -5264,6 +5360,7 @@ export class CentralizedKernelWorker {
 
     // If poll returned error (not EAGAIN), propagate it
     if (retVal < 0 && errVal !== EAGAIN) {
+      this.pollRetryDeadlines.delete(retryKey);
       this.completeChannelRaw(channel, retVal, errVal);
       this.relistenChannel(channel);
       return;
@@ -5295,6 +5392,7 @@ export class CentralizedKernelWorker {
 
     // If we got events, return them
     if (readyCount > 0) {
+      this.pollRetryDeadlines.delete(retryKey);
       this.completeChannelRaw(channel, readyCount, 0);
       this.relistenChannel(channel);
       return;
@@ -5303,9 +5401,27 @@ export class CentralizedKernelWorker {
     // No events ready — handle timeout
     if (timeoutMs === 0) {
       // Non-blocking: return 0 events
+      this.pollRetryDeadlines.delete(retryKey);
       this.completeChannelRaw(channel, 0, 0);
       this.relistenChannel(channel);
       return;
+    }
+
+    const deadline =
+      timeoutMs > 0
+        ? (this.pollRetryDeadlines.get(retryKey) ?? Date.now() + timeoutMs)
+        : -1;
+    if (deadline > 0) {
+      this.pollRetryDeadlines.set(retryKey, deadline);
+      if (Date.now() >= deadline) {
+        this.pendingPollRetries.delete(retryKey);
+        this.pollRetryDeadlines.delete(retryKey);
+        this.completeChannelRaw(channel, 0, 0);
+        this.relistenChannel(channel);
+        return;
+      }
+    } else {
+      this.pollRetryDeadlines.delete(retryKey);
     }
 
     // Blocking: retry via setTimeout to avoid starving other processes.
@@ -5314,17 +5430,19 @@ export class CentralizedKernelWorker {
     const { pipeIndices, acceptIndices } = this.resolveEpollReadinessIndices(channel.pid);
 
     const retryFn = () => {
-      this.pendingPollRetries.delete(this.channelKey(channel));
+      this.pendingPollRetries.delete(retryKey);
       if (this.isChannelActive(channel)) {
         this.handleEpollPwait(channel, syscallNr, origArgs);
       }
     };
-    const timer = setTimeout(retryFn, 10);
-    this.pendingPollRetries.set(this.channelKey(channel), {
+    const retryMs = deadline > 0 ? Math.min(Math.max(deadline - Date.now(), 1), 10) : 10;
+    const timer = setTimeout(retryFn, retryMs);
+    this.pendingPollRetries.set(retryKey, {
       timer,
       channel,
       pipeIndices,
       acceptIndices,
+      deadline,
     });
   }
 
@@ -6377,13 +6495,9 @@ export class CentralizedKernelWorker {
       ((pid: number) => number) | undefined;
     if (clearForkChild) clearForkChild(childPid);
 
-    // Clear the child's blocked signal mask. With wpk_fork instrumentation,
-    // musl's __restore_sigs after fork() runs in the child, but we clear it
-    // here too for safety. Without fork instrumentation, the child re-executes
-    // _start and never gets __restore_sigs.
-    const resetSignalMask = this.kernelInstance!.exports.kernel_reset_signal_mask as
-      ((pid: number) => number) | undefined;
-    if (resetSignalMask) resetSignalMask(childPid);
+    // POSIX fork inherits the caller's signal mask. Do not clear it here:
+    // runtimes often block signals around fork and unblock them in the child
+    // only after child-specific handlers are installed.
 
     // If the syscall arrived on a thread channel (registered via clone()
     // with tid > 0), the wpk_fork save buffer is at THIS channel's offset
@@ -6634,8 +6748,11 @@ export class CentralizedKernelWorker {
 
   /**
    * Read a null-terminated string from process memory at the given pointer.
+   * The default bound is intentionally much larger than PATH_MAX because this
+   * helper also decodes exec argv/envp entries, and POSIX environments commonly
+   * carry multi-kilobyte values (for example descriptor-inheritance metadata).
    */
-  private readCStringFromProcess(mem: Uint8Array, ptr: number, maxLen = 4096): string {
+  private readCStringFromProcess(mem: Uint8Array, ptr: number, maxLen = 1024 * 1024): string {
     if (ptr === 0) return "";
     let len = 0;
     while (ptr + len < mem.length && mem[ptr + len] !== 0 && len < maxLen) {

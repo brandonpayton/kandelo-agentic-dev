@@ -81,6 +81,11 @@ const RUN_TESTS_BASE_INI = [
   "zend.exception_ignore_args=0",
 ];
 
+const FAILURE_SNIPPET_BYTES = Math.max(
+  2000,
+  parseInt(process.env.PHP_TEST_FAILURE_SNIPPET_BYTES ?? "2000", 10) || 2000,
+);
+
 type HostKind = "node" | "browser";
 type TestStatus =
   | "pass"
@@ -493,6 +498,7 @@ function defaultPhpTestEnvArgs(): string[] {
     // The fixture patch below teaches the FPM tester helper to honor this.
     `TEST_FPM_LOG_TIMEOUT_SECONDS=${process.env.TEST_FPM_LOG_TIMEOUT_SECONDS ?? "20"}`,
     `TEST_FPM_CHECK_CONNECTION_ATTEMPTS=${process.env.TEST_FPM_CHECK_CONNECTION_ATTEMPTS ?? "200"}`,
+    `TEST_FPM_READ_WRITE_TIMEOUT_MS=${process.env.TEST_FPM_READ_WRITE_TIMEOUT_MS ?? "20000"}`,
     "TEST_FPM_EXTENSION_DIR=/usr/lib/php/extensions",
     "TZ=",
   ];
@@ -656,6 +662,9 @@ function preparePhpTestFixtures(sourceRoot: string): void {
   //   but the shipped FPM tester helper does not define that method.
   // - logreader.inc has a native three-second default that is too short for
   //   OPcache preload startup under emulation.
+  // - fcgi.inc has a native five-second client read/write timeout; under
+  //   wasm emulation, OPcache preload requests can legitimately take longer
+  //   while still producing the correct FastCGI response.
   //
   // These changes only affect the copied PHPT fixture tree used by the
   // harness. They do not change PHP runtime behavior or Kandelo kernel
@@ -730,6 +739,21 @@ function preparePhpTestFixtures(sourceRoot: string): void {
         );
       }
       writeFileSync(fpmLogReader, text.replace(from, to), "utf8");
+    }
+  }
+
+  const fpmFcgi = join(sourceRoot, "sapi/fpm/tests/fcgi.inc");
+  if (existsSync(fpmFcgi)) {
+    const text = readFileSync(fpmFcgi, "utf8");
+    if (!text.includes("TEST_FPM_READ_WRITE_TIMEOUT_MS")) {
+      const from = `        $this->transport = $transport;\n    }`;
+      const to = `        $this->transport = $transport;\n\n        $configuredTimeout = getenv('TEST_FPM_READ_WRITE_TIMEOUT_MS');\n        if ($configuredTimeout !== false && is_numeric($configuredTimeout)) {\n            $this->_readWriteTimeout = max($this->_readWriteTimeout, (int) $configuredTimeout);\n        }\n    }`;
+      if (!text.includes(from)) {
+        throw new Error(
+          `Unable to patch PHP FPM FastCGI fixture: constructor marker not found in ${fpmFcgi}`,
+        );
+      }
+      writeFileSync(fpmFcgi, text.replace(from, to), "utf8");
     }
   }
 
@@ -875,6 +899,12 @@ function compareExpectation(
     };
   }
   return { ok: false, detail: "no supported EXPECT section" };
+}
+
+function failureSnippet(actualOutput: string): string {
+  return normalizeOutput(actualOutput)
+    .slice(0, FAILURE_SNIPPET_BYTES)
+    .replace(/\n/g, "\\n");
 }
 
 function unsupportedReason(test: PhptTest): string | null {
@@ -1112,7 +1142,7 @@ class NodePhpRunner implements PhpRunner {
         const name = ABI_SYSCALL_NAMES[event.nr] ?? `syscall_${event.nr}`;
         if (filters.size === 0 || filters.has(name) || filters.has(String(event.nr))) {
           console.error(
-            `[php-phpt-syscall] pid=${event.pid} ${name}(${event.args.join(",")})`,
+            `[php-phpt-syscall t=${event.t.toFixed(3)}] pid=${event.pid} ${name}(${event.args.join(",")})`,
           );
         }
       });
@@ -1718,9 +1748,7 @@ async function runPhpt(
   let detail = main.error;
   let actualOutput = main.output ?? `${main.stdout}${main.stderr}`;
   if (main.error === "TIMEOUT" && actualOutput) {
-    const snippet = normalizeOutput(actualOutput)
-      .slice(0, 2000)
-      .replace(/\n/g, "\\n");
+    const snippet = failureSnippet(actualOutput);
     detail = `TIMEOUT; partial actual: ${snippet}`;
   }
   if (main.error !== "TIMEOUT") {
@@ -1730,9 +1758,7 @@ async function runPhpt(
     ok = compared.ok;
     detail = compared.detail;
     if (!ok && detail) {
-      const snippet = normalizeOutput(actualOutput)
-        .slice(0, 2000)
-        .replace(/\n/g, "\\n");
+      const snippet = failureSnippet(actualOutput);
       const errorDetail = main.error ? `; error=${main.error}` : "";
       detail = `${detail}; exit=${main.exitCode}${errorDetail}; actual: ${snippet}`;
     }
@@ -1751,9 +1777,7 @@ async function runPhpt(
       ok = compared.ok;
       detail = compared.detail;
       if (!ok && detail) {
-        const snippet = normalizeOutput(actualOutput)
-          .slice(0, 2000)
-          .replace(/\n/g, "\\n");
+        const snippet = failureSnippet(actualOutput);
         const errorDetail = main.error ? `; error=${main.error}` : "";
         detail = `${detail}; exit=${main.exitCode}${errorDetail}; actual: ${snippet}`;
       }
