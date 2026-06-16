@@ -54,7 +54,7 @@ Outputs:
   chunk-<offset>.jsonl         JSONL PHPT results for that chunk
   chunk-<offset>.stderr        Harness stderr for that chunk
   chunk-<offset>.exit          Harness exit status for that chunk
-  chunk-<offset>.done          Marker written after the chunk command exits
+  chunk-<offset>.done          Marker written only after the chunk command succeeds
   summary.json                 Aggregated status counts and untested count
   summary.md                   Human-readable summary
 USAGE
@@ -233,9 +233,15 @@ while [ "$offset" -lt "$total" ]; do
   status=$?
   set -e
   echo "$status" > "$exit_file"
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$done_file"
-  aggregate || true
-  offset=$((offset + chunk_size))
+  if [ "$status" -eq 0 ]; then
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$done_file"
+    aggregate || true
+    offset=$((offset + chunk_size))
+  else
+    echo "chunk offset $offset failed with status $status; see $stderr" >&2
+    aggregate || true
+    exit "$status"
+  fi
 done
 
 {
