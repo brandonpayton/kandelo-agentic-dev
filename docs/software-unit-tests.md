@@ -3,7 +3,7 @@
 This project proves Kandelo by running real upstream/project test suites for
 large guest software on both Node.js and browser hosts where possible.
 
-Status date: 2026-06-15.
+Status date: 2026-06-16.
 
 ## Current Status
 
@@ -12,39 +12,59 @@ Status date: 2026-06-15.
 | MariaDB | `mysql-test/main/*.test` through `mysqltest` against `mariadbd` | Started full run, stopped after 710 results due Node heap OOM | Browser run reached the harness but failed VFS/init fetch and recorded 1149 failures |
 | SQLite direct | Direct execution of each upstream Tcl `test/*.test` script once through `testfixture` | Completed 1159 scripts: 912 PASS, 36 FAIL, 15 XFAIL, 196 XPASS | Completed 1159 scripts: 876 PASS, 62 FAIL, 38 XFAIL, 173 XPASS, 10 TIME |
 | SQLite official | Upstream `test/testrunner.tcl` permutations `full` and `all` | Completed corrected Node `full --jobs 2`: 1416/1416 official Tcl jobs finalized, 1416 passed, 0 failed, 1,703,255 SQLite internal cases, 0 case errors. The prior `busy2.test` failure was fixed by rebuilding the SQLite artifacts with `SQLITE_ENABLE_SETLK_TIMEOUT=2`, matching SQLite's own official lock-timeout test configuration; see `docs/sqlite-official-test-report.md` | Same inventory: 1416 `full` jobs and 10523 `all` jobs. Current browser iteration is past the earlier `writecrash.test` blocker and reached a timeout/stall checkpoint at 40/1416 jobs, 12,206 cases, 0 case errors, with `test/sort4.test` still running. Node isolated `sort4.test` passes 11/11 in 54s; browser isolated `sort4.test` was still at 0/1 after about 3 minutes before maintenance stop. See `docs/sqlite-official-test-report.md`. |
-| PHP | PHPT runtime tests from the PHP source tree | Harness wired for php-src discovery and Node execution. Current PR iteration has smoke/shard results documented in the PR; full run is still memory/time constrained in shared AO workers. | Harness wired for browser execution via the `php-test` Vite page and VFS image. Current PR iteration has smoke/shard results documented in the PR; full run is still memory/time constrained in shared AO workers. |
+| PHP | PHPT runtime tests from the PHP source tree | Full discovered Node PHPT set completed on PR #2: 19,017/19,017 covered, 14,554 PASS, 0 FAIL, 0 TIMEOUT, 9 XFAIL, 1 XPASS, 3,987 SKIP, 466 UNSUPPORTED. | Browser harness is wired through the `php-test` Vite page and VFS image; current PR #2 browser coverage is still partial: 2,363/19,017 covered, 2,141 PASS, 2 FAIL, 1 XFAIL, 212 SKIP, 7 UNSUPPORTED. |
 | SpiderMonkey smoke | Kandelo-authored shell coverage tests, not Mozilla's official suite | Completed 17/17 PASS | Completed 17/17 PASS |
 | SpiderMonkey official | Mozilla `jstests.py` and `jit_test.py` harnesses using `js.wasm` through a Kandelo shell wrapper | Paused until the process-memory architecture bug is fixed, so Node/browser results stay comparable | Paused until the browser process-memory architecture bug is fixed |
 | Node.js library | Upstream Node.js `test/parallel/test-*.js` and `test/sequential/test-*.js` through the SpiderMonkey-backed Node-compatible runtime | Completed 3925 tests: 336 PASS, 3264 FAIL, 325 TIME | Completed 3925 tests: 339 PASS, 3564 FAIL, 22 TIME |
 
 Logs from the 2026-05-28 full runs are under `test-runs/software-unit-tests/`.
 
-## 2026-06-15 PHP PHPT Node Current-Head Full Run
+## 2026-06-16 PHP PHPT Node Current-Head Full Run
 
 php-src discovery finds **19,017** `.phpt` files from PHP **8.3.15**. The
-current-head Node run on PR #2 completed the full discovered set:
+current-head Node run on PR #2 completed the full discovered set. The aggregate
+uses chronological chunk results plus targeted reruns for tests whose earlier
+results were invalidated by harness or external-service issues:
 
-| Host | Scope | Pass | XFAIL | Fail | Timeout | Skip | Unsupported | Untested | Total |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Node | Chunked `--all`, current PR head `091dc220c05f` | 14,443 | 9 | 0 | 0 | 4,099 | 466 | 0 | 19,017 |
+| Host | Scope | Pass | XFAIL | XPASS | Fail | Timeout | Skip | Unsupported | Untested | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Node | Chunked `--all`, current PR head `bc13ad8631a2` | 14,554 | 9 | 1 | 0 | 0 | 3,987 | 466 | 0 | 19,017 |
 
-The run used the restartable chunk harness:
+The bounded final segment used the restartable chunk harness:
 
 ```bash
 TEST_NON_ROOT_USER=nobody \
+TEST_FPM_RUN_AS_ROOT=1 \
+PHP_TEST_FAILURE_SNIPPET_BYTES=5000 \
 PHP_WASM=/tmp/kad-php-dynfork.wasm \
+PHP_FPM_WASM="$PWD/packages/registry/php/bin/php-fpm.wasm" \
 PHP_OPCACHE_SO=/tmp/kad-opcache-sidefork.so \
 PHP_EXTENSION_DIR="$PWD/packages/registry/php/bin" \
+PHP_TEST_CHUNK_SIZE=500 \
+PHP_TEST_JOBS=2 \
+PHP_TEST_TIMEOUT_MS=240000 \
+PHP_TEST_HOST_RESET_INTERVAL=1 \
 scripts/run-php-upstream-node-chunks.sh \
-  --chunk-size 250 --jobs 4 --timeout 600000 \
-  --host-reset-interval 10 \
-  --out-dir /tmp/kad-1-test-logs/php-node-chunks-20260615173607-mmap-hints
+  --start-offset 8962 \
+  --out-dir /tmp/kad-1-test-logs/php-node-bounded-chunks-from-8962-20260616075451 \
+  --chunk-size 500 --jobs 2 --timeout 240000 --host-reset-interval 1
 ```
 
-The aggregate initially had 141 untested `Zend/tests/type_declarations/*`
-PHPTs because chunk `03750` was interrupted by a local `node_modules/tsx`
-race during `npm ci`. Rerunning exactly those PHPTs and appending the JSONL
-results completed coverage with **0 fail** and **0 timeout**.
+Important reruns included:
+
+- `Zend/tests/generators/bug71441.phpt`, which now passes after increasing the
+  default Node host worker stack from 16 MiB to 32 MiB. This is a general host
+  stability change for deep guest stacks, not PHP-specific behavior.
+- FPM non-root/virtual-ownership coverage, which now passes after allowing
+  host-backed mounts to expose stable virtual uid/gid metadata to the guest.
+- Two online `httpbin.org` HTTP/1.1 PHPTs, which are now counted as upstream
+  skips under `SKIP_ONLINE_TESTS=1` after host `curl --http1.1` confirmed
+  `httpbin.org` currently returns HTTP/1.1 503. This is an external service
+  availability issue, not a Kandelo kernel failure.
+
+The only XPASS is
+`sapi/fpm/tests/log-bwd-multiple-msgs-stdout-stderr.phpt`, an upstream
+intermittent XFAIL that passed locally.
 
 Current skip/unsupported coverage gaps should be reduced through normal
 runtime packaging and harness support:
@@ -52,7 +72,8 @@ runtime packaging and harness support:
 - Missing optional PHP extensions/dependencies: `intl`, `oci8`, `gd`, `curl`,
   `ldap`, `ffi`, `gmp`, `imap`, `zip`, `pgsql`, and related extension suites.
 - External services: MySQL/PDO MySQL connection tests require a running
-  compatible database service.
+  compatible database service; the two `httpbin.org` online tests are skipped
+  while HTTP/1.1 requests to that service return 503.
 - FPM/CGI/web PHPTs: the Node harness can now stage `php-fpm` when
   `PHP_FPM_WASM` is set, and passes upstream's `TEST_FPM_RUN_AS_ROOT` control
   env through to guest tests. This exposes real FPM coverage instead of
@@ -67,9 +88,9 @@ runtime packaging and harness support:
     sapi/fpm/tests/<test>.phpt
   ```
 
-  Some opcache/FPM preload tests currently expose a php-src fixture mismatch
-  (`FPM\Tester::getLogLines()` is referenced but absent from this PHP 8.3.15
-  `sapi/fpm/tests/tester.inc`), so they are not force-counted as passing.
+- web/CGI PHPT sections such as `EXPECTHEADERS`, `POST`, `POST_RAW`, `GET`,
+  `COOKIE`, `CGI`, `GZIP_POST`, `DEFLATE_POST`, and `REDIRECTTEST` still need
+  general harness support.
 - Fibers require a real general `getcontext`/`makecontext`/`swapcontext`
   implementation or another Wasm context-switching backend.
 - phpdbg PHPTs require building and packaging the phpdbg SAPI.
