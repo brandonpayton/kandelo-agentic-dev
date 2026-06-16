@@ -95,6 +95,10 @@ export interface NodeKernelHostOptions {
     mountPoint: string;
     hostPath: string;
     readonly?: boolean;
+    /** Virtual owner for existing host-backed mount entries. Defaults to root. */
+    uid?: number;
+    /** Virtual group for existing host-backed mount entries. Defaults to root. */
+    gid?: number;
   }>;
 }
 

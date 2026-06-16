@@ -27,6 +27,11 @@ interface VirtualMetadata {
 export class NativeMetadataOverlay {
   private readonly entries = new Map<string, VirtualMetadata>();
 
+  constructor(
+    private readonly defaultUid = 0,
+    private readonly defaultGid = 0,
+  ) {}
+
   toStatResult(s: Stats): StatResult {
     const metadata = this.entries.get(this.key(s));
     const nativeType = s.mode & FILE_TYPE_MASK;
@@ -40,8 +45,8 @@ export class NativeMetadataOverlay {
       ino: s.ino,
       mode,
       nlink: s.nlink,
-      uid: metadata?.uid ?? 0,
-      gid: metadata?.gid ?? 0,
+      uid: metadata?.uid ?? this.defaultUid,
+      gid: metadata?.gid ?? this.defaultGid,
       size: s.size,
       atimeMs: metadata?.atimeMs ?? s.atimeMs,
       mtimeMs: metadata?.mtimeMs ?? s.mtimeMs,

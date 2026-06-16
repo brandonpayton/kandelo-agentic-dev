@@ -1122,7 +1122,12 @@ class NodePhpRunner implements PhpRunner {
           : {}),
       },
       extraMounts: [
-        { mountPoint: "/php-src", hostPath: this.sourceRoot },
+        {
+          mountPoint: "/php-src",
+          hostPath: this.sourceRoot,
+          uid: this.runUid,
+          gid: this.runGid ?? this.runUid,
+        },
         {
           mountPoint: "/kandelo-bin",
           hostPath: binaryMountRoot,

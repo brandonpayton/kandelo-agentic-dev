@@ -102,7 +102,11 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 
-const DEFAULT_NODE_WORKER_STACK_SIZE_MB = 16;
+// Wasm guest stacks consume the embedding worker's native stack when engines
+// recurse through Wasm frames. Keep the default high enough for stack-heavy
+// POSIX workloads while retaining an environment override for constrained
+// embedders.
+const DEFAULT_NODE_WORKER_STACK_SIZE_MB = 32;
 
 function currentModuleUrl(): string {
   if (typeof __filename !== "undefined") return pathToFileURL(__filename).href;

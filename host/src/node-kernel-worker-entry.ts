@@ -599,6 +599,8 @@ function buildVirtualPlatformIO(
     mountPoint: string;
     hostPath: string;
     readonly?: boolean;
+    uid?: number;
+    gid?: number;
   }>,
 ): VirtualPlatformIO {
   sessionDir = mkdtempSync(join(tmpdir(), "wasm-posix-session-"));
@@ -612,7 +614,10 @@ function buildVirtualPlatformIO(
   shmfs.chmod("/", 0o1777);
   const extras: MountConfig[] = (extraMounts ?? []).map((m) => ({
     mountPoint: m.mountPoint,
-    backend: new HostFileSystem(m.hostPath, m.mountPoint),
+    backend: new HostFileSystem(m.hostPath, m.mountPoint, {
+      uid: m.uid,
+      gid: m.gid,
+    }),
     readonly: m.readonly,
   }));
   const mounts = [
