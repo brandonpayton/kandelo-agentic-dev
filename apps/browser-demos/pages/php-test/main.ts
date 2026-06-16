@@ -25,6 +25,7 @@ interface RunPhpScriptResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  output?: string;
   error?: string;
   durationMs: number;
 }
@@ -116,11 +117,20 @@ async function init() {
 
     let stdout = "";
     let stderr = "";
+    let output = "";
     const kernel = new BrowserKernel({
       memfs: fs,
       maxWorkers: 4,
-      onStdout: (data) => { stdout += bytesToBinaryString(data); },
-      onStderr: (data) => { stderr += bytesToBinaryString(data); },
+      onStdout: (data) => {
+        const text = bytesToBinaryString(data);
+        stdout += text;
+        output += text;
+      },
+      onStderr: (data) => {
+        const text = bytesToBinaryString(data);
+        stderr += text;
+        output += text;
+      },
     });
 
     const stdin = request.stdin == null ? undefined : binaryStringToBytes(request.stdin);
@@ -147,13 +157,14 @@ async function init() {
           setTimeout(() => reject(new Error("TIMEOUT")), request.timeoutMs ?? 60_000),
         ),
       ]);
-      return { exitCode, stdout, stderr, durationMs: Math.round(performance.now() - start) };
+      return { exitCode, stdout, stderr, output, durationMs: Math.round(performance.now() - start) };
     } catch (err: any) {
       const message = err?.message || String(err);
       return {
         exitCode: -1,
         stdout,
         stderr,
+        output,
         error: message.includes("TIMEOUT") ? "TIMEOUT" : message,
         durationMs: Math.round(performance.now() - start),
       };
