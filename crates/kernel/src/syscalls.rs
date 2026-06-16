@@ -1012,8 +1012,10 @@ pub fn sys_close(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<(
                         crate::socket::udp_unregister(proc.pid, sock_idx);
                         let _ = host.host_udp_unbind(sock_idx as i32);
                     }
-                    if sock.domain == crate::socket::SocketDomain::Inet
-                        && sock.sock_type == crate::socket::SocketType::Stream
+                    if matches!(
+                        sock.domain,
+                        crate::socket::SocketDomain::Inet | crate::socket::SocketDomain::Inet6
+                    ) && sock.sock_type == crate::socket::SocketType::Stream
                     {
                         crate::socket::tcp_unregister(proc.pid, sock_idx);
                     }
@@ -5669,6 +5671,16 @@ pub(crate) fn is_unspecified_addr6(addr: [u8; 16]) -> bool {
     addr == [0; 16]
 }
 
+fn ipv6_v6only(sock: &crate::socket::SocketInfo) -> bool {
+    let value = sock
+        .get_option(
+            wasm_posix_shared::socket::IPPROTO_IPV6,
+            wasm_posix_shared::socket::IPV6_V6ONLY,
+        )
+        .unwrap_or(0);
+    value != 0
+}
+
 fn is_supported_udp_bind_addr(addr: [u8; 4]) -> bool {
     addr == [0, 0, 0, 0]
         || is_loopback_addr(addr)
@@ -6945,7 +6957,8 @@ pub fn sys_getsockopt(proc: &mut Process, fd: i32, level: u32, optname: u32) -> 
         },
         IPPROTO_IPV6 => match optname {
             IPV6_MULTICAST_IF | IPV6_MULTICAST_HOPS | IPV6_MULTICAST_LOOP
-            | IPV6_RECVPKTINFO | IPV6_RECVTCLASS | IPV6_DONTFRAG | IPV6_TCLASS => {
+            | IPV6_RECVPKTINFO | IPV6_RECVTCLASS | IPV6_DONTFRAG | IPV6_TCLASS
+            | IPV6_V6ONLY => {
                 Ok(sock.get_option(level, optname).unwrap_or(0))
             }
             _ => Err(Errno::ENOPROTOOPT),
@@ -7212,6 +7225,16 @@ pub fn sys_setsockopt(
             _ => Err(Errno::ENOPROTOOPT),
         },
         IPPROTO_IPV6 => match optname {
+            IPV6_V6ONLY => {
+                if sock.domain != crate::socket::SocketDomain::Inet6 {
+                    return Err(Errno::ENOPROTOOPT);
+                }
+                if sock.bind_port != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                sock.set_option(level, optname, if value != 0 { 1 } else { 0 });
+                Ok(())
+            }
             IPV6_MULTICAST_IF | IPV6_MULTICAST_HOPS | IPV6_MULTICAST_LOOP
             | IPV6_PKTINFO | IPV6_RECVPKTINFO | IPV6_RECVTCLASS | IPV6_DONTFRAG
             | IPV6_TCLASS => {
@@ -7336,9 +7359,14 @@ pub fn sys_bind(
                 port
             };
 
-            // Kandelo currently implements AF_INET6 as in-kernel loopback.
-            // Do not register it in the IPv4 TCP binding table: IPv6 ::1 and
-            // IPv4 127.0.0.1 can legally bind the same port independently.
+            // Linux defaults AF_INET6 sockets to dual-stack unless
+            // IPV6_V6ONLY is enabled. A wildcard IPv6 stream bind therefore
+            // also occupies the IPv4 port space and must conflict with an
+            // AF_INET bind to the same port. Specific ::1 binds stay IPv6-only
+            // and can coexist with 127.0.0.1.
+            if is_unspecified_addr6(ip) && !ipv6_v6only(sock) {
+                crate::socket::tcp_register(proc.pid, sock_idx, [0, 0, 0, 0], assigned_port)?;
+            }
             let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
             sock.bind_addr6 = ip;
             sock.bind_port = assigned_port;
@@ -7443,9 +7471,9 @@ pub fn sys_listen(
         return Err(Errno::ENOTSOCK);
     }
     let sock_idx = (-(ofd.host_handle + 1)) as usize;
-    let (domain, sock_type, state) = {
+    let (domain, sock_type, state, v6only) = {
         let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
-        (sock.domain, sock.sock_type, sock.state)
+        (sock.domain, sock.sock_type, sock.state, ipv6_v6only(sock))
     };
     if sock_type != SocketType::Stream {
         return Err(Errno::EOPNOTSUPP);
@@ -7464,7 +7492,14 @@ pub fn sys_listen(
                     }
                     p
                 };
-                if domain == SocketDomain::Inet {
+                if domain == SocketDomain::Inet
+                    || (domain == SocketDomain::Inet6 && !v6only)
+                {
+                    // listen(2) on an unbound INET stream socket auto-binds
+                    // to the wildcard address. Linux's default AF_INET6
+                    // wildcard listener is dual-stack, so reserve the IPv4
+                    // wildcard port as well unless IPV6_V6ONLY was set before
+                    // listen().
                     crate::socket::tcp_register(proc.pid, sock_idx, [0, 0, 0, 0], assigned_port)?;
                 }
                 let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;

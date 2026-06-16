@@ -623,6 +623,7 @@ pub mod socket {
     pub const IPV6_MULTICAST_IF: u32 = 17;
     pub const IPV6_MULTICAST_HOPS: u32 = 18;
     pub const IPV6_MULTICAST_LOOP: u32 = 19;
+    pub const IPV6_V6ONLY: u32 = 26;
     pub const IPV6_RECVPKTINFO: u32 = 49;
     pub const IPV6_PKTINFO: u32 = 50;
     pub const IPV6_DONTFRAG: u32 = 62;
