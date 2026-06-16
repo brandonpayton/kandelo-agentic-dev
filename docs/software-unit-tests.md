@@ -30,7 +30,7 @@ results were invalidated by harness or external-service issues:
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Node | Chunked `--all`, current PR head `bc13ad8631a2` | 14,554 | 9 | 1 | 0 | 0 | 3,987 | 466 | 0 | 19,017 |
 
-The bounded final segment used the restartable chunk harness. The chunk wrapper defaults to `--host node` and can also checkpoint browser runs with `--host browser`; use `--rebuild-vfs` for browser after changing `PHP_WASM`, `PHP_OPCACHE_SO`, or `PHP_EXTENSION_DIR` so shared extensions such as `zend_test.so` are present in the image:
+The bounded final segment used the restartable chunk harness. The chunk wrapper defaults to `--host node` and can also checkpoint browser runs with `--host browser`; use `--rebuild-vfs` for browser after changing `PHP_WASM`, `PHP_OPCACHE_SO`, or `PHP_EXTENSION_DIR` so shared extensions such as `zend_test.so` are present in the image. The VFS builder honors an explicit `PHP_OPCACHE_SO` by writing it to `/usr/lib/php/extensions/opcache.so` after scanning `PHP_EXTENSION_DIR`, so a stale directory entry cannot override the requested OPcache side module:
 
 ```bash
 TEST_NON_ROOT_USER=nobody \
@@ -84,7 +84,7 @@ runtime packaging and harness support:
   TEST_FPM_RUN_AS_ROOT=1 \
   PHP_WASM="$PWD/packages/registry/php/bin/php.wasm" \
   PHP_FPM_WASM="$PWD/packages/registry/php/bin/php-fpm.wasm" \
-  PHP_OPCACHE_SO="$PWD/packages/registry/php/bin/opcache.so" \
+  PHP_OPCACHE_SO=/tmp/kad-opcache-sidefork.so \
   scripts/run-php-upstream-tests.sh --host node --json \
     sapi/fpm/tests/<test>.phpt
   ```

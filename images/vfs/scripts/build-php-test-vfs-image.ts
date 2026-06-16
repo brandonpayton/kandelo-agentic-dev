@@ -167,6 +167,18 @@ async function main() {
       );
     }
   }
+  if (OPCACHE_SO && existsSync(OPCACHE_SO)) {
+    // PHP_OPCACHE_SO is the explicit harness override for the OPcache side
+    // module. Honor it even when PHP_EXTENSION_DIR also contains an
+    // opcache.so; otherwise browser PHPT runs can silently package a stale
+    // or non-side-module opcache under the canonical extension path while the
+    // runner advertises OPcache as available.
+    writeVfsBinary(
+      fs,
+      "/usr/lib/php/extensions/opcache.so",
+      new Uint8Array(readFileSync(OPCACHE_SO)),
+    );
+  }
 
   const phptDirs = collectPhptDirs(phpSrc);
   console.log(`  Writing ${phptDirs.length} PHPT directories...`);
