@@ -5579,7 +5579,10 @@ export class CentralizedKernelWorker {
     const ifreqPtr = origArgs[2];
     const nul = processMem.indexOf(0, ifreqPtr);
     const end = nul >= ifreqPtr && nul < ifreqPtr + 16 ? nul : ifreqPtr + 16;
-    const name = new TextDecoder().decode(processMem.subarray(ifreqPtr, end));
+    // Browser TextDecoder rejects SharedArrayBuffer-backed views. Copy the
+    // guest ifr_name bytes before decoding; ioctl handlers must work for
+    // process memories backed by SAB.
+    const name = new TextDecoder().decode(new Uint8Array(processMem.subarray(ifreqPtr, end)));
 
     if (name !== VIRTUAL_IFACE_NAME) {
       this.completeChannelRaw(channel, -ENODEV, ENODEV);
