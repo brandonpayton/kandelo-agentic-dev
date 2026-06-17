@@ -184,6 +184,7 @@ function shouldExclude(sourceRoot: string, relPath: string): boolean {
   const base = relPath.split("/").pop() ?? relPath;
   if (relPath.includes("/.git/") || relPath.includes("/.deps/") || relPath.includes("/.libs/")) return true;
   if (base.startsWith(".nfs")) return true;
+  if (isGeneratedPhptArtifact(sourceRoot, relPath)) return true;
   if (base.endsWith(".o") || base.endsWith(".lo") || base.endsWith(".la") || base.endsWith(".a")) return true;
   if (base === "php" || base === "phpdbg" || base === "php-cgi" || base === "php-fpm") {
     try {
@@ -194,6 +195,28 @@ function shouldExclude(sourceRoot: string, relPath: string): boolean {
     }
   }
   return false;
+}
+
+function isGeneratedPhptArtifact(sourceRoot: string, relPath: string): boolean {
+  const slash = relPath.lastIndexOf("/");
+  const dir = slash >= 0 ? relPath.slice(0, slash) : "";
+  const base = slash >= 0 ? relPath.slice(slash + 1) : relPath;
+
+  for (const suffix of [".skip.php", ".clean.php", ".php"]) {
+    if (!base.endsWith(suffix)) continue;
+    const stem = base.slice(0, -suffix.length);
+    if (stem && existsSync(join(sourceRoot, dir, `${stem}.phpt`))) return true;
+  }
+
+  // PHPTs commonly leave archives/databases named after the test stem when a
+  // run is interrupted before --CLEAN--. Those files are execution products,
+  // not source fixtures; baking them into the browser image changes future
+  // test initial state (for example PharData opens an existing corrupt .zip
+  // instead of creating a new archive). Keep same-stem PHPT artifacts out of
+  // the immutable browser VFS image while preserving unrelated helper files.
+  const artifact = base.match(/^(.+?)(\.(?:\d+\.)*(?:phar|tar|zip|db|sqlite|sqlite3)(?:\.[A-Za-z0-9_-]+)*)$/);
+  if (!artifact) return false;
+  return existsSync(join(sourceRoot, dir, `${artifact[1]}.phpt`));
 }
 
 async function main() {
