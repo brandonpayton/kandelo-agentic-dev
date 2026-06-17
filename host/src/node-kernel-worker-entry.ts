@@ -989,7 +989,13 @@ async function handleExec(
   const resolved = await resolveExecutableForLaunch(path, argv);
   if (!resolved) return -2; // ENOENT
   const { programBytes, argv: launchArgv } = resolved;
-  const programModule = await getCompiledProgramModule(programBytes);
+  let programModule: WebAssembly.Module;
+  try {
+    programModule = await getCompiledProgramModule(programBytes);
+  } catch (e) {
+    if (e instanceof WebAssembly.CompileError) return -8; // ENOEXEC
+    throw e;
+  }
 
   const newPtrWidth = detectPtrWidth(programBytes);
   const setupResult = kernelWorker.kernelExecSetup(pid);
@@ -1140,7 +1146,13 @@ async function handlePosixSpawn(
   envp: string[],
 ): Promise<number> {
   post({ type: "proc_event", kind: "spawn", pid: childPid });
-  const programModule = await getCompiledProgramModule(programBytes);
+  let programModule: WebAssembly.Module;
+  try {
+    programModule = await getCompiledProgramModule(programBytes);
+  } catch (e) {
+    if (e instanceof WebAssembly.CompileError) return -8; // ENOEXEC
+    throw e;
+  }
 
   const ptrWidth = detectPtrWidth(programBytes);
   const {

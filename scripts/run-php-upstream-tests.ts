@@ -1704,6 +1704,7 @@ class BrowserPhpRunner implements PhpRunner {
       stdin: opts.stdin ?? "",
       stdinIsPipe: opts.stdinIsPipe ?? true,
       pipeStdio: opts.pipeStdio,
+      waitForChildOutput: opts.waitForChildOutput,
       timeoutMs: opts.timeoutMs,
     };
 

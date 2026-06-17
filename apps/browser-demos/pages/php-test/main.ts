@@ -18,6 +18,7 @@ interface RunPhpScriptRequest {
   stdin?: string;
   stdinIsPipe?: boolean;
   pipeStdio?: number[];
+  waitForChildOutput?: boolean;
   timeoutMs?: number;
 }
 
@@ -96,6 +97,10 @@ function corsProxyUrlPrefix(): string {
   return proxyUrl.href;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function init() {
   const [kernelBuf, imageBuf] = await Promise.all([
     fetch(kernelWasmUrl).then((r) => {
@@ -167,6 +172,28 @@ async function init() {
           setTimeout(() => reject(new Error("TIMEOUT")), request.timeoutMs ?? 60_000),
         ),
       ]);
+
+      if (request.waitForChildOutput) {
+        const deadline = performance.now() + 1_000;
+        while (performance.now() < deadline) {
+          const processes = await kernel.enumProcs().catch(() => []);
+          if (processes.length === 0) break;
+          await delay(25);
+        }
+      }
+
+      let lastOutputLength = -1;
+      let stablePolls = 0;
+      for (let waitedMs = 0; waitedMs < 500 && stablePolls < 3; waitedMs += 25) {
+        await delay(25);
+        const outputLength = output.length;
+        if (waitedMs >= 100 && outputLength === lastOutputLength) {
+          stablePolls++;
+        } else {
+          stablePolls = 0;
+        }
+        lastOutputLength = outputLength;
+      }
       return { exitCode, stdout, stderr, output, durationMs: Math.round(performance.now() - start) };
     } catch (err: any) {
       const message = err?.message || String(err);
