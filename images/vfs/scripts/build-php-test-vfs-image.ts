@@ -104,6 +104,73 @@ function collectPhptDirs(root: string): string[] {
   return [...dirs].sort();
 }
 
+const SUPPORT_FILE_PATTERN =
+  /\.(?:inc|php|phtml|pem|crt|csr|key|cnf|ini|txt|dat|data|json|xml|xsd|dtd|rng|csv|sql|stub)$/i;
+
+function isTestPath(relPath: string): boolean {
+  return relPath.split(/[\\/]+/).includes("tests");
+}
+
+function isSupportFileName(name: string): boolean {
+  return SUPPORT_FILE_PATTERN.test(name);
+}
+
+function directoryHasSupportFiles(sourceRoot: string, dir: string): boolean {
+  const relDir = relative(sourceRoot, dir);
+  if (!relDir || !isTestPath(relDir)) return false;
+  for (const entry of readdirSync(dir)) {
+    if (!isSupportFileName(entry)) continue;
+    try {
+      if (statSync(join(dir, entry)).isFile()) return true;
+    } catch {
+      // Ignore unreadable or disappearing entries.
+    }
+  }
+  return false;
+}
+
+function collectPhptSupportDirs(sourceRoot: string, phptDirs: string[]): string[] {
+  const dirs = new Set<string>();
+  const phptDirSet = new Set(phptDirs);
+  for (const phptDir of phptDirs) {
+    let current = dirname(phptDir);
+    while (current !== sourceRoot && current.startsWith(sourceRoot)) {
+      if (!phptDirSet.has(current) && directoryHasSupportFiles(sourceRoot, current)) {
+        dirs.add(current);
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return [...dirs].sort();
+}
+
+function copySupportFiles(
+  fs: MemoryFileSystem,
+  sourceRoot: string,
+  dir: string,
+): number {
+  const relDir = relative(sourceRoot, dir);
+  const destDir = relDir ? `/php-src/${relDir}` : "/php-src";
+  ensureDirRecursive(fs, destDir);
+  let count = 0;
+  for (const entry of readdirSync(dir)) {
+    if (!isSupportFileName(entry)) continue;
+    const relPath = relDir ? `${relDir}/${entry}` : entry;
+    if (shouldExclude(sourceRoot, relPath)) continue;
+    const full = join(dir, entry);
+    try {
+      if (!statSync(full).isFile()) continue;
+      writeVfsBinary(fs, `${destDir}/${entry}`, new Uint8Array(readFileSync(full)), 0o644);
+      count++;
+    } catch {
+      // Skip unreadable or disappearing support files, matching walkAndWrite.
+    }
+  }
+  return count;
+}
+
 function preparePhpTestFixtures(sourceRoot: string): void {
   const fixtureDir = join(REPO_ROOT, "tests/php-fixtures/openssl-sni-2036");
   const destDir = join(sourceRoot, "ext/openssl/tests");
@@ -295,6 +362,7 @@ async function main() {
   }
 
   const phptDirs = collectPhptDirs(phpSrc);
+  const supportDirs = collectPhptSupportDirs(phpSrc, phptDirs);
   console.log(`  Writing ${phptDirs.length} PHPT directories...`);
   let fileCount = 0;
   for (const dir of phptDirs) {
@@ -304,6 +372,12 @@ async function main() {
     fileCount += walkAndWrite(fs, dir, dest, {
       exclude: (childRel) => shouldExclude(phpSrc, rel ? `${rel}/${childRel}` : childRel),
     });
+  }
+  if (supportDirs.length > 0) {
+    console.log(`  Writing ${supportDirs.length} PHPT support directories...`);
+    for (const dir of supportDirs) {
+      fileCount += copySupportFiles(fs, phpSrc, dir);
+    }
   }
   console.log(`    ${fileCount} files`);
 
