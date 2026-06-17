@@ -91,7 +91,6 @@ const VFS_IMAGE_FLAG_HAS_LAZY_ARCHIVES = 1 << 1;
 const VFS_IMAGE_FLAG_HAS_METADATA = 1 << 2;
 const VFS_IMAGE_HEADER_SIZE = 16; // magic(4) + version(4) + flags(4) + sabLen(4)
 const VFS_IMAGE_MAX_METADATA_BYTES = 64 * 1024;
-const REPORTED_INODE_GENERATION_STRIDE = 1_048_576;
 
 function cloneMetadata(metadata: VfsImageMetadata | null): VfsImageMetadata | null {
   return metadata === null ? null : { ...metadata };
@@ -735,9 +734,12 @@ export class MemoryFileSystem implements FileSystemBackend {
   }
 
   private reportedInodeNumber(s: SfsStatResult): number {
-    return s.generation > 0
-      ? s.generation * REPORTED_INODE_GENERATION_STRIDE + s.ino
-      : s.ino;
+    // POSIX permits inode reuse after unlink.  Do not expose the SharedFS
+    // internal generation counter as part of st_ino: 32-bit guest runtimes
+    // commonly surface inode numbers through signed long APIs, and inflated
+    // synthetic inode values can become unrepresentable even though the raw
+    // filesystem inode is small and stable for the file's lifetime.
+    return s.ino;
   }
 
   private applyLazyStatSize(result: StatResult, rawIno: number): StatResult {
