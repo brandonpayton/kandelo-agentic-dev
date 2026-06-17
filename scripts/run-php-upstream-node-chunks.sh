@@ -10,6 +10,8 @@ chunk_size="${PHP_TEST_CHUNK_SIZE:-500}"
 jobs="${PHP_TEST_JOBS:-4}"
 timeout_ms="${PHP_TEST_TIMEOUT_MS:-600000}"
 host_reset_interval="${PHP_TEST_HOST_RESET_INTERVAL:-25}"
+run_uid="${PHP_TEST_RUN_UID:-}"
+run_gid="${PHP_TEST_RUN_GID:-}"
 start_offset=0
 out_dir=""
 force=0
@@ -36,6 +38,8 @@ Options:
   --jobs <n>                   PHPT concurrency inside each chunk (default: PHP_TEST_JOBS or 4)
   --timeout <ms>               Per PHPT section timeout (default: PHP_TEST_TIMEOUT_MS or 600000)
   --host-reset-interval <n>    Kernel reboot interval per worker (default: PHP_TEST_HOST_RESET_INTERVAL or 25)
+  --run-uid <n>                Run guest PHP processes as uid n (default: PHP_TEST_RUN_UID)
+  --run-gid <n>                Run guest PHP processes as gid n (default: PHP_TEST_RUN_GID)
   --start-offset <n>           Start at global sorted PHPT offset (default: 0)
   --out-dir <dir>              Output directory (default: /tmp/kandelo-php-<host>-chunks-<timestamp>)
   --force                      Re-run chunks even if their .done marker exists
@@ -49,6 +53,8 @@ Environment:
   PHP_WASM                     PHP wasm binary (default resolved by downstream harness)
   PHP_OPCACHE_SO               opcache.so path when testing opcache (recommended)
   PHP_EXTENSION_DIR            Directory of PHP .so side modules to include in the browser VFS
+  PHP_TEST_RUN_UID             Optional guest uid for PHP processes
+  PHP_TEST_RUN_GID             Optional guest gid for PHP processes
 
 Outputs:
   chunk-<offset>.jsonl         JSONL PHPT results for that chunk
@@ -67,6 +73,8 @@ while [ "$#" -gt 0 ]; do
     --jobs) [ "$#" -ge 2 ] || die "--jobs needs a value"; jobs="$2"; shift 2 ;;
     --timeout) [ "$#" -ge 2 ] || die "--timeout needs a value"; timeout_ms="$2"; shift 2 ;;
     --host-reset-interval) [ "$#" -ge 2 ] || die "--host-reset-interval needs a value"; host_reset_interval="$2"; shift 2 ;;
+    --run-uid) [ "$#" -ge 2 ] || die "--run-uid needs a value"; run_uid="$2"; shift 2 ;;
+    --run-gid) [ "$#" -ge 2 ] || die "--run-gid needs a value"; run_gid="$2"; shift 2 ;;
     --start-offset) [ "$#" -ge 2 ] || die "--start-offset needs a value"; start_offset="$2"; shift 2 ;;
     --out-dir) [ "$#" -ge 2 ] || die "--out-dir needs a value"; out_dir="$2"; shift 2 ;;
     --force) force=1; shift ;;
@@ -81,6 +89,12 @@ for numeric in chunk_size jobs timeout_ms host_reset_interval start_offset; do
   value="${!numeric}"
   case "$value" in
     ''|*[!0-9]*) die "$numeric must be a non-negative integer, got: $value" ;;
+  esac
+done
+for optional_numeric in run_uid run_gid; do
+  value="${!optional_numeric}"
+  case "$value" in
+    ''|*[!0-9]*) [ -z "$value" ] || die "$optional_numeric must be a non-negative integer, got: $value" ;;
   esac
 done
 [ "$chunk_size" -gt 0 ] || die "chunk_size must be > 0"
@@ -105,6 +119,8 @@ metadata="$out_dir/metadata.env"
   echo "JOBS=$jobs"
   echo "TIMEOUT_MS=$timeout_ms"
   echo "HOST_RESET_INTERVAL=$host_reset_interval"
+  echo "RUN_UID=$run_uid"
+  echo "RUN_GID=$run_gid"
   echo "START_OFFSET=$start_offset"
   echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$metadata"
@@ -219,6 +235,13 @@ while [ "$offset" -lt "$total" ]; do
   fi
   rm -f "$jsonl" "$stderr" "$exit_file" "$done_file"
   echo "[$(date -u +%H:%M:%S)] running host=$host chunk offset=$offset limit=$chunk_size jobs=$jobs timeout=$timeout_ms reset=$host_reset_interval"
+  extra_args=()
+  if [ -n "$run_uid" ]; then
+    extra_args+=(--run-uid "$run_uid")
+  fi
+  if [ -n "$run_gid" ]; then
+    extra_args+=(--run-gid "$run_gid")
+  fi
   set +e
   "$REPO_ROOT/scripts/run-php-upstream-tests.sh" \
     --host "$host" \
@@ -228,6 +251,7 @@ while [ "$offset" -lt "$total" ]; do
     --jobs "$jobs" \
     --timeout "$timeout_ms" \
     --host-reset-interval "$host_reset_interval" \
+    "${extra_args[@]}" \
     --json \
     > "$jsonl" 2> "$stderr"
   status=$?

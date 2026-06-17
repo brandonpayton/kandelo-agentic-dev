@@ -1596,6 +1596,8 @@ class BrowserPhpRunner implements PhpRunner {
     private sourceRoot: string,
     private rebuildVfs: boolean,
     private availableSharedExtensions: Set<string>,
+    private runUid?: number,
+    private runGid?: number,
   ) {}
 
   loadExtensionIniArgs(requiredExtensions: string[]): string[] {
@@ -1701,6 +1703,8 @@ class BrowserPhpRunner implements PhpRunner {
         "TEST_PHP_EXECUTABLE_ESCAPED='/usr/local/bin/php'",
         ...opts.env,
       ],
+      uid: this.runUid,
+      gid: this.runGid,
       stdin: opts.stdin ?? "",
       stdinIsPipe: opts.stdinIsPipe ?? true,
       pipeStdio: opts.pipeStdio,
@@ -1979,9 +1983,9 @@ Options:
   --offset <n>          Skip the first n selected tests
   --limit <n>           Run only the first n discovered tests
   --jobs <n>            Number of PHPTs to run concurrently (Node host only; default: 1)
-  --run-uid <n>         Run Node-host guest PHP processes as uid n
+  --run-uid <n>         Run guest PHP processes as uid n
                         (default: PHP_TEST_RUN_UID; root when unset)
-  --run-gid <n>         Run Node-host guest PHP processes as gid n
+  --run-gid <n>         Run guest PHP processes as gid n
                         (default: PHP_TEST_RUN_GID; root when unset)
   --host-reset-interval <n>
                         Reboot each Node-host Kandelo kernel after n PHPTs
@@ -2000,8 +2004,8 @@ Environment:
   PHP_EXTENSION_DIR     Additional directory/directories to scan for shared
                         extensions when PHP_WASM is outside the package bin dir
   PHP_SOURCE_DIR        Path to a php-src checkout/extract
-  PHP_TEST_RUN_UID      Optional Node-host guest uid for PHP processes
-  PHP_TEST_RUN_GID      Optional Node-host guest gid for PHP processes
+  PHP_TEST_RUN_UID      Optional guest uid for PHP processes
+  PHP_TEST_RUN_GID      Optional guest gid for PHP processes
 `);
 }
 
@@ -2139,11 +2143,11 @@ async function main() {
       console.error(
         `Node TCP/DNS bridge: ${enableTcpNetwork ? "enabled" : "disabled"}`,
       );
-      if (runUid !== undefined || runGid !== undefined) {
-        console.error(
-          `Node guest credentials: uid=${runUid ?? 0} gid=${runGid ?? runUid ?? 0}`,
-        );
-      }
+    }
+    if (runUid !== undefined || runGid !== undefined) {
+      console.error(
+        `Guest credentials: uid=${runUid ?? 0} gid=${runGid ?? runUid ?? 0}`,
+      );
     }
     console.error(`Tests: ${tests.length}`);
     console.error("");
@@ -2155,6 +2159,8 @@ async function main() {
       sourceRoot,
       rebuildVfs,
       availableSharedExtensions,
+      runUid,
+      runGid,
     );
     await runner.init();
     runners.push(runner);

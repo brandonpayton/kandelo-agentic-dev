@@ -15,6 +15,8 @@ interface RunPhpScriptRequest {
   argv: string[];
   cwd: string;
   env?: string[];
+  uid?: number;
+  gid?: number;
   stdin?: string;
   stdinIsPipe?: boolean;
   pipeStdio?: number[];
@@ -69,6 +71,52 @@ function createFs(): MemoryFileSystem {
 function ensureParent(fs: MemoryFileSystem, path: string): void {
   const slash = path.lastIndexOf("/");
   if (slash > 0) ensureDirRecursive(fs, path.slice(0, slash));
+}
+
+function parentPath(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash > 0 ? path.slice(0, slash) : "/";
+}
+
+function makeDirectoryWritableByGuest(
+  fs: MemoryFileSystem,
+  path: string,
+  uid: number,
+  gid: number,
+): void {
+  try {
+    const st = fs.lstat(path);
+    // The harness prepares an ephemeral php-src image per PHPT section.
+    // When the guest process intentionally runs as a non-root uid, make the
+    // source root and the current PHPT directory writable by that guest just
+    // like the Node-host harness does for copied source trees. This changes
+    // only test fixture ownership/mode; kernel credential checks still decide
+    // whether user-mode operations are allowed.
+    if ((st.mode & 0o170000) !== 0o040000) return;
+    fs.chown(path, uid, gid);
+    fs.chmod(path, 0o777);
+  } catch {
+    // Missing paths will be reported by the actual PHP process or by the
+    // script write below. This helper is best-effort fixture setup.
+  }
+}
+
+function prepareGuestWritableWorkspace(
+  fs: MemoryFileSystem,
+  scriptPath: string,
+  uid?: number,
+  gid?: number,
+): void {
+  if (uid == null && gid == null) return;
+  const effectiveUid = uid ?? 0;
+  const effectiveGid = gid ?? effectiveUid;
+  makeDirectoryWritableByGuest(fs, "/php-src", effectiveUid, effectiveGid);
+  makeDirectoryWritableByGuest(
+    fs,
+    parentPath(scriptPath),
+    effectiveUid,
+    effectiveGid,
+  );
 }
 
 function binaryStringToBytes(value: string): Uint8Array {
@@ -126,6 +174,7 @@ async function init() {
   window.__runPhpScript = async (request: RunPhpScriptRequest) => {
     const start = performance.now();
     const fs = createFs();
+    prepareGuestWritableWorkspace(fs, request.scriptPath, request.uid, request.gid);
     ensureParent(fs, request.scriptPath);
     writeVfsBinary(fs, request.scriptPath, binaryStringToBytes(request.script), 0o644);
 
@@ -167,6 +216,8 @@ async function init() {
           stdin,
           stdinIsPipe: request.stdinIsPipe,
           pipeStdio: request.pipeStdio,
+          uid: request.uid,
+          gid: request.gid,
         }),
         new Promise<number>((_, reject) =>
           setTimeout(() => reject(new Error("TIMEOUT")), request.timeoutMs ?? 60_000),
