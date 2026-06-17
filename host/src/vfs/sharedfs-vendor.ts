@@ -767,6 +767,11 @@ export class SharedFS {
     if (offset > this.r64(inoOff + INO_SIZE)) {
       this.w64(inoOff + INO_SIZE, offset);
     }
+    if (totalWritten > 0) {
+      const now = Date.now();
+      this.w64(inoOff + INO_MTIME, now);
+      this.w64(inoOff + INO_CTIME, now);
+    }
     return totalWritten;
   }
 
@@ -853,11 +858,17 @@ export class SharedFS {
   private inodeTruncate(ino: number, newSize: number): void {
     const inoOff = this.inodeOffset(ino);
     const curSize = this.r64(inoOff + INO_SIZE);
+    const sizeChanged = newSize !== curSize;
     if (newSize >= curSize) {
       if (newSize > curSize) {
         this.zeroInodeRange(ino, curSize, newSize);
       }
       this.w64(inoOff + INO_SIZE, newSize);
+      if (sizeChanged) {
+        const now = Date.now();
+        this.w64(inoOff + INO_MTIME, now);
+        this.w64(inoOff + INO_CTIME, now);
+      }
       return;
     }
     if (newSize % BLOCK_SIZE !== 0) {
@@ -870,6 +881,11 @@ export class SharedFS {
     const keepBlocks = Math.ceil(newSize / BLOCK_SIZE);
     this.freeBlocksFrom(ino, keepBlocks);
     this.w64(inoOff + INO_SIZE, newSize);
+    if (sizeChanged) {
+      const now = Date.now();
+      this.w64(inoOff + INO_MTIME, now);
+      this.w64(inoOff + INO_CTIME, now);
+    }
   }
 
   // ── Directory operations ─────────────────────────────────────────
