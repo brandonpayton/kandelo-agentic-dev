@@ -503,6 +503,7 @@ function defaultPhpTestEnvArgs(): string[] {
     `TEST_FPM_CHECK_CONNECTION_ATTEMPTS=${process.env.TEST_FPM_CHECK_CONNECTION_ATTEMPTS ?? "200"}`,
     `TEST_FPM_READ_WRITE_TIMEOUT_MS=${process.env.TEST_FPM_READ_WRITE_TIMEOUT_MS ?? "20000"}`,
     "TEST_FPM_EXTENSION_DIR=/usr/lib/php/extensions",
+    `TEST_NON_ROOT_USER=${process.env.TEST_NON_ROOT_USER ?? "nobody"}`,
     "TZ=",
   ];
 }
@@ -780,6 +781,68 @@ function preparePhpTestFixtures(sourceRoot: string): void {
       // this fixture regex libc-portable rather than changing Kandelo/libc
       // message strings to match one C library.
       writeFileSync(fpmIpv4Fallback, text.replace(from, to), "utf8");
+    }
+  }
+
+  const mysqliFakeServer = join(sourceRoot, "ext/mysqli/tests/fake_server.inc");
+  if (existsSync(mysqliFakeServer)) {
+    const text = readFileSync(mysqliFakeServer, "utf8");
+    if (!text.includes("MYSQLI_FAKE_SERVER_DRAIN_IDLE_MS")) {
+      const from = `    public function read($bytes_len = 1024)
+    {
+        // wait 20ms to fill the buffer
+        usleep(20000);
+        $data = fread($this->conn, $bytes_len);
+        if ($data) {
+            fprintf(STDERR, "[*] Received: %s\\n", bin2hex($data));
+        }
+    }`;
+      const to = `    public function read($bytes_len = 1024)
+    {
+        // wait 20ms to fill the buffer
+        usleep(20000);
+        $data = fread($this->conn, $bytes_len);
+
+        if ($data && $bytes_len > 1024) {
+            // Large reads in this fake MySQL server are used to drain the
+            // connection tail after the client reacts to a crafted packet.
+            // fread() on a POSIX stream may return as soon as any bytes are
+            // available; it is not required to wait for later client writes to
+            // coalesce into the same TCP segment. Native php-src runs usually
+            // see the final COM_STMT_CLOSE and COM_QUIT together after the
+            // fixed sleep above, but the browser host can schedule the guest
+            // peer more slowly. Keep draining for a short idle window and print
+            // one Received line so the fixture remains semantically identical
+            // without relying on transport coalescing.
+            $idleMs = getenv('MYSQLI_FAKE_SERVER_DRAIN_IDLE_MS');
+            $idleMs = $idleMs !== false && is_numeric($idleMs) ? max(0, (int) $idleMs) : 250;
+            $deadline = microtime(true) + ($idleMs / 1000);
+            $wasBlocking = stream_get_meta_data($this->conn)['blocked'] ?? true;
+            stream_set_blocking($this->conn, false);
+            try {
+                while (strlen($data) < $bytes_len && microtime(true) < $deadline) {
+                    usleep(10000);
+                    $chunk = fread($this->conn, $bytes_len - strlen($data));
+                    if ($chunk !== false && $chunk !== '') {
+                        $data .= $chunk;
+                        $deadline = microtime(true) + ($idleMs / 1000);
+                    }
+                }
+            } finally {
+                stream_set_blocking($this->conn, $wasBlocking);
+            }
+        }
+
+        if ($data) {
+            fprintf(STDERR, "[*] Received: %s\\n", bin2hex($data));
+        }
+    }`;
+      if (!text.includes(from)) {
+        throw new Error(
+          `Unable to patch PHP mysqli fake_server fixture: read() marker not found in ${mysqliFakeServer}`,
+        );
+      }
+      writeFileSync(mysqliFakeServer, text.replace(from, to), "utf8");
     }
   }
 }
@@ -1918,6 +1981,13 @@ Environment:
 }
 
 async function main() {
+  // Upstream run-tests.php expects TEST_NON_ROOT_USER to be available for
+  // root-run preloading tests that use --INI-- placeholders before the guest
+  // process is spawned. Provide the portable account that Kandelo rootfs/VFS
+  // images carry by default rather than requiring every harness invocation to
+  // remember this environment variable.
+  process.env.TEST_NON_ROOT_USER ??= "nobody";
+
   const args = process.argv.slice(2);
   let host: HostKind = "node";
   let timeoutMs = 60_000;

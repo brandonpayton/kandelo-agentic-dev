@@ -9,13 +9,14 @@
  * The Playwright-side runner parses each .phpt file and writes transient
  * PHP scripts into the restored image before spawning /usr/local/bin/php.
  */
-import { cpSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { MemoryFileSystem } from "../../../host/src/vfs/memory-fs";
 import {
   ensureDir,
   ensureDirRecursive,
   symlink,
+  writeVfsFile,
   writeVfsBinary,
 } from "../../../host/src/vfs/image-helpers";
 import { findRepoRoot, tryResolveBinary } from "../../../host/src/binary-resolver";
@@ -41,6 +42,21 @@ const OUT_FILE = process.env.PHP_TEST_VFS_OUT
   ?? join(REPO_ROOT, "apps/browser-demos/public/php-test.vfs.zst");
 const FS_INITIAL_BYTES = Number(process.env.PHP_TEST_VFS_INITIAL_BYTES ?? 256 * 1024 * 1024);
 const FS_MAX_BYTES = Number(process.env.PHP_TEST_VFS_MAX_BYTES ?? 2 * 1024 * 1024 * 1024);
+
+const ETC_PASSWD = [
+  "root:x:0:0:root:/root:/bin/sh",
+  "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
+  "user:x:1000:1000:user:/home/user:/bin/sh",
+  "",
+].join("\n");
+
+const ETC_GROUP = [
+  "root:x:0:",
+  "nogroup:x:65534:",
+  "nobody:x:65534:",
+  "user:x:1000:",
+  "",
+].join("\n");
 
 const COREUTILS_NAMES = [
   "arch", "b2sum", "base32", "base64", "basename", "basenc", "cat",
@@ -78,16 +94,89 @@ function collectPhptDirs(root: string): string[] {
     }
   }
   walk(root);
+  // Some PHPTs include helper fixtures from extension directories that do not
+  // themselves contain .phpt files. Keep those directories in the browser VFS
+  // so SKIPIF sections behave like they do against a complete php-src tree.
+  for (const rel of ["ext/dl_test/tests"]) {
+    const full = join(root, rel);
+    if (existsSync(full)) dirs.add(full);
+  }
   return [...dirs].sort();
 }
 
 function preparePhpTestFixtures(sourceRoot: string): void {
   const fixtureDir = join(REPO_ROOT, "tests/php-fixtures/openssl-sni-2036");
   const destDir = join(sourceRoot, "ext/openssl/tests");
-  if (!existsSync(fixtureDir) || !existsSync(destDir)) return;
-  for (const entry of readdirSync(fixtureDir)) {
-    if (!entry.startsWith("sni_server_") || !entry.endsWith(".pem")) continue;
-    cpSync(join(fixtureDir, entry), join(destDir, entry));
+  if (existsSync(fixtureDir) && existsSync(destDir)) {
+    for (const entry of readdirSync(fixtureDir)) {
+      if (!entry.startsWith("sni_server_") || !entry.endsWith(".pem")) continue;
+      cpSync(join(fixtureDir, entry), join(destDir, entry));
+    }
+  }
+
+  const mysqliFakeServer = join(sourceRoot, "ext/mysqli/tests/fake_server.inc");
+  if (existsSync(mysqliFakeServer)) {
+    const text = readFileSync(mysqliFakeServer, "utf8");
+    if (!text.includes("MYSQLI_FAKE_SERVER_DRAIN_IDLE_MS")) {
+      const from = `    public function read($bytes_len = 1024)
+    {
+        // wait 20ms to fill the buffer
+        usleep(20000);
+        $data = fread($this->conn, $bytes_len);
+        if ($data) {
+            fprintf(STDERR, "[*] Received: %s\\n", bin2hex($data));
+        }
+    }`;
+      const to = `    public function read($bytes_len = 1024)
+    {
+        // wait 20ms to fill the buffer
+        usleep(20000);
+        $data = fread($this->conn, $bytes_len);
+
+        if ($data && $bytes_len > 1024) {
+            // Large reads in this fake MySQL server are used to drain the
+            // connection tail after the client reacts to a crafted packet.
+            // fread() on a POSIX stream may return as soon as any bytes are
+            // available; it is not required to wait for later client writes to
+            // coalesce into the same TCP segment. Native php-src runs usually
+            // see the final COM_STMT_CLOSE and COM_QUIT together after the
+            // fixed sleep above, but the browser host can schedule the guest
+            // peer more slowly. Keep draining for a short idle window and print
+            // one Received line so the fixture remains semantically identical
+            // without relying on transport coalescing.
+            $idleMs = getenv('MYSQLI_FAKE_SERVER_DRAIN_IDLE_MS');
+            $idleMs = $idleMs !== false && is_numeric($idleMs) ? max(0, (int) $idleMs) : 250;
+            $deadline = microtime(true) + ($idleMs / 1000);
+            $wasBlocking = stream_get_meta_data($this->conn)['blocked'] ?? true;
+            stream_set_blocking($this->conn, false);
+            try {
+                while (strlen($data) < $bytes_len && microtime(true) < $deadline) {
+                    usleep(10000);
+                    $chunk = fread($this->conn, $bytes_len - strlen($data));
+                    if ($chunk !== false && $chunk !== '') {
+                        $data .= $chunk;
+                        $deadline = microtime(true) + ($idleMs / 1000);
+                    }
+                }
+            } finally {
+                stream_set_blocking($this->conn, $wasBlocking);
+            }
+        }
+
+        if ($data) {
+            fprintf(STDERR, "[*] Received: %s\\n", bin2hex($data));
+        }
+    }`;
+      if (!text.includes(from)) {
+        throw new Error(
+          `Unable to patch PHP mysqli fake_server fixture: read() marker not found in ${mysqliFakeServer}`,
+        );
+      }
+      // The source tree is a local extracted test fixture, not tracked PHP
+      // package source. Patch it before packing the browser VFS so browser and
+      // Node PHPT runs exercise the same transport-tolerant fixture behavior.
+      writeFileSync(mysqliFakeServer, text.replace(from, to), "utf8");
+    }
   }
 }
 
@@ -139,6 +228,8 @@ async function main() {
     ensureDir(fs, dir);
   }
   fs.chmod("/tmp", 0o1777);
+  writeVfsFile(fs, "/etc/passwd", ETC_PASSWD);
+  writeVfsFile(fs, "/etc/group", ETC_GROUP);
 
   writeVfsBinary(fs, "/usr/bin/dash", new Uint8Array(readFileSync(DASH_WASM)));
   symlink(fs, "/usr/bin/dash", "/bin/sh");
