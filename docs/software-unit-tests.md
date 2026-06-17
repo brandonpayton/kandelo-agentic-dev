@@ -768,7 +768,12 @@ The PHPT harness writes the generated `--FILE--` section as the upstream
 This matches php-src's `run-tests.php` behavior for tests that assert `__FILE__`
 or exception source locations. Browser runs use the same generated path inside
 the `/php-src` VFS image and start a temporary Vite server; set
-`PHP_TEST_VITE_PORT` if port `5201` is occupied.
+`PHP_TEST_VITE_PORT` if port `5201` is occupied. Browser PHPT runs pass Chromium
+Wasm stack-switching flags by default so stack-heavy guest workloads get a
+larger secondary Wasm stack in dedicated workers. Add extra browser flags with
+`PHP_TEST_CHROMIUM_ARGS` or `KANDELO_CHROMIUM_ARGS`; set
+`PHP_TEST_DISABLE_BROWSER_WASM_STACK_FLAGS=1` only when debugging those default
+stack settings.
 
 The runner also mirrors `run-tests.php` comparison and working-directory
 semantics: CRLF is normalized and both actual and expected output are trimmed

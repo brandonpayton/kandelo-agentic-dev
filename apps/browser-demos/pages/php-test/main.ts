@@ -87,6 +87,15 @@ function bytesToBinaryString(data: Uint8Array): string {
   return out;
 }
 
+function corsProxyUrlPrefix(): string {
+  const base = import.meta.env.BASE_URL ?? "/";
+  const normalized = base.startsWith("/") ? base : `/${base}`;
+  const proxyPath = `${normalized.endsWith("/") ? normalized : `${normalized}/`}__kandelo_cors_proxy`;
+  const proxyUrl = new URL(proxyPath, window.location.href);
+  proxyUrl.searchParams.set("url", "");
+  return proxyUrl.href;
+}
+
 async function init() {
   const [kernelBuf, imageBuf] = await Promise.all([
     fetch(kernelWasmUrl).then((r) => {
@@ -121,6 +130,7 @@ async function init() {
     const kernel = new BrowserKernel({
       memfs: fs,
       maxWorkers: 4,
+      corsProxyUrl: corsProxyUrlPrefix(),
       onStdout: (data) => {
         const text = bytesToBinaryString(data);
         stdout += text;

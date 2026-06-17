@@ -87,6 +87,16 @@ const FAILURE_SNIPPET_BYTES = Math.max(
   2000,
   parseInt(process.env.PHP_TEST_FAILURE_SNIPPET_BYTES ?? "2000", 10) || 2000,
 );
+const BROWSER_WASM_STACK_JS_FLAGS = [
+  // Chromium dedicated Web Workers expose only the default V8 native stack,
+  // which is too small for legitimate stack-heavy Wasm workloads. Keep
+  // browser-host PHPT runs on V8's secondary Wasm stack and raise that stack
+  // so deep guest recursion behaves like the Node host's larger worker stack.
+  "--stack-size=32768",
+  "--stress-wasm-stack-switching",
+  "--wasm-stack-switching-stack-size=32768",
+  "--experimental-wasm-growable-stacks",
+].join(" ");
 
 type HostKind = "node" | "browser";
 type TestStatus =
@@ -417,6 +427,17 @@ function splitArgs(input: string | undefined): string[] {
   }
   if (current) out.push(current);
   return out;
+}
+
+function extraChromiumArgsFromEnv(): string[] {
+  const args = [
+    ...splitArgs(process.env.PHP_TEST_CHROMIUM_ARGS),
+    ...splitArgs(process.env.KANDELO_CHROMIUM_ARGS),
+  ];
+  if (process.env.PHP_TEST_DISABLE_BROWSER_WASM_STACK_FLAGS !== "1") {
+    args.unshift(`--js-flags=${BROWSER_WASM_STACK_JS_FLAGS}`);
+  }
+  return args;
 }
 
 function guestTestDir(test: PhptTest): string {
@@ -1606,7 +1627,10 @@ class BrowserPhpRunner implements PhpRunner {
     await this.browser?.close().catch(() => {});
     this.browser = await chromium.launch({
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
-      args: ["--enable-features=SharedArrayBuffer"],
+      args: [
+        "--enable-features=SharedArrayBuffer",
+        ...extraChromiumArgsFromEnv(),
+      ],
     });
   }
 
