@@ -957,6 +957,13 @@ export class SharedFS {
 
   // ── Directory operations ─────────────────────────────────────────
 
+  private touchDirectoryMutation(dirIno: number): void {
+    const inoOff = this.inodeOffset(dirIno);
+    const now = Date.now();
+    this.w64(inoOff + INO_MTIME, now);
+    this.w64(inoOff + INO_CTIME, now);
+  }
+
   private dirNameKey(name: Uint8Array): string {
     return safeDecode(name);
   }
@@ -1090,6 +1097,7 @@ export class SharedFS {
       this.w32(slot.abs, childIno);
       this.view.setUint16(slot.abs + 6, name.length, true);
       this.u8.set(name, slot.abs + DIRENT_HEADER_SIZE);
+      this.touchDirectoryMutation(dirIno);
       this.updateDirIndexAdd(dirIno, name, childIno, slot.abs, slot.recLen);
       return true;
     }
@@ -1273,6 +1281,7 @@ export class SharedFS {
     this.u8.set(name, abs + DIRENT_HEADER_SIZE);
 
     this.w64(inoOff + INO_SIZE, appendPos + needed);
+    this.touchDirectoryMutation(dirIno);
     this.updateDirIndexAdd(dirIno, name, childIno, abs, needed);
     return 0;
   }
@@ -1326,6 +1335,7 @@ export class SharedFS {
           this.w32(abs, childIno);
           this.view.setUint16(abs + 6, name.length, true);
           this.u8.set(name, abs + DIRENT_HEADER_SIZE);
+          this.touchDirectoryMutation(dirIno);
           this.updateDirIndexAdd(dirIno, name, childIno, abs, recLen);
           return 0;
         }
@@ -1341,6 +1351,7 @@ export class SharedFS {
           this.view.setUint16(newAbs + 4, slack, true);
           this.view.setUint16(newAbs + 6, name.length, true);
           this.u8.set(name, newAbs + DIRENT_HEADER_SIZE);
+          this.touchDirectoryMutation(dirIno);
           this.updateDirIndexAdd(dirIno, name, childIno, newAbs, slack);
           return 0;
         }
@@ -1371,6 +1382,7 @@ export class SharedFS {
         this.w32(entry.abs, 0); // mark as deleted
         index.entries.delete(key);
         index.free.push({ abs: entry.abs, recLen: entry.recLen });
+        this.touchDirectoryMutation(dirIno);
         return 0;
       }
 
@@ -1411,6 +1423,7 @@ export class SharedFS {
           }
           if (match) {
             this.w32(abs, 0); // mark as deleted
+            this.touchDirectoryMutation(dirIno);
             this.updateDirIndexRemove(dirIno, name);
             return 0;
           }
