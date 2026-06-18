@@ -269,6 +269,24 @@ function isGeneratedPhptArtifact(sourceRoot: string, relPath: string): boolean {
   const dir = slash >= 0 ? relPath.slice(0, slash) : "";
   const base = slash >= 0 ? relPath.slice(slash + 1) : relPath;
 
+  // Some PHPTs create a same-stem directory next to the test and then remove
+  // it from --CLEAN--. If a long browser run is interrupted during the test,
+  // the source checkout/cache can retain a huge generated directory; baking it
+  // into the immutable browser VFS changes the next run's initial state. Keep
+  // small same-stem directories because upstream also uses that convention for
+  // legitimate helper fixtures (for example ext/phar/tests/bug53872/).
+  if (base && existsSync(join(sourceRoot, dir, `${base}.phpt`))) {
+    try {
+      const full = join(sourceRoot, relPath);
+      const st = statSync(full);
+      if (st.isDirectory() && readdirSync(full).length >= 100) {
+        return true;
+      }
+    } catch {
+      // Fall through to the file-artifact checks below.
+    }
+  }
+
   for (const suffix of [".skip.php", ".clean.php", ".php"]) {
     if (!base.endsWith(suffix)) continue;
     const stem = base.slice(0, -suffix.length);
