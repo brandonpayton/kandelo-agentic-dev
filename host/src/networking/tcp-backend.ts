@@ -7,6 +7,7 @@ const POLLIN = 0x0001;
 const POLLOUT = 0x0004;
 const POLLERR = 0x0008;
 const POLLHUP = 0x0010;
+const MSG_PEEK = 0x0002;
 
 /**
  * Map a Node.js network error code to a POSIX errno value.
@@ -52,6 +53,8 @@ interface Connection {
   socket: net.Socket;
   recvBuf: Buffer;
   closed: boolean;
+  readEnded: boolean;
+  postFinWriteAccepted: boolean;
   /** True once net.Socket has emitted 'connect' (TCP handshake done). */
   connected: boolean;
   error: Error | null;
@@ -68,11 +71,13 @@ export class TcpNetworkBackend implements NetworkIO {
 
   connect(handle: number, addr: Uint8Array, port: number): void {
     const ip = `${addr[0]}.${addr[1]}.${addr[2]}.${addr[3]}`;
-    const socket = new net.Socket();
+    const socket = new net.Socket({ allowHalfOpen: true });
     const conn: Connection = {
       socket,
       recvBuf: Buffer.alloc(0),
       closed: false,
+      readEnded: false,
+      postFinWriteAccepted: false,
       connected: false,
       error: null,
     };
@@ -83,11 +88,15 @@ export class TcpNetworkBackend implements NetworkIO {
     socket.on("data", (data: Buffer) => {
       conn.recvBuf = Buffer.concat([conn.recvBuf, data]);
     });
+    socket.on("end", () => {
+      conn.readEnded = true;
+    });
     socket.on("error", (err: Error) => {
       conn.error = err;
     });
     socket.on("close", () => {
       conn.closed = true;
+      conn.readEnded = true;
     });
 
     socket.connect(port, ip);
@@ -115,14 +124,28 @@ export class TcpNetworkBackend implements NetworkIO {
     const conn = this.connections.get(handle);
     if (!conn) throw new Error("ENOTCONN");
     if (conn.error) throw conn.error;
-    if (conn.closed) throw new Error("EPIPE");
+    if ((conn.closed || conn.socket.destroyed) && conn.connected) {
+      if (!conn.postFinWriteAccepted) {
+        // TCP close is half-duplex. After a peer FIN/EOF, Linux commonly lets
+        // one write succeed locally and reports the reset on a later operation.
+        // Node may already have emitted `close` by the time guest code performs
+        // that write; preserve the POSIX-visible behavior instead of turning
+        // the first post-FIN write into an eager EPIPE.
+        conn.postFinWriteAccepted = true;
+        conn.error = Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" });
+        return data.length;
+      }
+      throw Object.assign(new Error("EPIPE"), { errno: 32 });
+    }
     // `net.Socket.write` buffers internally before the TCP handshake
-    // completes, so we don't need to gate on `connected`.
+    // completes, so we don't need to gate on `connected`. With allowHalfOpen,
+    // this also permits writes after a peer FIN while Node still has an open
+    // writable half, matching TCP half-close semantics.
     conn.socket.write(Buffer.from(data));
     return data.length;
   }
 
-  recv(handle: number, maxLen: number, _flags: number): Uint8Array {
+  recv(handle: number, maxLen: number, flags: number): Uint8Array {
     const conn = this.connections.get(handle);
     if (!conn) throw new Error("ENOTCONN");
     if (conn.error) throw conn.error;
@@ -134,11 +157,13 @@ export class TcpNetworkBackend implements NetworkIO {
         conn.recvBuf.byteOffset,
         len,
       );
-      conn.recvBuf = conn.recvBuf.subarray(len);
+      if ((flags & MSG_PEEK) === 0) {
+        conn.recvBuf = conn.recvBuf.subarray(len);
+      }
       return result;
     }
 
-    if (conn.closed) return new Uint8Array(0);
+    if (conn.readEnded || conn.closed) return new Uint8Array(0);
 
     throw new EagainError();
   }
@@ -150,7 +175,7 @@ export class TcpNetworkBackend implements NetworkIO {
     if (conn.error) return POLLERR;
 
     let revents = 0;
-    if ((events & POLLIN) !== 0 && conn.recvBuf.length > 0) {
+    if ((events & POLLIN) !== 0 && (conn.recvBuf.length > 0 || conn.readEnded || conn.closed)) {
       revents |= POLLIN;
     }
     if (conn.closed) {
@@ -165,7 +190,17 @@ export class TcpNetworkBackend implements NetworkIO {
   close(handle: number): void {
     const conn = this.connections.get(handle);
     if (conn) {
-      conn.socket.destroy();
+      // POSIX close(2) on a normal TCP socket performs an orderly close
+      // (FIN after queued bytes) unless reset-style linger is configured.
+      // Destroying the Node socket here sends an abrupt reset shape, which
+      // breaks protocols that perform their own shutdown handshakes (TLS
+      // close_notify via SSL_shutdown, for example).
+      if (!conn.socket.destroyed) {
+        conn.socket.end();
+        conn.socket.setTimeout(1_000, () => {
+          if (!conn.socket.destroyed) conn.socket.destroy();
+        });
+      }
       this.connections.delete(handle);
     }
   }

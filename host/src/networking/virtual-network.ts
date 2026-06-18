@@ -20,6 +20,7 @@ const POLLIN = 0x0001;
 const POLLOUT = 0x0004;
 const POLLERR = 0x0008;
 const POLLHUP = 0x0010;
+const MSG_PEEK = 0x0002;
 
 const ANY = "0.0.0.0";
 
@@ -51,6 +52,7 @@ class VirtualTcpPeer implements TcpConnectionPeer {
   private peer?: VirtualTcpPeer;
   private readClosed = false;
   private writeClosed = false;
+  private closed = false;
   private reset = false;
 
   pairWith(peer: VirtualTcpPeer): void {
@@ -73,11 +75,22 @@ class VirtualTcpPeer implements TcpConnectionPeer {
       err.errno = 32;
       throw err;
     }
+    // A peer close(2) on TCP is an orderly FIN for its write side, not an
+    // immediate refusal of incoming data. Linux commonly lets the first write
+    // after observing peer EOF succeed and reports the resulting reset on a
+    // later operation. Preserve that POSIX-compatible TCP behavior by accepting
+    // and discarding data sent to a fully closed peer, then marking this side
+    // reset for subsequent operations. Explicit SHUT_RD remains EPIPE via the
+    // readClosed check above.
+    if (this.peer.closed) {
+      this.reset = true;
+      return data.length;
+    }
     this.peer.enqueue(data.slice());
     return data.length;
   }
 
-  recv(maxLen: number, _flags: number): Uint8Array {
+  recv(maxLen: number, flags: number): Uint8Array {
     if (this.reset) {
       const err = new Error("ECONNRESET") as Error & { errno?: number };
       err.errno = ECONNRESET;
@@ -86,7 +99,9 @@ class VirtualTcpPeer implements TcpConnectionPeer {
     if (this.recvBuf.length > 0) {
       const len = Math.min(maxLen, this.recvBuf.length);
       const out = this.recvBuf.slice(0, len);
-      this.recvBuf = this.recvBuf.slice(len);
+      if ((flags & MSG_PEEK) === 0) {
+        this.recvBuf = this.recvBuf.slice(len);
+      }
       return out;
     }
     if (!this.peer || this.peer.writeClosed) {
@@ -127,7 +142,18 @@ class VirtualTcpPeer implements TcpConnectionPeer {
   }
 
   close(): void {
-    this.shutdown(2);
+    this.closed = true;
+    this.writeClosed = true;
+    this.recvBuf = new Uint8Array(0);
+  }
+
+  abort(): void {
+    this.closed = true;
+    this.readClosed = true;
+    this.writeClosed = true;
+    this.reset = true;
+    this.recvBuf = new Uint8Array(0);
+    this.peer?.resetPeer();
   }
 
   resetPeer(): void {
@@ -204,7 +230,7 @@ export class LocalVirtualNetwork {
     this.tcpListeners = this.tcpListeners.filter((l) => l.machineId !== machineId);
     this.udpEndpoints = this.udpEndpoints.filter((e) => e.machineId !== machineId);
     for (const peer of this.tcpPeersByMachine.get(machineId) ?? []) {
-      peer.close();
+      peer.abort();
     }
     this.tcpPeersByMachine.delete(machineId);
     backend.resetAllConnections();
@@ -450,7 +476,10 @@ export class VirtualNetworkBackend implements NetworkIO {
   }
 
   resetAllConnections(): void {
-    for (const conn of this.connections.values()) conn.close();
+    for (const conn of this.connections.values()) {
+      if (typeof conn.abort === "function") conn.abort();
+      else conn.close();
+    }
     this.connections.clear();
     this.connectErrors.clear();
   }

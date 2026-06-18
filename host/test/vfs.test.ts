@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { VirtualPlatformIO } from "../src/vfs/vfs";
@@ -224,6 +224,38 @@ describe("VirtualPlatformIO mount resolution", () => {
     vfs.stat("/tmp/abc");
     expect(tmp.calls).toContain("stat:/abc");
   });
+
+  it("routes mount-root .. to the parent mount", () => {
+    const root = createMockBackend();
+    const phpSrc = createMockBackend();
+    const vfs = new VirtualPlatformIO(
+      [
+        { mountPoint: "/", backend: root },
+        { mountPoint: "/php-src", backend: phpSrc },
+      ],
+      new NodeTimeProvider(),
+    );
+
+    vfs.stat("/php-src/..");
+
+    expect(root.calls).toContain("stat:/");
+    expect(phpSrc.calls.length).toBe(0);
+  });
+
+  it("leaves backend-internal missing/.. paths for component-wise resolution", () => {
+    const phpSrc = createMockBackend();
+    const vfs = new VirtualPlatformIO(
+      [
+        { mountPoint: "/", backend: createMockBackend() },
+        { mountPoint: "/php-src", backend: phpSrc },
+      ],
+      new NodeTimeProvider(),
+    );
+
+    vfs.stat("/php-src/missing/../file.txt");
+
+    expect(phpSrc.calls).toContain("stat:/missing/../file.txt");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -344,8 +376,56 @@ describe("HostFileSystem path traversal", () => {
   });
 
   it("rejects paths with embedded .. sequences", () => {
-    const hfs = new HostFileSystem("/tmp/sandbox");
-    expect(() => hfs.stat("/subdir/../../etc/passwd")).toThrow("EACCES");
+    const root = mkdtempSync(join(tmpdir(), "hostfs-traversal-"));
+    try {
+      mkdirSync(join(root, "subdir"));
+      const hfs = new HostFileSystem(root);
+      expect(() => hfs.stat("/subdir/../../etc/passwd")).toThrow("EACCES");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not lexically erase missing intermediate components before ..", () => {
+    const root = mkdtempSync(join(tmpdir(), "hostfs-path-"));
+    try {
+      mkdirSync(join(root, "existing"));
+      writeFileSync(join(root, "existing", "file.txt"), "data");
+      const hfs = new HostFileSystem(root);
+
+      expect(() =>
+        hfs.chmod("/existing/missing/../file.txt", 0o755),
+      ).toThrow("ENOENT");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves trailing slash semantics for non-directory final components", () => {
+    const root = mkdtempSync(join(tmpdir(), "hostfs-trailing-slash-"));
+    try {
+      writeFileSync(join(root, "file.txt"), "data");
+      const hfs = new HostFileSystem(root);
+
+      expect(() => hfs.stat("/file.txt/")).toThrow("ENOTDIR");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows absolute guest symlinks that stay inside the host mount", () => {
+    const root = mkdtempSync(join(tmpdir(), "hostfs-symlink-"));
+    try {
+      writeFileSync(join(root, "target.txt"), "data");
+      const hfs = new HostFileSystem(root, "/mnt");
+
+      hfs.symlink("/mnt/target.txt", "/link.txt");
+
+      expect(hfs.readlink("/link.txt")).toBe("/mnt/target.txt");
+      expect(hfs.stat("/link.txt").size).toBe(4);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -394,6 +474,64 @@ describe("MemoryFileSystem", () => {
     expect(entries).toContain("file.txt");
   });
 
+  it("reports raw inode numbers that remain representable after inode reuse", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_RDWR = 0x0002,
+      O_TRUNC = 0x0200;
+
+    // SharedFS tracks an internal generation counter for reused inode slots.
+    // POSIX st_ino does not need to include that generation, and exposing it
+    // can overflow 32-bit guest language APIs while tools like ls(1) print the
+    // full kernel value.
+    for (let i = 0; i < 2_100; i++) {
+      const fd = mfs.open("/reuse.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+      mfs.close(fd);
+      mfs.unlink("/reuse.txt");
+    }
+
+    const fd = mfs.open("/reuse.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const stat = mfs.fstat(fd);
+    expect(stat.ino).toBeGreaterThan(0);
+    expect(stat.ino).toBeLessThanOrEqual(0x7fffffff);
+
+    const dh = mfs.opendir("/");
+    let entry;
+    let dirIno: number | null = null;
+    while ((entry = mfs.readdir(dh)) !== null) {
+      if (entry.name === "reuse.txt") {
+        dirIno = entry.ino;
+        break;
+      }
+    }
+    mfs.closedir(dh);
+    expect(dirIno).toBe(stat.ino);
+    mfs.close(fd);
+  });
+
+  it("honors O_CREAT|O_EXCL by failing when the final path already exists", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_WRONLY = 0x0001,
+      O_CREAT = 0x0040,
+      O_EXCL = 0x0080;
+
+    const fd = mfs.open("/exclusive.txt", O_WRONLY | O_CREAT | O_EXCL, 0o600);
+    mfs.close(fd);
+
+    expect(() =>
+      mfs.open("/exclusive.txt", O_WRONLY | O_CREAT | O_EXCL, 0o600),
+    ).toThrow(/File exists/);
+
+    // POSIX open(O_CREAT|O_EXCL) must fail with EEXIST when the final path is
+    // a symbolic link, even if the symlink points at an existing regular file.
+    mfs.symlink("/exclusive.txt", "/exclusive-link.txt");
+    expect(() =>
+      mfs.open("/exclusive-link.txt", O_WRONLY | O_CREAT | O_EXCL, 0o600),
+    ).toThrow(/File exists/);
+  });
+
   it("stat returns correct size after writing", () => {
     const sab = new SharedArrayBuffer(4 * 1024 * 1024);
     const mfs = MemoryFileSystem.create(sab);
@@ -408,6 +546,37 @@ describe("MemoryFileSystem", () => {
     mfs.close(fd);
   });
 
+  it("updates mtime and ctime after file writes and truncates", () => {
+    const now = vi.spyOn(Date, "now");
+    try {
+      const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+      now.mockReturnValue(1_000);
+      const mfs = MemoryFileSystem.create(sab);
+      const O_CREAT = 0x0040,
+        O_RDWR = 0x0002,
+        O_TRUNC = 0x0200;
+      const fd = mfs.open("/timestamps.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+      const initial = mfs.fstat(fd);
+
+      now.mockReturnValue(5_000);
+      mfs.write(fd, new TextEncoder().encode("abc"), null, 3);
+      const afterWrite = mfs.fstat(fd);
+      expect(afterWrite.mtimeMs).toBe(5_000);
+      expect(afterWrite.ctimeMs).toBe(5_000);
+      expect(afterWrite.mtimeMs).toBeGreaterThan(initial.mtimeMs);
+
+      now.mockReturnValue(9_000);
+      mfs.ftruncate(fd, 1);
+      const afterTruncate = mfs.fstat(fd);
+      expect(afterTruncate.mtimeMs).toBe(9_000);
+      expect(afterTruncate.ctimeMs).toBe(9_000);
+      expect(afterTruncate.mtimeMs).toBeGreaterThan(afterWrite.mtimeMs);
+      mfs.close(fd);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("unlink removes a file", () => {
     const sab = new SharedArrayBuffer(4 * 1024 * 1024);
     const mfs = MemoryFileSystem.create(sab);
@@ -417,6 +586,115 @@ describe("MemoryFileSystem", () => {
     mfs.close(fd);
     mfs.unlink("/todelete.txt");
     expect(() => mfs.stat("/todelete.txt")).toThrow();
+  });
+
+  it("rejects unlink paths with a trailing slash on non-directories", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    const fd = mfs.open("/file.txt", O_CREAT | O_WRONLY, 0o644);
+    mfs.close(fd);
+    mfs.symlink("/file.txt", "/link.txt");
+
+    expect(() => mfs.unlink("/file.txt/")).toThrow(/Not a directory/);
+    expect(() => mfs.unlink("/link.txt/")).toThrow(/Not a directory/);
+    expect(mfs.stat("/file.txt").mode & 0xf000).toBe(0x8000);
+    expect(mfs.readlink("/link.txt")).toBe("/file.txt");
+  });
+
+  it("rejects rename source paths that require a non-directory to be a directory", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    const fd = mfs.open("/file.txt", O_CREAT | O_WRONLY, 0o644);
+    mfs.close(fd);
+
+    expect(() => mfs.rename("/file.txt/", "/renamed.txt")).toThrow(
+      /Not a directory/,
+    );
+    expect(mfs.stat("/file.txt").size).toBe(0);
+    expect(() => mfs.stat("/renamed.txt")).toThrow(/No such file/);
+  });
+
+  it("preserves POSIX type checks when renaming directories onto existing paths", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    mfs.mkdir("/dir", 0o755);
+    const fd = mfs.open("/file.txt", O_CREAT | O_WRONLY, 0o644);
+    mfs.close(fd);
+    mfs.symlink("/file.txt", "/link.txt");
+
+    expect(() => mfs.rename("/dir", "/file.txt")).toThrow(/Not a directory/);
+    expect(() => mfs.rename("/dir", "/link.txt")).toThrow(/Not a directory/);
+
+    expect(mfs.stat("/dir").mode & 0xf000).toBe(0x4000);
+    expect(mfs.stat("/file.txt").mode & 0xf000).toBe(0x8000);
+    expect(mfs.readlink("/link.txt")).toBe("/file.txt");
+  });
+
+  it("renames directories over empty directories and updates dot-dot", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    mfs.mkdir("/old-parent", 0o755);
+    mfs.mkdir("/new-parent", 0o755);
+    mfs.mkdir("/old-parent/child", 0o755);
+    const siblingFd = mfs.open(
+      "/new-parent/sibling.txt",
+      O_CREAT | O_WRONLY,
+      0o644,
+    );
+    mfs.close(siblingFd);
+
+    mfs.rename("/old-parent/child", "/new-parent/child");
+    expect(mfs.stat("/new-parent/child/../sibling.txt").mode & 0xf000).toBe(
+      0x8000,
+    );
+
+    mfs.mkdir("/empty-dest", 0o755);
+    mfs.rename("/new-parent/child", "/empty-dest");
+    expect(mfs.stat("/empty-dest").mode & 0xf000).toBe(0x4000);
+    expect(() => mfs.stat("/new-parent/child")).toThrow(/No such file/);
+  });
+
+  it("keeps an unlinked open file alive until close", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_RDWR = 0x0002,
+      O_TRUNC = 0x0200;
+
+    const oldFd = mfs.open("/open.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const oldData = new TextEncoder().encode("old");
+    mfs.write(oldFd, oldData, null, oldData.length);
+    mfs.unlink("/open.txt");
+    expect(() => mfs.stat("/open.txt")).toThrow();
+
+    const newFd = mfs.open("/open.txt", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const newData = new TextEncoder().encode("newer");
+    mfs.write(newFd, newData, null, newData.length);
+
+    mfs.seek(oldFd, 0, 0);
+    const oldBuf = new Uint8Array(8);
+    const oldRead = mfs.read(oldFd, oldBuf, null, oldBuf.length);
+    expect(new TextDecoder().decode(oldBuf.subarray(0, oldRead))).toBe("old");
+
+    mfs.seek(newFd, 0, 0);
+    const newBuf = new Uint8Array(8);
+    const newRead = mfs.read(newFd, newBuf, null, newBuf.length);
+    expect(new TextDecoder().decode(newBuf.subarray(0, newRead))).toBe("newer");
+
+    mfs.close(oldFd);
+    mfs.close(newFd);
   });
 
   it("ftruncate changes file size", () => {
@@ -431,6 +709,24 @@ describe("MemoryFileSystem", () => {
     expect(mfs.fstat(fd).size).toBe(10);
     mfs.ftruncate(fd, 5);
     expect(mfs.fstat(fd).size).toBe(5);
+    mfs.close(fd);
+  });
+
+  it("ftruncate shrink then extend zero-fills the truncated tail", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_RDWR = 0x0002,
+      O_TRUNC = 0x0200;
+    const fd = mfs.open("/zero-tail.bin", O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    const data = new TextEncoder().encode("abcdefghij");
+    mfs.write(fd, data, null, data.length);
+    mfs.ftruncate(fd, 3);
+    mfs.ftruncate(fd, 10);
+    mfs.seek(fd, 0, 0);
+    const buf = new Uint8Array(10);
+    expect(mfs.read(fd, buf, null, buf.length)).toBe(10);
+    expect(Array.from(buf)).toEqual([97, 98, 99, 0, 0, 0, 0, 0, 0, 0]);
     mfs.close(fd);
   });
 

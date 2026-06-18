@@ -2,6 +2,7 @@ use wasm_posix_shared::signal::NSIG;
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use core::ptr;
 
 /// First real-time signal number.
 pub const SIGRTMIN: u32 = 32;
@@ -142,6 +143,11 @@ impl PerThreadSignalState {
         self.raise_internal(signum, si_value, -1) // SI_QUEUE
     }
 
+    /// Mark a signal as pending with explicit siginfo metadata.
+    pub fn raise_with_info(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
+        self.raise_internal(signum, si_value, si_code)
+    }
+
     fn raise_internal(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
         if signum == 0 || signum >= NSIG {
             return false;
@@ -238,6 +244,24 @@ impl SignalState {
         }
     }
 
+    /// Initialize a `SignalState` field in place without constructing the
+    /// 65-entry action array as a temporary on the wasm stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes and must point to uninitialized
+    /// `SignalState` storage.
+    pub(crate) unsafe fn write_default_to(dst: *mut SignalState) {
+        unsafe {
+            let actions = ptr::addr_of_mut!((*dst).actions) as *mut SignalAction;
+            for i in 0..65 {
+                actions.add(i).write(SignalAction::default());
+            }
+            ptr::addr_of_mut!((*dst).blocked).write(0);
+            ptr::addr_of_mut!((*dst).pending).write(0);
+            ptr::addr_of_mut!((*dst).rt_queue).write(VecDeque::new());
+        }
+    }
+
     /// Get the handler for a signal.
     pub fn get_handler(&self, signum: u32) -> SignalHandler {
         if signum == 0 || signum >= 65 {
@@ -309,6 +333,11 @@ impl SignalState {
     /// Mark a signal as pending with an si_value (for sigqueue — SI_QUEUE).
     pub fn raise_with_value(&mut self, signum: u32, si_value: i32) -> bool {
         self.raise_internal(signum, si_value, -1) // SI_QUEUE
+    }
+
+    /// Mark a signal as pending with explicit siginfo metadata.
+    pub fn raise_with_info(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
+        self.raise_internal(signum, si_value, si_code)
     }
 
     fn raise_internal(&mut self, signum: u32, si_value: i32, si_code: i32) -> bool {
@@ -495,6 +524,42 @@ impl SignalState {
             blocked,
             pending: 0,
             rt_queue: VecDeque::new(),
+        }
+    }
+
+    /// Restore one serialized action directly into an already allocated
+    /// signal table. Fork deserialization uses this to avoid a large temporary
+    /// actions array in its wasm stack frame.
+    pub(crate) fn set_deserialized_action(&mut self, signum: u32, action: SignalAction) {
+        if signum > 0 && signum < 65 {
+            self.actions[signum as usize] = action;
+        }
+    }
+
+    /// Reset signal state for exec deserialization without constructing an
+    /// inline actions array on the caller's stack.
+    pub(crate) fn reset_deserialized_exec(&mut self, blocked: u64) {
+        for action in self.actions.iter_mut() {
+            *action = SignalAction::default();
+        }
+        self.blocked = blocked;
+        self.pending = 0;
+        self.rt_queue.clear();
+    }
+
+    /// Restore exec-preserved pending signals and rebuild the synthetic RT
+    /// queue used by `from_parts_with_pending`.
+    pub(crate) fn set_deserialized_pending(&mut self, pending: u64) {
+        self.pending = pending;
+        self.rt_queue.clear();
+        for sig in SIGRTMIN..SIGRTMAX_PLUS1 {
+            if (pending & sig_bit(sig)) != 0 {
+                self.rt_queue.push_back(RtSigEntry {
+                    signum: sig,
+                    si_value: 0,
+                    si_code: 0,
+                });
+            }
         }
     }
 

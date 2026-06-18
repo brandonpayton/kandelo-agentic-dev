@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -eo pipefail
 
 SDK_CXX="${WASM_POSIX_CXX_DRIVER:-0}"
 if [[ "$(basename "$0")" == *c++ ]]; then
@@ -45,6 +45,8 @@ GLUE_DIR="${WASM_POSIX_GLUE_DIR:-/usr/wasm32posix/glue}"
 GLUE_OBJ_DIR="${WASM_POSIX_GLUE_OBJ_DIR:-/usr/wasm32posix/glue-objects}"
 RESOURCE_DIR="${WASM_POSIX_CLANG_RESOURCE_DIR:-/usr/lib/llvm/lib/clang/21}"
 WASM_LD="$(find_tool wasm-ld || true)"
+DEFAULT_EXECUTABLE_STACK_SIZE=8388608
+STACK_GLOBAL_BASE_GAP=65536
 
 [[ -f "${SYSROOT}/lib/libc.a" ]] || die "missing ${SYSROOT}/lib/libc.a"
 [[ -f "${GLUE_DIR}/channel_syscall.c" ]] || die "missing ${GLUE_DIR}/channel_syscall.c"
@@ -144,7 +146,6 @@ exe_link_flags=(
   -Wl,--shared-memory
   -Wl,--max-memory=1073741824
   -Wl,--allow-undefined
-  -Wl,--global-base=1114112
   -Wl,--table-base=3
   -Wl,--export-table
   -Wl,--growable-table
@@ -166,6 +167,8 @@ compile_args=()
 source_inputs=()
 object_inputs=()
 user_link_args=()
+user_stack_size=""
+user_global_base=""
 
 idx=0
 while [[ "$idx" -lt "${#filtered[@]}" ]]; do
@@ -187,6 +190,27 @@ while [[ "$idx" -lt "${#filtered[@]}" ]]; do
       ;;
     -Wl,*)
       IFS=',' read -r -a wl_parts <<< "${arg#-Wl,}"
+      for ((part_idx = 0; part_idx < ${#wl_parts[@]}; part_idx++)); do
+        part="${wl_parts[$part_idx]}"
+        if [[ "$part" == "-z" && $((part_idx + 1)) -lt ${#wl_parts[@]} && "${wl_parts[$((part_idx + 1))]}" == stack-size=* ]]; then
+          value="${wl_parts[$((part_idx + 1))]#stack-size=}"
+          if [[ "$value" =~ ^[0-9]+$ ]]; then
+            user_stack_size="$value"
+          fi
+          part_idx=$((part_idx + 1))
+        elif [[ "$part" == --global-base=* ]]; then
+          value="${part#--global-base=}"
+          if [[ "$value" =~ ^[0-9]+$ ]]; then
+            user_global_base="$value"
+          fi
+        elif [[ "$part" == "--global-base" && $((part_idx + 1)) -lt ${#wl_parts[@]} ]]; then
+          value="${wl_parts[$((part_idx + 1))]}"
+          if [[ "$value" =~ ^[0-9]+$ ]]; then
+            user_global_base="$value"
+          fi
+          part_idx=$((part_idx + 1))
+        fi
+      done
       user_link_args+=("${wl_parts[@]}")
       ;;
     -L)
@@ -203,6 +227,13 @@ while [[ "$idx" -lt "${#filtered[@]}" ]]; do
   esac
   idx=$((idx + 1))
 done
+
+sdk_stack_size="${user_stack_size:-$DEFAULT_EXECUTABLE_STACK_SIZE}"
+sdk_global_base="${user_global_base:-$((sdk_stack_size + STACK_GLOBAL_BASE_GAP))}"
+exe_link_flags+=(
+  "-Wl,--global-base=${sdk_global_base}"
+  "-Wl,-z,stack-size=${sdk_stack_size}"
+)
 
 compiled_objects=()
 for src in "${source_inputs[@]}"; do

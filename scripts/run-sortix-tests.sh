@@ -38,9 +38,6 @@ INCLUDE_EXPECTED_FAIL=(
 
 BASIC_EXPECTED_FAIL=(
     "devctl/posix_devctl"                                 # device control (Sortix/2024, not in musl)
-    "pthread/pthread_condattr_setpshared"                 # cross-process MAP_SHARED|MAP_ANONYMOUS memory
-                                                          # not supported on wasm (pthread primitives ARE
-                                                          # supported — see crates/kernel/src/pshared.rs)
     "pthread/pthread_attr_setinheritsched"                # priority scheduling not supported
     "strings/ffsll"                                       # wasm32 test bug (long vs long long)
     # aio/aio_cancel was flaky (FAIL once, XPASS next run) — left
@@ -654,12 +651,14 @@ _run_runtime_test_worker() {
 
     # Run with timeout. KERNEL_CWD is the data directory containing symlinks
     # to test binaries at their expected relative paths (e.g., fcntl/open).
-    local output rc
+    local output rc output_file
     # stdin redirected to /dev/null: run-example.ts reads process.stdin
     # when not a TTY, which would drain any pipe the caller supplies.
     set +e
-    output=$(cd "$REPO_ROOT" && KERNEL_CWD="${SORTIX_DATA_DIR:-$REPO_ROOT}" run_with_timeout "$this_timeout" node --experimental-wasm-exnref --import tsx/esm examples/run-example.ts "${wasm}" </dev/null 2>&1)
+    output_file="$result_dir/${test_name//\//__}.out"
+    (cd "$REPO_ROOT" && KERNEL_CWD="${SORTIX_DATA_DIR:-$REPO_ROOT}" run_with_timeout "$this_timeout" node --experimental-wasm-exnref --import tsx/esm examples/run-example.ts "${wasm}" </dev/null >"$output_file" 2>&1)
     rc=$?
+    output=$(cat "$output_file")
     set -e
 
     # Clean up .so symlink
@@ -667,7 +666,7 @@ _run_runtime_test_worker() {
 
     # Sortix convention: if output is empty or exit code >= 2,
     # append "exit: N" to the output (matches tests/sortix/os-test/misc/run.sh)
-    if [ -z "$output" ] || [ "$rc" -ge 2 ]; then
+    if [ ! -s "$output_file" ] || [ "$rc" -ge 2 ]; then
         if [ -n "$output" ]; then
             output="$output
 exit: $rc"

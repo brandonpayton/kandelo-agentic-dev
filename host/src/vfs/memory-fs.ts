@@ -721,7 +721,7 @@ export class MemoryFileSystem implements FileSystemBackend {
   private adaptStat(s: SfsStatResult): StatResult {
     return {
       dev: 0,
-      ino: s.ino,
+      ino: this.reportedInodeNumber(s),
       mode: s.mode,
       nlink: s.linkCount,
       uid: s.uid,
@@ -731,6 +731,35 @@ export class MemoryFileSystem implements FileSystemBackend {
       mtimeMs: s.mtime,
       ctimeMs: s.ctime,
     };
+  }
+
+  private reportedInodeNumber(s: SfsStatResult): number {
+    // POSIX permits inode reuse after unlink.  Do not expose the SharedFS
+    // internal generation counter as part of st_ino: 32-bit guest runtimes
+    // commonly surface inode numbers through signed long APIs, and inflated
+    // synthetic inode values can become unrepresentable even though the raw
+    // filesystem inode is small and stable for the file's lifetime.
+    return s.ino;
+  }
+
+  private applyLazyStatSize(result: StatResult, rawIno: number): StatResult {
+    const entry = this.lazyFiles.get(rawIno);
+    if (entry) {
+      result.size = entry.size;
+      return result;
+    }
+
+    const group = this.lazyArchiveInodes.get(rawIno);
+    if (group) {
+      for (const archiveEntry of group.entries.values()) {
+        if (archiveEntry.ino === rawIno) {
+          result.size = archiveEntry.size;
+          break;
+        }
+      }
+    }
+
+    return result;
   }
 
   open(path: string, flags: number, mode: number): number {
@@ -781,23 +810,8 @@ export class MemoryFileSystem implements FileSystemBackend {
   }
 
   fstat(handle: number): StatResult {
-    const result = this.adaptStat(this.fs.fstat(handle));
-    // Override size for unmaterialized lazy files / archive entries
-    const entry = this.lazyFiles.get(result.ino);
-    if (entry) {
-      result.size = entry.size;
-    } else {
-      const group = this.lazyArchiveInodes.get(result.ino);
-      if (group) {
-        for (const archiveEntry of group.entries.values()) {
-          if (archiveEntry.ino === result.ino) {
-            result.size = archiveEntry.size;
-            break;
-          }
-        }
-      }
-    }
-    return result;
+    const stat = this.fs.fstat(handle);
+    return this.applyLazyStatSize(this.adaptStat(stat), stat.ino);
   }
 
   ftruncate(handle: number, length: number): void {
@@ -815,43 +829,13 @@ export class MemoryFileSystem implements FileSystemBackend {
   }
 
   stat(path: string): StatResult {
-    const result = this.adaptStat(this.fs.stat(path));
-    // Override size for unmaterialized lazy files / archive entries
-    const entry = this.lazyFiles.get(result.ino);
-    if (entry) {
-      result.size = entry.size;
-    } else {
-      const group = this.lazyArchiveInodes.get(result.ino);
-      if (group) {
-        for (const archiveEntry of group.entries.values()) {
-          if (archiveEntry.ino === result.ino) {
-            result.size = archiveEntry.size;
-            break;
-          }
-        }
-      }
-    }
-    return result;
+    const stat = this.fs.stat(path);
+    return this.applyLazyStatSize(this.adaptStat(stat), stat.ino);
   }
 
   lstat(path: string): StatResult {
-    const result = this.adaptStat(this.fs.lstat(path));
-    // Override size for unmaterialized lazy files / archive entries
-    const entry = this.lazyFiles.get(result.ino);
-    if (entry) {
-      result.size = entry.size;
-    } else {
-      const group = this.lazyArchiveInodes.get(result.ino);
-      if (group) {
-        for (const archiveEntry of group.entries.values()) {
-          if (archiveEntry.ino === result.ino) {
-            result.size = archiveEntry.size;
-            break;
-          }
-        }
-      }
-    }
-    return result;
+    const stat = this.fs.lstat(path);
+    return this.applyLazyStatSize(this.adaptStat(stat), stat.ino);
   }
 
   statfs(path: string): StatfsResult {
@@ -970,7 +954,7 @@ export class MemoryFileSystem implements FileSystemBackend {
     if ((mode & 0xf000) === 0x8000) dtype = 8; // DT_REG
     else if ((mode & 0xf000) === 0x4000) dtype = 4; // DT_DIR
     else if ((mode & 0xf000) === 0xa000) dtype = 10; // DT_LNK
-    return { name: entry.name, type: dtype, ino: entry.stat.ino };
+    return { name: entry.name, type: dtype, ino: this.reportedInodeNumber(entry.stat) };
   }
 
   closedir(handle: number): void {

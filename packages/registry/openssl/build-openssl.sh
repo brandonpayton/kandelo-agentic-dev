@@ -65,7 +65,6 @@ perl Configure linux-generic32 \
     no-ui-console \
     no-tests \
     no-apps \
-    no-autoerrinit \
     no-posix-io \
     --prefix="$INSTALL_DIR" \
     --openssldir=/etc/ssl

@@ -76,6 +76,10 @@ export interface BrowserKernelOptions {
   syscallLogPtrWidth?: 4 | 8;
   /** Forwarded to TlsNetworkBackendOptions.dnsAliases. */
   dnsAliases?: Record<string, string>;
+  /** Forwarded to TlsNetworkBackendOptions.corsProxyUrl. Browser pages that
+   *  are not controlled by Kandelo's service worker can use this to route
+   *  guest outbound HTTP(S) through a same-origin proxy. */
+  corsProxyUrl?: string;
 }
 
 /** Options for {@link BrowserKernel.boot}. */
@@ -106,6 +110,10 @@ export interface BrowserKernelBootOptions {
   pty?: boolean;
   /** Initial stdin bytes (with implicit EOF). */
   stdin?: Uint8Array;
+  /** Whether supplied stdin should make fd 0 pipe-like for isatty/fstat. */
+  stdinIsPipe?: boolean;
+  /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
+  pipeStdio?: number[];
 }
 
 export class BrowserKernel {
@@ -134,6 +142,7 @@ export class BrowserKernel {
   > &
     BrowserKernelOptions;
   private exitResolvers = new Map<number, (status: number) => void>();
+  private pendingExitStatuses = new Map<number, number>();
   private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   private nextRequestId = 1;
   private ptyOutputCallbacks = new Map<number, (data: Uint8Array) => void>();
@@ -374,6 +383,7 @@ export class BrowserKernel {
           enableSyscallLog: this.options.enableSyscallLog,
           syscallLogPtrWidth: this.options.syscallLogPtrWidth,
           dnsAliases: this.options.dnsAliases,
+          corsProxyUrl: this.options.corsProxyUrl,
         },
       };
       this.kernelWorkerHandle.postMessage(initMsg, [transferBuf]);
@@ -402,12 +412,12 @@ export class BrowserKernel {
       gid: options.gid,
       pty: options.pty,
       stdin: options.stdin,
+      stdinIsPipe: options.stdinIsPipe,
+      pipeStdio: options.pipeStdio,
       maxPages: this.maxPages,
     }) as number;
 
-    const exit = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exit = this.createExitPromise(pid);
 
     if (options.pty) {
       this.sendToKernel({ type: "register_pty_output", pid });
@@ -446,6 +456,8 @@ export class BrowserKernel {
       env?: string[];
       cwd?: string;
       stdin?: Uint8Array;
+      stdinIsPipe?: boolean;
+      pipeStdio?: number[];
       pty?: boolean;
       uid?: number;
       gid?: number;
@@ -457,9 +469,7 @@ export class BrowserKernel {
     const pid = this.nextPid++;
     const requestId = this.nextRequestId++;
 
-    const exitPromise = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exitPromise = this.createExitPromise(pid);
 
     // Clone programBytes since it gets transferred (detached)
     const bytesToSend = programBytes.slice(0);
@@ -478,6 +488,8 @@ export class BrowserKernel {
       ptyCols: options?.ptyCols,
       ptyRows: options?.ptyRows,
       stdin: options?.stdin,
+      stdinIsPipe: options?.stdinIsPipe,
+      pipeStdio: options?.pipeStdio,
       maxPages: this.maxPages,
     }, [bytesToSend]);
 
@@ -512,7 +524,7 @@ export class BrowserKernel {
   async spawnFromVfs(
     programPath: string,
     argv: string[],
-    options?: { env?: string[]; cwd?: string; uid?: number; gid?: number; pty?: boolean; stdin?: Uint8Array },
+    options?: { env?: string[]; cwd?: string; uid?: number; gid?: number; pty?: boolean; stdin?: Uint8Array; stdinIsPipe?: boolean; pipeStdio?: number[] },
   ): Promise<{ pid: number; exit: Promise<number> }> {
     const requestId = this.nextRequestId++;
     const pid = await this.request(requestId, {
@@ -526,18 +538,29 @@ export class BrowserKernel {
       gid: options?.gid,
       pty: options?.pty,
       stdin: options?.stdin,
+      stdinIsPipe: options?.stdinIsPipe,
+      pipeStdio: options?.pipeStdio,
       maxPages: this.maxPages,
     }) as number;
 
-    const exit = new Promise<number>((resolve) => {
-      this.exitResolvers.set(pid, resolve);
-    });
+    const exit = this.createExitPromise(pid);
 
     if (options?.pty) {
       this.sendToKernel({ type: "register_pty_output", pid });
     }
 
     return { pid, exit };
+  }
+
+  private createExitPromise(pid: number): Promise<number> {
+    if (this.pendingExitStatuses.has(pid)) {
+      const status = this.pendingExitStatuses.get(pid)!;
+      this.pendingExitStatuses.delete(pid);
+      return Promise.resolve(status);
+    }
+    return new Promise<number>((resolve) => {
+      this.exitResolvers.set(pid, resolve);
+    });
   }
 
   /**
@@ -886,6 +909,7 @@ export class BrowserKernel {
     });
     this.kernelWorkerHandle.terminate();
     this.exitResolvers.clear();
+    this.pendingExitStatuses.clear();
     this.pendingRequests.clear();
     this.ptyOutputCallbacks.clear();
   }
@@ -950,7 +974,11 @@ export class BrowserKernel {
       case "exit": {
         const resolver = this.exitResolvers.get(msg.pid);
         this.exitResolvers.delete(msg.pid);
-        if (resolver) resolver(msg.status);
+        if (resolver) {
+          resolver(msg.status);
+        } else {
+          this.pendingExitStatuses.set(msg.pid, msg.status);
+        }
         this.options.onProcessEvent?.({ kind: "exit", pid: msg.pid, exitStatus: msg.status });
         break;
       }

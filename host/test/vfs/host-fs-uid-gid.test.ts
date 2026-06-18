@@ -1,8 +1,24 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { chmodSync, fstatSync, mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostFileSystem } from "../../src/vfs/host-fs";
+
+const UTIME_NOW = 0x3fffffff;
+const UTIME_OMIT = 0x3ffffffe;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 describe("HostFileSystem uid/gid normalization", () => {
   let root: string;
@@ -109,5 +125,97 @@ describe("HostFileSystem uid/gid normalization", () => {
     } finally {
       hfs.close(fd);
     }
+  });
+
+  it("allows mknod-style callers to overlay a FIFO file type", () => {
+    const nativePath = join(root, "fifo-overlay");
+    writeFileSync(nativePath, "");
+
+    const hfs = new HostFileSystem(root);
+    const fd = hfs.open("/fifo-overlay", 0, 0);
+    try {
+      hfs.fchmod(fd, 0o010000 | 0o755);
+      expect(hfs.fstat(fd).mode & 0o170000).toBe(0o010000);
+      expect(hfs.stat("/fifo-overlay").mode & 0o170000).toBe(0o010000);
+
+      hfs.fchmod(fd, 0o600);
+      const afterChmod = hfs.stat("/fifo-overlay");
+      expect(afterChmod.mode & 0o170000).toBe(0o010000);
+      expect(afterChmod.mode & 0o7777).toBe(0o600);
+      expect(fstatSync(fd).isFile()).toBe(true);
+    } finally {
+      hfs.close(fd);
+    }
+  });
+
+  it("reports native ctime changes after a virtual chmod overlay exists", async () => {
+    const hfs = new HostFileSystem(root);
+    const dir = "/ctime-dir";
+    const nativeDir = join(root, "ctime-dir");
+    rmSync(nativeDir, { recursive: true, force: true });
+    hfs.mkdir(dir, 0o755);
+
+    const before = hfs.stat(dir);
+    await delay(25);
+    hfs.utimensat(dir, 0, UTIME_OMIT, 12_345, 0);
+    const after = hfs.stat(dir);
+
+    expect(after.atimeMs).toBe(before.atimeMs);
+    expect(Math.floor(after.mtimeMs / 1000)).toBe(12_345);
+    expect(after.ctimeMs).toBeGreaterThan(before.ctimeMs);
+  });
+
+  it("honors UTIME_NOW while preserving virtual mode metadata", async () => {
+    const nativePath = join(root, "utime-now.txt");
+    writeFileSync(nativePath, "hi");
+    const hfs = new HostFileSystem(root);
+    hfs.chmod("/utime-now.txt", 0o751);
+    const before = hfs.stat("/utime-now.txt");
+
+    await delay(25);
+    hfs.utimensat("/utime-now.txt", 0, UTIME_OMIT, 0, UTIME_NOW);
+    const after = hfs.stat("/utime-now.txt");
+
+    expect(after.mode & 0o7777).toBe(0o751);
+    expect(after.atimeMs).toBe(before.atimeMs);
+    expect(after.mtimeMs).toBeGreaterThanOrEqual(before.mtimeMs);
+    expect(after.ctimeMs).toBeGreaterThan(before.ctimeMs);
+  });
+
+  it("invalidates cached directory resolution when directories move", () => {
+    const nativeDir = join(root, "cached-dir");
+    const nativeMoved = join(root, "cached-dir-moved");
+    rmSync(nativeDir, { recursive: true, force: true });
+    rmSync(nativeMoved, { recursive: true, force: true });
+    mkdirSync(nativeDir);
+    writeFileSync(join(nativeDir, "file.txt"), "hi");
+
+    const hfs = new HostFileSystem(root);
+    expect(hfs.stat("/cached-dir/file.txt").size).toBe(2);
+    hfs.rename("/cached-dir", "/cached-dir-moved");
+
+    expect(() => hfs.stat("/cached-dir/file.txt")).toThrow();
+    expect(hfs.stat("/cached-dir-moved/file.txt").size).toBe(2);
+  });
+
+  it("does not cache symlink resolution across symlink replacement", () => {
+    const nativeA = join(root, "symlink-a");
+    const nativeB = join(root, "symlink-b");
+    const nativeLink = join(root, "symlink-current");
+    rmSync(nativeA, { recursive: true, force: true });
+    rmSync(nativeB, { recursive: true, force: true });
+    rmSync(nativeLink, { force: true });
+    mkdirSync(nativeA);
+    mkdirSync(nativeB);
+    writeFileSync(join(nativeA, "file.txt"), "a");
+    writeFileSync(join(nativeB, "file.txt"), "bb");
+    symlinkSync("symlink-a", nativeLink);
+
+    const hfs = new HostFileSystem(root);
+    expect(hfs.stat("/symlink-current/file.txt").size).toBe(1);
+    hfs.unlink("/symlink-current");
+    symlinkSync("symlink-b", nativeLink);
+
+    expect(hfs.stat("/symlink-current/file.txt").size).toBe(2);
   });
 });

@@ -4,7 +4,7 @@
 //! exactly which functions should be reported as reaching the
 //! `kernel.kernel_fork` import through direct calls.
 
-use fork_instrument::{analyze, Options};
+use fork_instrument::{Options, analyze};
 use std::collections::HashSet;
 
 fn discover(wat_src: &str) -> HashSet<String> {
@@ -332,6 +332,219 @@ fn declared_element_is_not_an_indirect_table_target() {
     assert!(
         !found.iter().any(|n| n == "calls_table"),
         "declared elements do not populate an indirect-call table; got {found:?}"
+    );
+}
+
+#[test]
+fn dynamic_table_write_does_not_make_every_function_a_target() {
+    // A dynamic table operation means this table may receive runtime function
+    // references, but it does not mean that every function in the module can
+    // appear in the table. In large libc/Tcl modules, that false positive
+    // pulls generic syscall and malloc paths into the fork path.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (result i32)))
+          (type $ft (func (result i32)))
+          (table $t 1 funcref)
+          (func $fork_wrapper (export "fork_wrapper") (result i32)
+            call $fork)
+          (func $calls_table (export "calls_table") (result i32)
+            i32.const 0
+            call_indirect $t (type $ft))
+          (func $grows_table (export "grows_table") (result i32)
+            ref.null func
+            i32.const 1
+            table.grow $t))
+    "#;
+    let found = discover(wat);
+    assert!(found.iter().any(|n| n == "fork_wrapper"));
+    assert!(
+        !found.iter().any(|n| n == "calls_table"),
+        "dynamic table writes must not make non-address-taken fork paths \
+         possible indirect targets; got {found:?}"
+    );
+}
+
+#[test]
+fn dynamic_table_write_can_reach_address_taken_fork_target() {
+    // If a fork-path function is address-taken and the table is written
+    // dynamically, a same-table matching-signature call_indirect remains a
+    // possible fork path.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (result i32)))
+          (type $ft (func (result i32)))
+          (table $t 1 funcref)
+          (elem declare func $fork_target)
+          (func $fork_target (export "fork_target") (result i32)
+            call $fork)
+          (func $writes_target
+            i32.const 0
+            ref.func $fork_target
+            table.set $t)
+          (func $calls_table (export "calls_table") (result i32)
+            i32.const 0
+            call_indirect $t (type $ft)))
+    "#;
+    let found = discover(wat);
+    assert!(found.iter().any(|n| n == "fork_target"));
+    assert!(
+        found.iter().any(|n| n == "calls_table"),
+        "dynamic write of an address-taken fork target must be followed; got {found:?}"
+    );
+}
+
+#[test]
+fn dynamic_linker_indirect_call_is_conservative_fork_boundary() {
+    // A dlopen/dlsym-capable main module can have side-module functions
+    // inserted into its indirect function table by the host after static
+    // analysis. If such a side-module function calls fork(), the main-module
+    // frame above the call_indirect must be serializable even though the
+    // side-module target is not present in any static element segment.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (result i32)))
+          (import "env" "__wasm_dlsym" (func $dlsym (param i32 i32 i32) (result i32)))
+          (type $side_fn_ty (func (result i32)))
+          (table $t 1 funcref)
+          (func $dispatch_side_callback (export "dispatch_side_callback") (result i32)
+            i32.const 0
+            call_indirect $t (type $side_fn_ty))
+          (func $parent_frame (export "parent_frame") (result i32)
+            call $dispatch_side_callback)
+          (func $ordinary (export "ordinary") (result i32)
+            i32.const 7))
+    "#;
+    let found = discover(wat);
+    assert!(
+        found.iter().any(|n| n == "dispatch_side_callback"),
+        "dynamic-linking call_indirect sites must be instrumented as potential \
+         side-module fork boundaries; got {found:?}"
+    );
+    assert!(
+        found.iter().any(|n| n == "parent_frame"),
+        "direct callers above a dynamic side-module dispatch must also be saved; got {found:?}"
+    );
+    assert!(
+        !found.iter().any(|n| n == "ordinary"),
+        "unrelated dynamic-linking functions without call_indirect should stay out; got {found:?}"
+    );
+}
+
+#[test]
+fn ambiguous_same_signature_first_hop_is_followed() {
+    // A large C function table often contains many functions with the same
+    // signature. The first indirect hop out of a proven direct fork path still
+    // has to be followed so dispatcher frames are saved for fork unwind.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (result i32)))
+          (type $ft (func (param i32) (result i32)))
+          (table $t 2 funcref)
+          (elem (table $t) (i32.const 0) func $fork_target $safe_target)
+          (func $fork_target (export "fork_target") (param i32) (result i32)
+            call $fork
+            local.get 0
+            i32.add)
+          (func $safe_target (param i32) (result i32)
+            local.get 0)
+          (func $unknown_index_caller (export "unknown_index_caller") (param i32) (result i32)
+            local.get 0
+            local.get 0
+            call_indirect $t (type $ft)))
+    "#;
+    let found = discover(wat);
+    assert!(found.iter().any(|n| n == "fork_target"));
+    assert!(
+        found.iter().any(|n| n == "unknown_index_caller"),
+        "first-hop dispatch into a direct fork path must be included; got {found:?}"
+    );
+}
+
+#[test]
+fn ambiguous_same_signature_second_hop_is_not_followed_without_index_proof() {
+    // Ambiguous first-hop dispatch is required for real command dispatchers.
+    // Ambiguous second-hop dispatch crosses unrelated callback domains in
+    // large C modules unless the analyzer can prove the table index.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (result i32)))
+          (type $fork_ty (func (result i32)))
+          (type $middle_ty (func (result i64)))
+          (table $t 4 funcref)
+          (elem (table $t) (i32.const 0) func $fork_target $safe_fork_sig $middle $safe_middle_sig)
+
+          (func $fork_target (export "fork_target") (result i32)
+            call $fork)
+          (func $safe_fork_sig (result i32)
+            i32.const 0)
+          (func $helper
+            nop)
+
+          (func $middle (export "middle") (result i64)
+            call $helper
+            i32.const 0
+            call_indirect $t (type $fork_ty)
+            drop
+            i64.const 1)
+          (func $safe_middle_sig (result i64)
+            i64.const 0)
+
+          (func $second_hop_dispatch (export "second_hop_dispatch") (param i32) (result i64)
+            local.get 0
+            call_indirect $t (type $middle_ty)))
+    "#;
+    let found = discover(wat);
+    assert!(found.iter().any(|n| n == "fork_target"));
+    assert!(
+        found.iter().any(|n| n == "middle"),
+        "ambiguous first-hop dispatch should include middle; got {found:?}"
+    );
+    assert!(
+        !found.iter().any(|n| n == "second_hop_dispatch"),
+        "ambiguous second-hop dispatch needs index value-flow proof; got {found:?}"
+    );
+}
+
+#[test]
+fn ambiguous_same_signature_second_hop_through_trampoline_is_followed() {
+    // Tcl's non-recursive command dispatch has a frame above Dispatch; Dispatch
+    // itself is a simple indirect trampoline. That parent frame must be saved
+    // so fork rewind can return through the actual Tcl stack.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (result i32)))
+          (type $fork_ty (func (result i32)))
+          (type $middle_ty (func (result i64)))
+          (table $t 4 funcref)
+          (elem (table $t) (i32.const 0) func $fork_target $safe_fork_sig $trampoline $safe_middle_sig)
+
+          (func $fork_target (export "fork_target") (result i32)
+            call $fork)
+          (func $safe_fork_sig (result i32)
+            i32.const 0)
+
+          (func $trampoline (export "trampoline") (result i64)
+            i32.const 0
+            call_indirect $t (type $fork_ty)
+            drop
+            i64.const 1)
+          (func $safe_middle_sig (result i64)
+            i64.const 0)
+
+          (func $second_hop_dispatch (export "second_hop_dispatch") (param i32) (result i64)
+            local.get 0
+            call_indirect $t (type $middle_ty)))
+    "#;
+    let found = discover(wat);
+    assert!(found.iter().any(|n| n == "fork_target"));
+    assert!(
+        found.iter().any(|n| n == "trampoline"),
+        "ambiguous first-hop dispatch should include trampoline; got {found:?}"
+    );
+    assert!(
+        found.iter().any(|n| n == "second_hop_dispatch"),
+        "ambiguous second-hop through a simple trampoline must be followed; got {found:?}"
     );
 }
 

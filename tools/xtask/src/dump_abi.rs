@@ -77,7 +77,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     let kernel_wasm = kernel_wasm.ok_or_else(|| {
         "missing --kernel-wasm <path>. Build the kernel first \
          (e.g. via scripts/check-abi-version.sh) and pass the path to \
-         target/wasm64-unknown-unknown/release/kandelo_kernel.wasm. \
+         target/wasm32-unknown-unknown/release/kandelo_kernel.wasm. \
          Refusing to write a partial snapshot."
             .to_string()
     })?;
@@ -478,6 +478,7 @@ fn render_ts_module() -> String {
     out.push_str("  direction: SyscallArgDirection;\n");
     out.push_str("  size: SyscallArgSizeSpec;\n");
     out.push_str("  copyRetvalAdd?: number;\n");
+    out.push_str("  copyRetvalLimit?: boolean;\n");
     out.push_str("}\n\n");
 
     out.push_str("export const SYSCALL_ARGS: Record<number, SyscallArgDesc[]> = {\n");
@@ -502,6 +503,9 @@ fn ts_syscall_arg_desc(desc: &shared::host_abi::SyscallArgDesc) -> String {
     );
     if desc.copy_retval_add != 0 {
         s.push_str(&format!(", copyRetvalAdd: {}", desc.copy_retval_add));
+    }
+    if !desc.copy_retval_limit {
+        s.push_str(", copyRetvalLimit: false");
     }
     s.push_str(" }");
     s
@@ -903,6 +907,9 @@ fn marshalled_structs() -> Value {
             st_ctime_sec,
             st_ctime_nsec,
             _pad,
+            st_rdev,
+            st_blksize,
+            st_blocks,
         }),
     );
     structs.insert(
@@ -1265,6 +1272,9 @@ fn syscall_arg_desc_json(desc: &shared::host_abi::SyscallArgDesc) -> Value {
     m.insert("size".into(), syscall_arg_size_json(desc.size));
     if desc.copy_retval_add != 0 {
         m.insert("copyRetvalAdd".into(), json!(desc.copy_retval_add));
+    }
+    if !desc.copy_retval_limit {
+        m.insert("copyRetvalLimit".into(), json!(false));
     }
     Value::Object(m.into_iter().collect())
 }

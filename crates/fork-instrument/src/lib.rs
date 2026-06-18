@@ -14,7 +14,7 @@
 //! - Phase 6: catch-handler region support
 //! - Phase 7: production rollout
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 pub mod call_graph;
 pub mod instrument;
@@ -53,8 +53,7 @@ pub struct Analysis {
 /// Phase 2 scope: direct-call closure only. Phase 3 extends to
 /// indirect calls.
 pub fn analyze(input: &[u8], opts: &Options) -> Result<Analysis> {
-    let module = walrus::Module::from_buffer(input)
-        .context("failed to parse input wasm module")?;
+    let module = walrus::Module::from_buffer(input).context("failed to parse input wasm module")?;
 
     let Some(entry) = call_graph::find_import_func(&module, &opts.entry_import) else {
         bail!(
@@ -84,8 +83,9 @@ pub fn analyze(input: &[u8], opts: &Options) -> Result<Analysis> {
 /// tool is invoked by build scripts across programs that may or may
 /// not use `fork()`.
 pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
-    let mut module = walrus::Module::from_buffer(input)
-        .context("failed to parse input wasm module")?;
+    let leading_dylink_section = leading_dylink_section(input);
+    let mut module =
+        walrus::Module::from_buffer(input).context("failed to parse input wasm module")?;
 
     // Discover the fork-path closure *before* we mutate the module so
     // the runtime's own injected functions are not mistaken for
@@ -133,6 +133,61 @@ pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
     // see `instrument_one_function_switch` / `instrument_one_function_nested_switch`
     // for the actual transform.
 
-    let output = module.emit_wasm();
+    let mut output = module.emit_wasm();
+    if let Some(section) = leading_dylink_section {
+        // Walrus does not preserve arbitrary custom sections on re-emit.
+        // For WebAssembly side modules, the `dylink.0` custom section is not
+        // optional metadata: the dynamic-linking ABI requires it to be the
+        // first section so loaders can allocate the module's memory/table
+        // footprint before instantiation. Preserve that leading section when
+        // instrumenting a side module (for example a shared library whose fork
+        // path is reached through an imported libc symbol).
+        output.splice(8..8, section.iter().copied());
+    }
     Ok(output)
+}
+
+fn leading_dylink_section(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() < 8 || &input[0..4] != b"\0asm" {
+        return None;
+    }
+    let mut offset = 8usize;
+    let section_start = offset;
+    let section_id = *input.get(offset)?;
+    offset += 1;
+    if section_id != 0 {
+        return None;
+    }
+    let size = read_var_u32(input, &mut offset)? as usize;
+    let payload_start = offset;
+    let payload_end = payload_start.checked_add(size)?;
+    if payload_end > input.len() {
+        return None;
+    }
+    let name_len = read_var_u32(input, &mut offset)? as usize;
+    let name_end = offset.checked_add(name_len)?;
+    if name_end > payload_end {
+        return None;
+    }
+    if &input[offset..name_end] != b"dylink.0" {
+        return None;
+    }
+    Some(input[section_start..payload_end].to_vec())
+}
+
+fn read_var_u32(input: &[u8], offset: &mut usize) -> Option<u32> {
+    let mut result = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let byte = *input.get(*offset)?;
+        *offset += 1;
+        result |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
 }

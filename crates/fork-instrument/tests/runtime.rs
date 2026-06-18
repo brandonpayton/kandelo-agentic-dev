@@ -11,8 +11,8 @@
 //! - Independently validating via wasmparser that the emitted module
 //!   is well-formed.
 
-use fork_instrument::{Options, instrument};
 use fork_instrument::runtime::names;
+use fork_instrument::{Options, instrument};
 use walrus::{ExportItem, Module, ValType};
 
 fn instrument_wat(wat_src: &str) -> Vec<u8> {
@@ -21,9 +21,8 @@ fn instrument_wat(wat_src: &str) -> Vec<u8> {
 }
 
 fn validate(bytes: &[u8]) {
-    let mut validator = wasmparser::Validator::new_with_features(
-        wasmparser::WasmFeatures::default(),
-    );
+    let mut validator =
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default());
     validator.validate_all(bytes).expect("valid wasm");
 }
 
@@ -174,10 +173,7 @@ use walrus::ir::Instr;
 
 /// Helper: count `Store` / `Load` instructions in the body of the
 /// named export by re-parsing the instrumented module.
-fn export_body_instr_counts(
-    module: &Module,
-    export: &str,
-) -> (usize, usize) {
+fn export_body_instr_counts(module: &Module, export: &str) -> (usize, usize) {
     let id = match module
         .exports
         .iter()
@@ -223,8 +219,7 @@ fn unwind_begin_stores_one_per_saved_global() {
     // state+buf globals are added *after* the scan so they are also
     // excluded. Plus Phase 7 Task 1 adds one store for `current_pos` at
     // buf+0. Expected: 1 (current_pos) + 2 (saved globals) = 3 stores.
-    let (stores, loads) =
-        export_body_instr_counts(&module, names::EXPORT_UNWIND_BEGIN);
+    let (stores, loads) = export_body_instr_counts(&module, names::EXPORT_UNWIND_BEGIN);
     assert_eq!(
         stores, 3,
         "unwind_begin should store current_pos + one per saved global",
@@ -237,8 +232,7 @@ fn rewind_begin_loads_one_per_saved_global() {
     let bytes = instrument_wat(MODULE_WITH_EXTRA_GLOBAL);
     let module = Module::from_buffer(&bytes).unwrap();
 
-    let (stores, loads) =
-        export_body_instr_counts(&module, names::EXPORT_REWIND_BEGIN);
+    let (stores, loads) = export_body_instr_counts(&module, names::EXPORT_REWIND_BEGIN);
     assert_eq!(loads, 2, "rewind_begin should load each saved global");
     assert_eq!(stores, 0, "rewind_begin never writes the save buffer");
 }
@@ -379,10 +373,9 @@ fn unwind_begin_writes_frames_start_offset_wasm32() {
     let value_instr = &instrs[store_idx - 1];
     match value_instr {
         Instr::Const(c) => match c.value {
-            walrus::ir::Value::I32(v) => assert_eq!(
-                v, 8,
-                "wasm32 empty-globals frames_start_offset is 2*4 = 8",
-            ),
+            walrus::ir::Value::I32(v) => {
+                assert_eq!(v, 8, "wasm32 empty-globals frames_start_offset is 2*4 = 8",)
+            }
             other => panic!("expected I32 const, got {other:?}"),
         },
         other => panic!("expected Const immediately before store, got {other:?}"),

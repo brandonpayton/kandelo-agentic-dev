@@ -486,6 +486,35 @@ impl IpcTable {
         }
     }
 
+    /// Apply the mutable fields from `struct msqid_ds` for IPC_SET.
+    ///
+    /// POSIX/SysV IPC permits the queue owner (or root) to update the
+    /// permission uid/gid/mode and queue byte limit. The queue's creator ids
+    /// and accounting fields are kernel-owned and are intentionally left
+    /// unchanged.
+    pub fn msgctl_set(
+        &mut self,
+        qid: i32,
+        new_uid: u32,
+        new_gid: u32,
+        new_mode: u32,
+        new_qbytes: u32,
+        uid: u32,
+        _gid: u32,
+    ) -> Result<(), Errno> {
+        let q = self.msg_queues.get_mut(&qid).ok_or(Errno::EINVAL)?;
+        ipc_check_owner(uid, q.uid, q.cuid)?;
+        if new_qbytes == 0 || new_qbytes < q.cbytes {
+            return Err(Errno::EINVAL);
+        }
+        q.uid = new_uid;
+        q.gid = new_gid;
+        q.mode = new_mode & IPC_PERM_MASK;
+        q.qbytes = new_qbytes;
+        q.ctime = crate::current_time_secs();
+        Ok(())
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Semaphores
     // ═══════════════════════════════════════════════════════════════
@@ -1088,6 +1117,35 @@ mod tests {
         let qid = t.msgget(IPC_PRIVATE, IPC_CREAT | 0o666, 1, 0, 0).unwrap();
         t.msgctl(qid, IPC_RMID, 1, 0, 0).unwrap();
         assert_eq!(t.msgctl(qid, IPC_STAT, 1, 0, 0).unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn test_msgctl_set_updates_mutable_fields() {
+        let mut t = IpcTable::new();
+        let qid = t.msgget(IPC_PRIVATE, IPC_CREAT | 0o666, 1, 100, 200).unwrap();
+
+        t.msgctl_set(qid, 101, 201, 0o600, MSGMNB - 1, 100, 200)
+            .unwrap();
+
+        let info = t.msgctl(qid, IPC_STAT, 1, 101, 201).unwrap().unwrap();
+        assert_eq!(info.uid, 101);
+        assert_eq!(info.gid, 201);
+        assert_eq!(info.mode, 0o600);
+        assert_eq!(info.qbytes, MSGMNB - 1);
+        assert_eq!(info.cuid, 100);
+        assert_eq!(info.cgid, 200);
+    }
+
+    #[test]
+    fn test_msgctl_set_rejects_queue_limit_below_current_bytes() {
+        let mut t = IpcTable::new();
+        let qid = t.msgget(IPC_PRIVATE, IPC_CREAT | 0o666, 1, 0, 0).unwrap();
+        t.msgsnd(qid, 1, b"hello", 0, 1, 0, 0).unwrap();
+
+        assert_eq!(
+            t.msgctl_set(qid, 0, 0, 0o666, 4, 0, 0).unwrap_err(),
+            Errno::EINVAL
+        );
     }
 
     // ── Semaphore Tests ──

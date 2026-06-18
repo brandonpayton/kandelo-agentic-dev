@@ -1,6 +1,8 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::ptr;
 use wasm_posix_shared::{Errno, WasmStat, WasmStatfs};
 
 use crate::fd::FdTable;
@@ -28,6 +30,20 @@ pub trait HostIO {
     fn host_read(&mut self, handle: i64, buf: &mut [u8]) -> Result<usize, Errno>;
     fn host_write(&mut self, handle: i64, buf: &[u8]) -> Result<usize, Errno>;
     fn host_seek(&mut self, handle: i64, offset: i64, whence: u32) -> Result<i64, Errno>;
+    fn host_pread(&mut self, handle: i64, offset: i64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let current = self.host_seek(handle, 0, 1)?;
+        self.host_seek(handle, offset, 0)?;
+        let result = self.host_read(handle, buf);
+        let _ = self.host_seek(handle, current, 0);
+        result
+    }
+    fn host_pwrite(&mut self, handle: i64, offset: i64, buf: &[u8]) -> Result<usize, Errno> {
+        let current = self.host_seek(handle, 0, 1)?;
+        self.host_seek(handle, offset, 0)?;
+        let result = self.host_write(handle, buf);
+        let _ = self.host_seek(handle, current, 0);
+        result
+    }
     fn host_fstat(&mut self, handle: i64) -> Result<WasmStat, Errno>;
     fn host_stat(&mut self, path: &[u8]) -> Result<WasmStat, Errno>;
     fn host_lstat(&mut self, path: &[u8]) -> Result<WasmStat, Errno>;
@@ -203,6 +219,7 @@ pub trait HostIO {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Running,
+    Stopped,
     Exited,
     /// Reaped process-group leader retained only as a pgid/session identity
     /// placeholder while live or zombie members remain in the group.
@@ -301,8 +318,14 @@ pub struct TimerFdState {
 #[derive(Debug, Clone)]
 pub struct PosixTimerState {
     pub clock_id: u32,
+    /// Notification mode from struct sigevent (SIGEV_SIGNAL, SIGEV_NONE, or
+    /// Linux SIGEV_THREAD_ID).
+    pub sigev_notify: u32,
     pub sigev_signo: u32,
     pub sigev_value: i32,
+    /// Target TID for Linux SIGEV_THREAD_ID timers. The main thread's TID is
+    /// the process PID. Zero is unused for active thread-directed timers.
+    pub sigev_tid: u32,
     /// Interval for repeating timers (0 = one-shot).
     pub interval_sec: i64,
     pub interval_nsec: i64,
@@ -356,7 +379,12 @@ pub struct Process {
     /// POSIX uses this flag (not `sid == pid`) to gate setpgid EPERM checks.
     pub is_session_leader: bool,
     pub state: ProcessState,
+    /// Low 8-bit status supplied to _exit()/exit_group() for normal exits.
+    /// POSIX wait status encoding keeps normal exit codes 0..255 distinct
+    /// from signal termination; `exit_signal != 0` records the latter.
     pub exit_status: i32,
+    pub exit_signal: u32,
+    pub stop_signal: u32,
     pub fd_table: FdTable,
     pub ofd_table: OfdTable,
     pub lock_table: LockTable,
@@ -403,6 +431,10 @@ pub struct Process {
     pub signalfds: Vec<Option<SignalFdState>>,
     /// POSIX timers (timer_create / timer_settime).
     pub posix_timers: Vec<Option<PosixTimerState>>,
+    /// Linux PR_SET_PDEATHSIG value: signal delivered when this process's
+    /// parent dies. Zero disables delivery. This is process state, not signal
+    /// disposition; it is cleared across fork and preserved across exec.
+    pub parent_death_signal: u32,
     /// Alternate signal stack (sigaltstack): ss_sp, ss_flags, ss_size.
     pub alt_stack_sp: usize,
     pub alt_stack_flags: u32,
@@ -424,6 +456,17 @@ pub struct Process {
     /// Live mmap of `/dev/fb0`, if any. `Some` between successful
     /// `mmap` and the matching `munmap`/process-exit/exec.
     pub fb_binding: Option<FbBinding>,
+    /// Namespace-local PID visible through getpid(). Zero means the process is
+    /// in the initial PID namespace and its global pid is visible.
+    pub pid_ns_vpid: u32,
+    /// Next namespace-local PID to assign to fork children. Nonzero means this
+    /// process is creating children inside a PID namespace (after
+    /// unshare(CLONE_NEWPID), or because it is already namespace init/member).
+    pub pid_ns_next_child_pid: u32,
+    /// True when the process is in an isolated network namespace. The initial
+    /// namespace has host DNS/TCP bridging; isolated namespaces intentionally
+    /// start without external network routes, matching Linux's new netns.
+    pub net_namespace_isolated: bool,
     /// Counts how many times this process has called fork() (parent side, on success).
     /// Read-only from outside the kernel via `kernel_get_fork_count`.
     /// Used as a regression guardrail by the spawn test suite to confirm
@@ -438,6 +481,13 @@ impl Process {
     /// - OFD 1 = stdout (CharDevice, O_WRONLY, host_handle=1)
     /// - OFD 2 = stderr (CharDevice, O_WRONLY, host_handle=2)
     pub fn new(pid: u32) -> Self {
+        *Self::new_boxed(pid)
+    }
+
+    /// Heap-allocate a new process without first materializing the full
+    /// `Process` record on the wasm stack.
+    #[inline(never)]
+    pub fn new_boxed(pid: u32) -> Box<Self> {
         use crate::ofd::FileType;
         use wasm_posix_shared::flags::{O_RDONLY, O_WRONLY};
 
@@ -453,62 +503,73 @@ impl Process {
         rlimits[7] = [1024, 4096]; // RLIMIT_NOFILE: soft=1024, hard=4096
         rlimits[3] = [8 * 1024 * 1024, u64::MAX]; // RLIMIT_STACK: soft=8MB, hard=infinity
 
-        Process {
-            pid,
-            ppid: 0,
+        let mut boxed = Box::<Process>::new_uninit();
+        let proc_ptr = boxed.as_mut_ptr();
+
+        unsafe {
+            ptr::addr_of_mut!((*proc_ptr).pid).write(pid);
+            ptr::addr_of_mut!((*proc_ptr).ppid).write(0);
             // Default to root (uid=0). The kernel is single-user; privilege
             // drops happen explicitly via setuid/setgid and gate cross-user
             // operations (kill, sched_*).
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            pgid: pid,
-            sid: 0,
-            is_session_leader: false,
-            state: ProcessState::Running,
-            exit_status: 0,
-            fd_table,
-            ofd_table,
-            lock_table: LockTable::new(),
-            pipes: Vec::new(),
-            sockets: SocketTable::new(),
-            cwd: alloc::vec![b'/'],
-            dir_streams: Vec::new(),
-            signals: SignalState::new(),
-            memory: MemoryManager::new(),
-            terminal: TerminalState::new(),
-            environ: Vec::new(),
-            argv: Vec::new(),
-            umask: 0o022,
-            nice: 0,
-            rlimits,
-            alarm_deadline_ns: 0,
-            alarm_interval_ns: 0,
-            thread_name: [0u8; 16],
-            fork_child: false,
-            sigsuspend_saved_mask: None,
-            fork_exec_path: None,
-            fork_exec_argv: None,
-            fork_fd_actions: Vec::new(),
-            next_ephemeral_port: 49152,
-            threads: Vec::new(),
-            next_tid: 0, // will be set to pid + 1 after pid is known
-            eventfds: Vec::new(),
-            epolls: Vec::new(),
-            timerfds: Vec::new(),
-            signalfds: Vec::new(),
-            posix_timers: Vec::new(),
-            alt_stack_sp: 0,
-            alt_stack_flags: 2, // SS_DISABLE
-            alt_stack_size: 0,
-            alt_stack_depth: 0,
-            fork_pipe_replay: Vec::new(),
-            memfds: Vec::new(),
-            procfs_bufs: Vec::new(),
-            has_exec: false,
-            fb_binding: None,
-            fork_count: 0,
+            ptr::addr_of_mut!((*proc_ptr).uid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).gid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).euid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).egid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).pgid).write(pid);
+            ptr::addr_of_mut!((*proc_ptr).sid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).is_session_leader).write(false);
+            ptr::addr_of_mut!((*proc_ptr).state).write(ProcessState::Running);
+            ptr::addr_of_mut!((*proc_ptr).exit_status).write(0);
+            ptr::addr_of_mut!((*proc_ptr).exit_signal).write(0);
+            ptr::addr_of_mut!((*proc_ptr).stop_signal).write(0);
+            ptr::addr_of_mut!((*proc_ptr).fd_table).write(fd_table);
+            ptr::addr_of_mut!((*proc_ptr).ofd_table).write(ofd_table);
+            ptr::addr_of_mut!((*proc_ptr).lock_table).write(LockTable::new());
+            ptr::addr_of_mut!((*proc_ptr).pipes).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).sockets).write(SocketTable::new());
+            ptr::addr_of_mut!((*proc_ptr).cwd).write(alloc::vec![b'/']);
+            ptr::addr_of_mut!((*proc_ptr).dir_streams).write(Vec::new());
+            SignalState::write_default_to(ptr::addr_of_mut!((*proc_ptr).signals));
+            ptr::addr_of_mut!((*proc_ptr).memory).write(MemoryManager::new());
+            ptr::addr_of_mut!((*proc_ptr).terminal).write(TerminalState::new());
+            ptr::addr_of_mut!((*proc_ptr).environ).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).argv).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).umask).write(0o022);
+            ptr::addr_of_mut!((*proc_ptr).nice).write(0);
+            ptr::addr_of_mut!((*proc_ptr).rlimits).write(rlimits);
+            ptr::addr_of_mut!((*proc_ptr).alarm_deadline_ns).write(0);
+            ptr::addr_of_mut!((*proc_ptr).alarm_interval_ns).write(0);
+            ptr::addr_of_mut!((*proc_ptr).thread_name).write([0u8; 16]);
+            ptr::addr_of_mut!((*proc_ptr).fork_child).write(false);
+            ptr::addr_of_mut!((*proc_ptr).sigsuspend_saved_mask).write(None);
+            ptr::addr_of_mut!((*proc_ptr).fork_exec_path).write(None);
+            ptr::addr_of_mut!((*proc_ptr).fork_exec_argv).write(None);
+            ptr::addr_of_mut!((*proc_ptr).fork_fd_actions).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).next_ephemeral_port).write(49152);
+            ptr::addr_of_mut!((*proc_ptr).threads).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).next_tid).write(0); // will be set to pid + 1 after pid is known
+            ptr::addr_of_mut!((*proc_ptr).eventfds).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).epolls).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).timerfds).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).signalfds).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).posix_timers).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).parent_death_signal).write(0);
+            ptr::addr_of_mut!((*proc_ptr).alt_stack_sp).write(0);
+            ptr::addr_of_mut!((*proc_ptr).alt_stack_flags).write(2); // SS_DISABLE
+            ptr::addr_of_mut!((*proc_ptr).alt_stack_size).write(0);
+            ptr::addr_of_mut!((*proc_ptr).alt_stack_depth).write(0);
+            ptr::addr_of_mut!((*proc_ptr).fork_pipe_replay).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).memfds).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).procfs_bufs).write(Vec::new());
+            ptr::addr_of_mut!((*proc_ptr).has_exec).write(false);
+            ptr::addr_of_mut!((*proc_ptr).fb_binding).write(None);
+            ptr::addr_of_mut!((*proc_ptr).pid_ns_vpid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).pid_ns_next_child_pid).write(0);
+            ptr::addr_of_mut!((*proc_ptr).net_namespace_isolated).write(false);
+            ptr::addr_of_mut!((*proc_ptr).fork_count).write(0);
+
+            boxed.assume_init()
         }
     }
 
@@ -521,6 +582,13 @@ impl Process {
     /// the parent after a child is successfully created.
     pub(crate) fn increment_fork_count(&mut self) {
         self.fork_count += 1;
+    }
+
+    /// Record that a fork child consumed one namespace-local PID.
+    pub(crate) fn note_forked_child_namespace_pid(&mut self) {
+        if self.pid_ns_next_child_pid != 0 {
+            self.pid_ns_next_child_pid = self.pid_ns_next_child_pid.saturating_add(1);
+        }
     }
 
     /// Allocate a process-local pipe buffer, reusing the first free slot.
@@ -1124,7 +1192,16 @@ mod tests {
         udp.dgram_queue.push(Datagram {
             data: b"hello".to_vec(),
             src_addr: [127, 0, 0, 1],
+            src_addr6: [0; 16],
+            dst_addr: [127, 0, 0, 1],
+            dst_addr6: [0; 16],
             src_port: 12345,
+            src_sock_idx: None,
+            ipv6_tclass: 0,
+            src_pid: 0,
+            src_uid: 0,
+            src_gid: 0,
+            ancillary_fds: Vec::new(),
         });
         let mut tcp = SocketInfo::new(SocketDomain::Inet, SocketType::Stream, 0);
         tcp.oob_byte = Some(0xAB);

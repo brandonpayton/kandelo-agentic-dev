@@ -37,7 +37,13 @@ export interface InitMessage {
    * (custom-io / legacy path).
    */
   rootfsImage?: ArrayBuffer;
-  extraMounts?: Array<{ mountPoint: string; hostPath: string; readonly?: boolean }>;
+  extraMounts?: Array<{
+    mountPoint: string;
+    hostPath: string;
+    readonly?: boolean;
+    uid?: number;
+    gid?: number;
+  }>;
   /** Attach a real-TCP backend (TcpNetworkBackend) to the worker's PlatformIO
    *  so wasm programs can dial external hosts via Node `net.Socket`. */
   enableTcpNetwork?: boolean;
@@ -63,6 +69,10 @@ export interface SpawnMessage {
   ptyCols?: number;
   ptyRows?: number;
   stdin?: Uint8Array;
+  /** Whether supplied stdin should make fd 0 pipe-like for isatty/fstat. */
+  stdinIsPipe?: boolean;
+  /** Stdio fds (0, 1, 2) that should be host-backed pipes, not terminals. */
+  pipeStdio?: number[];
   /** Limit heap growth to protect thread channel pages */
   maxAddr?: number;
 }

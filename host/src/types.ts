@@ -41,6 +41,15 @@ export interface StatfsResult {
 }
 
 export interface PlatformIO {
+  /**
+   * Optional byte-preserving POSIX path entry points.
+   *
+   * POSIX paths are byte strings. Most in-memory/browser backends currently
+   * model paths as UTF-8 strings, but raw Node host-fs backends can preserve
+   * exact bytes here and avoid host Unicode filename restrictions leaking into
+   * guest semantics.
+   */
+  openBytes?(path: Uint8Array, flags: number, mode: number): number;
   open(path: string, flags: number, mode: number): number;
   close(handle: number): number;
   read(
@@ -59,26 +68,41 @@ export interface PlatformIO {
   fstat(handle: number): StatResult;
 
   // Path-based operations
+  statBytes?(path: Uint8Array): StatResult;
   stat(path: string): StatResult;
+  lstatBytes?(path: Uint8Array): StatResult;
   lstat(path: string): StatResult;
+  statfsBytes?(path: Uint8Array): StatfsResult;
   statfs(path: string): StatfsResult;
+  mkdirBytes?(path: Uint8Array, mode: number): void;
   mkdir(path: string, mode: number): void;
+  rmdirBytes?(path: Uint8Array): void;
   rmdir(path: string): void;
+  unlinkBytes?(path: Uint8Array): void;
   unlink(path: string): void;
+  renameBytes?(oldPath: Uint8Array, newPath: Uint8Array): void;
   rename(oldPath: string, newPath: string): void;
+  linkBytes?(existingPath: Uint8Array, newPath: Uint8Array): void;
   link(existingPath: string, newPath: string): void;
+  symlinkBytes?(target: Uint8Array, path: Uint8Array): void;
   symlink(target: string, path: string): void;
+  readlinkBytes?(path: Uint8Array): string;
   readlink(path: string): string;
+  chmodBytes?(path: Uint8Array, mode: number): void;
   chmod(path: string, mode: number): void;
+  chownBytes?(path: Uint8Array, uid: number, gid: number): void;
   chown(path: string, uid: number, gid: number): void;
+  accessBytes?(path: Uint8Array, mode: number): void;
   access(path: string, mode: number): void;
+  utimensatBytes?(path: Uint8Array, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void;
   utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void;
 
   // Directory iteration
+  opendirBytes?(path: Uint8Array): number;
   opendir(path: string): number;
   readdir(
     handle: number,
-  ): { name: string; type: number; ino: number } | null;
+  ): { name: string; type: number; ino: number; nameBytes?: Uint8Array } | null;
   closedir(handle: number): void;
 
   // File operations
@@ -109,6 +133,7 @@ export interface TcpConnectionPeer {
   poll?(events: number): number;
   shutdown(how: number): void;
   close(): void;
+  abort?(): void;
 }
 
 export interface TcpListenTarget {

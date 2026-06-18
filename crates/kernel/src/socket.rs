@@ -65,6 +65,7 @@ pub enum SocketDomain {
     Unix,
     Inet,
     Inet6,
+    Netlink,
 }
 
 /// Socket type.
@@ -91,7 +92,20 @@ pub enum SocketState {
 pub struct Datagram {
     pub data: Vec<u8>,
     pub src_addr: [u8; 4],
+    pub src_addr6: [u8; 16],
+    pub dst_addr: [u8; 4],
+    pub dst_addr6: [u8; 16],
     pub src_port: u16,
+    pub src_sock_idx: Option<usize>,
+    /// IPv6 traffic class associated with this datagram.
+    pub ipv6_tclass: u32,
+    /// Sender credentials captured when the datagram was queued. AF_UNIX
+    /// SO_PASSCRED reports these with SCM_CREDENTIALS.
+    pub src_pid: u32,
+    pub src_uid: u32,
+    pub src_gid: u32,
+    /// Ancillary file descriptors sent with this datagram via SCM_RIGHTS.
+    pub ancillary_fds: Vec<crate::pipe::InFlightFd>,
 }
 
 /// One AF_INET UDP endpoint bound in the in-kernel virtual network.
@@ -102,6 +116,18 @@ pub struct UdpEndpoint {
     pub addr: [u8; 4],
     pub port: u16,
     pub reuse_addr: bool,
+}
+
+/// IPv4 multicast group state for an AF_INET datagram socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ipv4MulticastMembership {
+    pub group: [u8; 4],
+    /// Interface address used for matching local delivery. 0.0.0.0 means the
+    /// kernel default interface. 127.0.0.1 represents loopback.
+    pub interface_addr: [u8; 4],
+    pub any_source: bool,
+    pub blocked_sources: Vec<[u8; 4]>,
+    pub included_sources: Vec<[u8; 4]>,
 }
 
 struct UdpEndpointTable(UnsafeCell<Option<Vec<UdpEndpoint>>>);
@@ -264,22 +290,35 @@ pub struct SocketInfo {
     pub host_net_handle: Option<i32>,
     /// Stored socket options as (level, optname, value) tuples.
     pub options: Vec<(u32, u32, u32)>,
+    /// SO_LINGER state. This is a structured option (`struct linger`), so it
+    /// is kept separately from integer-valued socket options.
+    pub linger_onoff: i32,
+    pub linger_seconds: i32,
+    /// SO_BINDTODEVICE binds a socket to a named virtual network interface.
+    pub bind_device: Option<Vec<u8>>,
+    /// TCP_CONGESTION algorithm name for this socket. Kandelo's virtual TCP
+    /// stack currently exposes the standard Linux default, "cubic".
+    pub tcp_congestion: Vec<u8>,
     /// Bound IPv4 address (for AF_INET sockets).
     pub bind_addr: [u8; 4],
+    /// Bound IPv6 address (for AF_INET6 sockets).
+    pub bind_addr6: [u8; 16],
     /// Bound port (for AF_INET sockets).
     pub bind_port: u16,
     /// Peer IPv4 address (for connected AF_INET sockets).
     pub peer_addr: [u8; 4],
+    /// Peer IPv6 address (for connected AF_INET6 sockets).
+    pub peer_addr6: [u8; 16],
     /// Peer port (for connected AF_INET sockets).
     pub peer_port: u16,
     /// Pending connection socket indices (for listening sockets).
     /// Used by AF_UNIX same-process sys_connect, which pre-allocates the
     /// accepted SocketInfo and pushes its index here.
     pub listen_backlog: Vec<usize>,
-    /// Index into the global SHARED_LISTENER_BACKLOG_TABLE for AF_INET
-    /// listening sockets. Set by sys_listen for INET sockets so all
-    /// fork-inherited copies of the listener share a single accept queue.
-    /// `None` for AF_UNIX or before listen() is called.
+    /// Index into the global SHARED_LISTENER_BACKLOG_TABLE for stream
+    /// listening sockets whose accept queue must be shared by inherited fds.
+    /// Set by sys_listen so all fork/spawn-inherited copies of the listener
+    /// pull from one accept queue. `None` before listen() is called.
     pub shared_backlog_idx: Option<usize>,
     /// Host-visible wake token for listener readiness. Assigned by listen()
     /// and cloned across fork/spawn so every inherited listener fd waits on
@@ -287,6 +326,11 @@ pub struct SocketInfo {
     pub accept_wake_idx: Option<u32>,
     /// Received UDP datagrams (for DGRAM sockets).
     pub dgram_queue: Vec<Datagram>,
+    /// Joined IPv4 multicast groups and source filters.
+    pub ipv4_multicast_memberships: Vec<Ipv4MulticastMembership>,
+    /// Received netlink datagrams. Netlink sockets are datagram-like and are
+    /// used by musl for route/interface enumeration.
+    pub netlink_queue: Vec<Vec<u8>>,
     /// Whether recv/send pipe indices refer to the global pipe table
     /// (cross-process loopback) rather than process-local pipes.
     pub global_pipes: bool,
@@ -318,14 +362,22 @@ impl SocketInfo {
             shut_wr: false,
             host_net_handle: None,
             options: Vec::new(),
+            linger_onoff: 0,
+            linger_seconds: 0,
+            bind_device: None,
+            tcp_congestion: b"cubic".to_vec(),
             bind_addr: [0; 4],
+            bind_addr6: [0; 16],
             bind_port: 0,
             peer_addr: [0; 4],
+            peer_addr6: [0; 16],
             peer_port: 0,
             listen_backlog: Vec::new(),
             shared_backlog_idx: None,
             accept_wake_idx: None,
             dgram_queue: Vec::new(),
+            ipv4_multicast_memberships: Vec::new(),
+            netlink_queue: Vec::new(),
             global_pipes: false,
             oob_byte: None,
             recv_timeout_us: 0,
@@ -361,21 +413,21 @@ impl SocketInfo {
 /// state. POSIX-wise these are properties of the underlying connection
 /// (one OOB byte per socket; one queue of pending datagrams; one queue
 /// of pending AF_UNIX same-process pre-accepted connections), but our
-/// per-process SocketInfo can't truly share — duplicating them would let
-/// both parent and child consume the "same" data.
+/// per-process SocketInfo can't truly share — duplicating inline per-process
+/// queues would let both parent and child consume the "same" data.
 ///
 /// Discarded in the child:
 ///   * `dgram_queue` — buffered UDP datagrams.
+///   * `netlink_queue` — buffered netlink replies.
 ///   * `oob_byte` — pending TCP out-of-band byte.
-///   * `listen_backlog` — pre-accepted AF_UNIX same-process connections.
+///   * `listen_backlog` — legacy per-process pre-accepted connections.
 ///     Indices reference other entries in this process's SocketTable; if
 ///     both parent and child kept them, both could `accept()` the same
-///     pending connection. After fork/spawn, the parent retains them;
-///     child gets fresh state. New connections that arrive post-fork are
-///     added to whichever process the connecting peer wires up to.
+///     pending connection. New stream listeners use `shared_backlog_idx`
+///     so inherited fds share one accept queue instead.
 ///
 /// Everything else is value-cloned. `host_net_handle` and
-/// `shared_backlog_idx` are still inherited; the cross-process refcount
+/// `shared_backlog_idx` is still inherited; the cross-process refcount
 /// bumps for those live in `process_table::bump_inherited_resource_refcounts`.
 impl Clone for SocketInfo {
     fn clone(&self) -> Self {
@@ -391,14 +443,22 @@ impl Clone for SocketInfo {
             shut_wr: self.shut_wr,
             host_net_handle: self.host_net_handle,
             options: self.options.clone(),
+            linger_onoff: self.linger_onoff,
+            linger_seconds: self.linger_seconds,
+            bind_device: self.bind_device.clone(),
+            tcp_congestion: self.tcp_congestion.clone(),
             bind_addr: self.bind_addr,
+            bind_addr6: self.bind_addr6,
             bind_port: self.bind_port,
             peer_addr: self.peer_addr,
+            peer_addr6: self.peer_addr6,
             peer_port: self.peer_port,
             listen_backlog: Vec::new(), // consume-once: don't double-accept
             shared_backlog_idx: self.shared_backlog_idx,
             accept_wake_idx: self.accept_wake_idx,
             dgram_queue: Vec::new(), // consume-once: don't double-deliver
+            ipv4_multicast_memberships: self.ipv4_multicast_memberships.clone(),
+            netlink_queue: Vec::new(), // consume-once: don't double-deliver
             global_pipes: self.global_pipes,
             oob_byte: None, // consume-once: don't double-deliver
             recv_timeout_us: self.recv_timeout_us,
@@ -469,21 +529,20 @@ impl SocketTable {
 
 // ── Shared listener backlog (cross-process accept queue) ──
 //
-// In real Linux, a listening socket inherited via fork() shares a single
-// accept queue across parent and children — any process can accept a
-// pending connection. Our SocketInfo lives in per-process tables, so a
-// naive fork+accept model would give each process its own backlog. To
-// match POSIX semantics for AF_INET listeners (the typical fork-server
-// pattern: nginx master + workers), we keep the actual pending queue
-// in this global table and reference it by index from each forked
-// SocketInfo copy.
-//
-// AF_UNIX same-process listeners still use the inline `listen_backlog`
-// field (sys_connect pre-allocates the accepted SocketInfo there).
+// In real POSIX kernels, a listening socket inherited via fork()/spawn shares
+// a single accept queue across parent and children — any process holding that
+// fd can accept a pending connection. Our SocketInfo lives in per-process
+// tables, so a naive clone would give each process its own backlog. We keep
+// the actual pending queue in this global table and reference it by index from
+// each inherited SocketInfo copy.
 
 /// A pending TCP connection waiting in a shared accept queue.
 pub struct PendingConnection {
     pub peer_addr: [u8; 4],
+    /// IPv6 peer address when this pending connection originated from an
+    /// AF_INET6 client. `None` on an AF_INET6 listener means the peer was an
+    /// IPv4 client and must be exposed as an IPv4-mapped IPv6 address.
+    pub peer_addr6: Option<[u8; 16]>,
     pub peer_port: u16,
     /// Recv pipe index (in the global pipe table). Host writes incoming
     /// TCP data here; the accepting process reads from it.

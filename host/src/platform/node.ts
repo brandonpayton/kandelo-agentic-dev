@@ -13,10 +13,52 @@ import type { PlatformIO, StatResult, StatfsResult } from "../types";
 import { nativeStatfs, translateOpenFlags } from "../vfs/host-fs";
 import { NativeMetadataOverlay } from "./native-metadata";
 
+const POSIX_BYTES_SEGMENT_PREFIX = ".kandelo-posix-bytes-";
+const PATH_DISPLAY_DECODER = new TextDecoder("utf-8", { fatal: false });
+const ASCII_DEV_SHM = new TextEncoder().encode("/dev/shm");
+const UTIME_NOW = 0x3fffffff;
+const UTIME_OMIT = 0x3ffffffe;
+
+function pathBytesToDisplay(bytes: Uint8Array): string {
+  return PATH_DISPLAY_DECODER.decode(bytes);
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
+  return out;
+}
+
+function hexToBytes(hex: string): Uint8Array | null {
+  if (hex.length === 0 || hex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(hex)) {
+    return null;
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+function makeFsError(code: string, message: string): Error & { code: string } {
+  const err = new Error(`${code}: ${message}`) as Error & { code: string };
+  err.code = code;
+  return err;
+}
+
+function bytesStartWith(bytes: Uint8Array, prefix: Uint8Array): boolean {
+  if (bytes.byteLength < prefix.byteLength) return false;
+  for (let i = 0; i < prefix.byteLength; i++) {
+    if (bytes[i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
 export class NodePlatformIO implements PlatformIO {
   private dirHandles = new Map<number, fs.Dir>();
   private nextDirHandle = 1;
   private fdPositions = new Map<number, number>();
+  private fdPaths = new Map<number, string>();
   // Offset from hrtime (monotonic) to epoch, computed once at startup.
   private readonly _epochOffsetNs: bigint;
   // hrtime at creation, used as process start for CPUTIME clocks.
@@ -60,18 +102,156 @@ export class NodePlatformIO implements PlatformIO {
     return p;
   }
 
+  private nativePathFromBytes(bytes: Uint8Array): string {
+    if (bytes.byteLength === 0) return "";
+    if (bytes.includes(0)) {
+      throw makeFsError("EINVAL", "path contains NUL byte");
+    }
+
+    const absolute = bytes[0] === 47; // '/'
+    const parts: string[] = [];
+    let start = absolute ? 1 : 0;
+    for (let i = start; i <= bytes.byteLength; i++) {
+      if (i !== bytes.byteLength && bytes[i] !== 47) continue;
+      const segment = bytes.subarray(start, i);
+      if (segment.byteLength > 0) {
+        parts.push(this.nativeSegmentFromBytes(segment));
+      }
+      start = i + 1;
+    }
+
+    let nativePath = (absolute ? "/" : "") + parts.join("/");
+    if (bytes.byteLength > 1 && bytes[bytes.byteLength - 1] === 47 && nativePath !== "/") {
+      nativePath += "/";
+    }
+    return nativePath || (absolute ? "/" : ".");
+  }
+
+  private nativeSegmentFromBytes(segment: Uint8Array): string {
+    let ascii = "";
+    for (const byte of segment) {
+      if (byte < 0x20 || byte >= 0x7f || byte === 47) {
+        return POSIX_BYTES_SEGMENT_PREFIX + bytesToHex(segment);
+      }
+      ascii += String.fromCharCode(byte);
+    }
+    if (ascii.startsWith(POSIX_BYTES_SEGMENT_PREFIX)) {
+      return POSIX_BYTES_SEGMENT_PREFIX + bytesToHex(segment);
+    }
+    return ascii;
+  }
+
+  private rewritePathBytes(bytes: Uint8Array): string {
+    if (
+      bytes.byteLength === ASCII_DEV_SHM.byteLength
+      && bytesStartWith(bytes, ASCII_DEV_SHM)
+    ) {
+      fs.mkdirSync(this._shmDir, { recursive: true });
+      return this._shmDir;
+    }
+    if (
+      bytes.byteLength > ASCII_DEV_SHM.byteLength
+      && bytes[ASCII_DEV_SHM.byteLength] === 47
+      && bytesStartWith(bytes, ASCII_DEV_SHM)
+    ) {
+      fs.mkdirSync(this._shmDir, { recursive: true });
+      const rel = this.nativePathFromBytes(bytes.subarray(ASCII_DEV_SHM.byteLength));
+      return this._shmDir + rel;
+    }
+
+    if (process.platform === "win32") {
+      const display = pathBytesToDisplay(bytes);
+      const winPath = translateWindowsDrivePath(display);
+      if (winPath !== null) return winPath;
+    }
+    return this.nativePathFromBytes(bytes);
+  }
+
+  private decodeNativeEntryName(name: string): { name: string; nameBytes?: Uint8Array } {
+    if (!name.startsWith(POSIX_BYTES_SEGMENT_PREFIX)) {
+      return { name };
+    }
+    const bytes = hexToBytes(name.slice(POSIX_BYTES_SEGMENT_PREFIX.length));
+    if (!bytes) return { name };
+    return { name: pathBytesToDisplay(bytes), nameBytes: bytes };
+  }
+
+  private sqliteFsTraceEnabled(): boolean {
+    return process.env.KERNEL_SQLITE_FS_TRACE === "1";
+  }
+
+  private isSqliteTracePath(p: string | undefined): boolean {
+    if (!p) return false;
+    return /(^|\/)(testrunner\.db(?:-(?:wal|shm))?|test\.db(?:-(?:journal|wal|shm|lock))?|test-[0-9a-f]+\.db(?:-(?:journal|wal|shm|lock))?)$/.test(p);
+  }
+
+  private bytesAllZero(bytes: Uint8Array, start: number, len: number): boolean {
+    if (start < 0 || len < 0 || start + len > bytes.byteLength) return false;
+    for (let i = 0; i < len; i++) {
+      if (bytes[start + i] !== 0) return false;
+    }
+    return true;
+  }
+
+  private traceStorageIo(op: string, message: string): void {
+    if (this.sqliteFsTraceEnabled()) {
+      console.error(`[KERNEL_SQLITE_FS_TRACE storage] ${op} ${message}`);
+    }
+  }
+
+  private traceWriteIfNeeded(
+    handle: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    bytesWritten: number,
+  ): void {
+    const pathForFd = this.fdPaths.get(handle);
+    if (!this.isSqliteTracePath(pathForFd)) return;
+
+    const sampleLen = Math.min(buffer.byteLength, Math.max(0, Math.min(length, bytesWritten)));
+    const allZero = sampleLen > 0 && this.bytesAllZero(buffer, 0, sampleLen);
+    const first = Array.from(buffer.subarray(0, Math.min(16, length)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    this.traceStorageIo(
+      "write",
+      `fd=${handle} path=${pathForFd} offset=${offset} len=${length} wrote=${bytesWritten} first16=${first} all_zero=${allZero}`,
+    );
+  }
+
+  openBytes(pathBytes: Uint8Array, flags: number, mode: number): number {
+    return this.openNative(this.rewritePathBytes(pathBytes), pathBytesToDisplay(pathBytes), flags, mode);
+  }
+
   open(path: string, flags: number, mode: number): number {
-    const nativePath = this.rewritePath(path);
+    return this.openNative(this.rewritePath(path), path, flags, mode);
+  }
+
+  private openNative(nativePath: string, displayPath: string, flags: number, mode: number): number {
     const created = (flags & 0o100) !== 0 && !fs.existsSync(nativePath);
     const fd = fs.openSync(nativePath, translateOpenFlags(flags), mode);
     if (created) this.metadata.chmod(fs.fstatSync(fd), mode);
     this.fdPositions.set(fd, 0);
+    this.fdPaths.set(fd, displayPath);
+    if (this.isSqliteTracePath(displayPath)) {
+      this.traceStorageIo(
+        "open",
+        `fd=${fd} path=${displayPath} native=${nativePath} flags=0o${(flags >>> 0).toString(8)} mode=0o${(mode >>> 0).toString(8)}`,
+      );
+    }
     return fd;
   }
 
   close(handle: number): number {
+    const pathForFd = this.fdPaths.get(handle);
+    if (this.isSqliteTracePath(pathForFd)) {
+      this.traceStorageIo("close", `fd=${handle} path=${pathForFd}`);
+    }
     fs.closeSync(handle);
     this.fdPositions.delete(handle);
+    this.fdPaths.delete(handle);
     return 0;
   }
 
@@ -83,6 +263,10 @@ export class NodePlatformIO implements PlatformIO {
   ): number {
     const pos = offset ?? this.fdPositions.get(handle) ?? 0;
     const bytesRead = fs.readSync(handle, buffer, 0, length, pos);
+    const pathForFd = this.fdPaths.get(handle);
+    if (this.isSqliteTracePath(pathForFd)) {
+      this.traceStorageIo("read", `fd=${handle} path=${pathForFd} offset=${pos} len=${length} read=${bytesRead}`);
+    }
     if (offset === null) {
       this.fdPositions.set(handle, pos + bytesRead);
     }
@@ -97,6 +281,8 @@ export class NodePlatformIO implements PlatformIO {
   ): number {
     const pos = offset ?? this.fdPositions.get(handle) ?? 0;
     const bytesWritten = fs.writeSync(handle, buffer, 0, length, pos);
+    if (bytesWritten > 0) this.metadata.noteNativeContentChange(fs.fstatSync(handle));
+    this.traceWriteIfNeeded(handle, buffer, pos, length, bytesWritten);
     if (offset === null) {
       this.fdPositions.set(handle, pos + bytesWritten);
     }
@@ -128,6 +314,9 @@ export class NodePlatformIO implements PlatformIO {
       default:
         throw new Error(`Invalid whence value: ${whence}`);
     }
+    if (newPos < 0) {
+      throw makeFsError("EINVAL", "negative seek offset");
+    }
     this.fdPositions.set(handle, newPos);
     return newPos;
   }
@@ -142,80 +331,174 @@ export class NodePlatformIO implements PlatformIO {
     return this.metadata.toStatResult(fs.fstatSync(handle));
   }
 
+  statBytes(path: Uint8Array): StatResult {
+    return this.metadata.toStatResult(fs.statSync(this.rewritePathBytes(path)));
+  }
+
   stat(path: string): StatResult {
     return this.metadata.toStatResult(fs.statSync(this.rewritePath(path)));
+  }
+
+  lstatBytes(path: Uint8Array): StatResult {
+    return this.metadata.toStatResult(fs.lstatSync(this.rewritePathBytes(path)));
   }
 
   lstat(path: string): StatResult {
     return this.metadata.toStatResult(fs.lstatSync(this.rewritePath(path)));
   }
 
+  statfsBytes(path: Uint8Array): StatfsResult {
+    return nativeStatfs(this.rewritePathBytes(path));
+  }
+
   statfs(path: string): StatfsResult {
     return nativeStatfs(this.rewritePath(path));
   }
 
+  mkdirBytes(path: Uint8Array, mode: number): void {
+    this.mkdirNative(this.rewritePathBytes(path), mode);
+  }
+
   mkdir(path: string, mode: number): void {
-    const nativePath = this.rewritePath(path);
+    this.mkdirNative(this.rewritePath(path), mode);
+  }
+
+  private mkdirNative(nativePath: string, mode: number): void {
     fs.mkdirSync(nativePath, { mode });
     this.metadata.chmod(fs.statSync(nativePath), mode);
   }
 
+  rmdirBytes(path: Uint8Array): void {
+    this.rmdirNative(this.rewritePathBytes(path));
+  }
+
   rmdir(path: string): void {
-    const nativePath = this.rewritePath(path);
+    this.rmdirNative(this.rewritePath(path));
+  }
+
+  private rmdirNative(nativePath: string): void {
     const stat = fs.lstatSync(nativePath);
     fs.rmdirSync(nativePath);
     this.metadata.forget(stat);
   }
 
+  unlinkBytes(path: Uint8Array): void {
+    this.unlinkNative(this.rewritePathBytes(path));
+  }
+
   unlink(path: string): void {
-    const nativePath = this.rewritePath(path);
+    this.unlinkNative(this.rewritePath(path));
+  }
+
+  private unlinkNative(nativePath: string): void {
     const stat = fs.lstatSync(nativePath);
     fs.unlinkSync(nativePath);
     if (stat.nlink <= 1) this.metadata.forget(stat);
   }
 
+  renameBytes(oldPath: Uint8Array, newPath: Uint8Array): void {
+    this.renameNative(this.rewritePathBytes(oldPath), this.rewritePathBytes(newPath));
+  }
+
   rename(oldPath: string, newPath: string): void {
-    const nativeNewPath = this.rewritePath(newPath);
+    this.renameNative(this.rewritePath(oldPath), this.rewritePath(newPath));
+  }
+
+  private renameNative(nativeOldPath: string, nativeNewPath: string): void {
     let replaced: fs.Stats | undefined;
     try {
       replaced = fs.lstatSync(nativeNewPath);
     } catch {}
-    fs.renameSync(this.rewritePath(oldPath), nativeNewPath);
+    fs.renameSync(nativeOldPath, nativeNewPath);
     if (replaced !== undefined && replaced.nlink <= 1) this.metadata.forget(replaced);
+  }
+
+  linkBytes(existingPath: Uint8Array, newPath: Uint8Array): void {
+    fs.linkSync(this.rewritePathBytes(existingPath), this.rewritePathBytes(newPath));
   }
 
   link(existingPath: string, newPath: string): void {
     fs.linkSync(this.rewritePath(existingPath), this.rewritePath(newPath));
   }
 
+  symlinkBytes(target: Uint8Array, path: Uint8Array): void {
+    fs.symlinkSync(this.rewritePathBytes(target), this.rewritePathBytes(path));
+  }
+
   symlink(target: string, path: string): void {
     fs.symlinkSync(target, this.rewritePath(path));
+  }
+
+  readlinkBytes(path: Uint8Array): string {
+    return fs.readlinkSync(this.rewritePathBytes(path), "utf8");
   }
 
   readlink(path: string): string {
     return fs.readlinkSync(this.rewritePath(path), "utf8");
   }
 
+  chmodBytes(path: Uint8Array, mode: number): void {
+    this.metadata.chmod(fs.statSync(this.rewritePathBytes(path)), mode);
+  }
+
   chmod(path: string, mode: number): void {
     this.metadata.chmod(fs.statSync(this.rewritePath(path)), mode);
+  }
+
+  chownBytes(path: Uint8Array, uid: number, gid: number): void {
+    this.metadata.chown(fs.statSync(this.rewritePathBytes(path)), uid, gid);
   }
 
   chown(path: string, uid: number, gid: number): void {
     this.metadata.chown(fs.statSync(this.rewritePath(path)), uid, gid);
   }
 
+  accessBytes(path: Uint8Array, mode: number): void {
+    this.metadata.access(fs.statSync(this.rewritePathBytes(path)), mode);
+  }
+
   access(path: string, mode: number): void {
     this.metadata.access(fs.statSync(this.rewritePath(path)), mode);
   }
 
+  utimensatBytes(path: Uint8Array, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
+    this.utimensatNative(this.rewritePathBytes(path), atimeSec, atimeNsec, mtimeSec, mtimeNsec);
+  }
+
   utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
-    const atime = atimeSec + atimeNsec / 1e9;
-    const mtime = mtimeSec + mtimeNsec / 1e9;
-    fs.utimesSync(this.rewritePath(path), atime, mtime);
+    this.utimensatNative(this.rewritePath(path), atimeSec, atimeNsec, mtimeSec, mtimeNsec);
+  }
+
+  private utimensatNative(nativePath: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
+    if (atimeNsec === UTIME_OMIT && mtimeNsec === UTIME_OMIT) return;
+
+    const stat = fs.statSync(nativePath);
+    const current = this.metadata.toStatResult(stat);
+    const nowMs = Date.now();
+    const atimeMs = atimeNsec === UTIME_OMIT
+      ? current.atimeMs
+      : atimeNsec === UTIME_NOW
+        ? nowMs
+        : atimeSec * 1000 + Math.floor(atimeNsec / 1_000_000);
+    const mtimeMs = mtimeNsec === UTIME_OMIT
+      ? current.mtimeMs
+      : mtimeNsec === UTIME_NOW
+        ? nowMs
+        : mtimeSec * 1000 + Math.floor(mtimeNsec / 1_000_000);
+    fs.utimesSync(nativePath, atimeMs / 1000, mtimeMs / 1000);
+    this.metadata.utimens(stat, atimeMs, mtimeMs, fs.statSync(nativePath).ctimeMs);
+  }
+
+  opendirBytes(path: Uint8Array): number {
+    return this.opendirNative(this.rewritePathBytes(path));
   }
 
   opendir(path: string): number {
-    const dir = fs.opendirSync(this.rewritePath(path));
+    return this.opendirNative(this.rewritePath(path));
+  }
+
+  private opendirNative(nativePath: string): number {
+    const dir = fs.opendirSync(nativePath);
     const handle = this.nextDirHandle++;
     this.dirHandles.set(handle, dir);
     return handle;
@@ -237,7 +520,7 @@ export class NodePlatformIO implements PlatformIO {
     else if (entry.isSocket()) dtype = 12; // DT_SOCK
     else if (entry.isCharacterDevice()) dtype = 2; // DT_CHR
     else if (entry.isBlockDevice()) dtype = 6; // DT_BLK
-    return { name: entry.name, type: dtype, ino: 0 };
+    return { ...this.decodeNativeEntryName(entry.name), type: dtype, ino: 0 };
   }
 
   closedir(handle: number): void {
@@ -248,10 +531,19 @@ export class NodePlatformIO implements PlatformIO {
   }
 
   ftruncate(handle: number, length: number): void {
+    const pathForFd = this.fdPaths.get(handle);
+    if (this.isSqliteTracePath(pathForFd)) {
+      this.traceStorageIo("ftruncate", `fd=${handle} path=${pathForFd} length=${length}`);
+    }
     fs.ftruncateSync(handle, length);
+    this.metadata.noteNativeContentChange(fs.fstatSync(handle));
   }
 
   fsync(handle: number): void {
+    const pathForFd = this.fdPaths.get(handle);
+    if (this.isSqliteTracePath(pathForFd)) {
+      this.traceStorageIo("fsync", `fd=${handle} path=${pathForFd}`);
+    }
     fs.fsyncSync(handle);
   }
 

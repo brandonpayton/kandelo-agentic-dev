@@ -22,7 +22,7 @@ pub mod host_abi;
 /// 13: process memory layout ABI is Rust-declared; per-pthread slots
 ///     use explicit TLS/control, fork-save, channel, and spill pages,
 ///     with a wasm-declared reserved thread-slot count.
-pub const ABI_VERSION: u32 = 13;
+pub const ABI_VERSION: u32 = 14;
 
 /// Syscall numbers for the POSIX kernel interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +356,7 @@ pub enum Errno {
     EBUSY = 16,
     EEXIST = 17,
     EXDEV = 18,
+    ENODEV = 19,
     ENOTDIR = 20,
     EISDIR = 21,
     EINVAL = 22,
@@ -384,6 +385,7 @@ pub enum Errno {
     EPROTOTYPE = 91,
     ENOPROTOOPT = 92,
     EPROTONOSUPPORT = 93,
+    ESOCKTNOSUPPORT = 94,
     EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
     EADDRINUSE = 98,
@@ -420,6 +422,7 @@ impl Errno {
             16 => Some(Errno::EBUSY),
             17 => Some(Errno::EEXIST),
             18 => Some(Errno::EXDEV),
+            19 => Some(Errno::ENODEV),
             20 => Some(Errno::ENOTDIR),
             21 => Some(Errno::EISDIR),
             22 => Some(Errno::EINVAL),
@@ -448,6 +451,7 @@ impl Errno {
             91 => Some(Errno::EPROTOTYPE),
             92 => Some(Errno::ENOPROTOOPT),
             93 => Some(Errno::EPROTONOSUPPORT),
+            94 => Some(Errno::ESOCKTNOSUPPORT),
             95 => Some(Errno::EOPNOTSUPP),
             97 => Some(Errno::EAFNOSUPPORT),
             98 => Some(Errno::EADDRINUSE),
@@ -558,6 +562,7 @@ pub mod socket {
     pub const SOCK_CLOEXEC: u32 = 0o2000000;
     pub const SOL_SOCKET: u32 = 1;
     pub const SCM_RIGHTS: u32 = 1;
+    pub const SCM_CREDENTIALS: u32 = 2;
     pub const SO_REUSEADDR: u32 = 2;
     pub const SO_ERROR: u32 = 4;
     pub const SO_KEEPALIVE: u32 = 9;
@@ -566,6 +571,11 @@ pub mod socket {
     pub const SO_TYPE: u32 = 3;
     pub const SO_DOMAIN: u32 = 39;
     pub const SO_ACCEPTCONN: u32 = 30;
+    pub const SO_REUSEPORT: u32 = 15;
+    pub const SO_PASSCRED: u32 = 16;
+    pub const SO_BINDTODEVICE: u32 = 25;
+    pub const SO_ATTACH_REUSEPORT_CBPF: u32 = 51;
+    pub const SO_ZEROCOPY: u32 = 60;
     pub const SHUT_RD: u32 = 0;
     pub const SHUT_WR: u32 = 1;
     pub const SHUT_RDWR: u32 = 2;
@@ -574,7 +584,32 @@ pub mod socket {
     // time64 values used by musl on wasm32 (where __LONG_MAX == 0x7fffffff)
     pub const SO_RCVTIMEO: u32 = 66;
     pub const SO_SNDTIMEO: u32 = 67;
+    pub const IPPROTO_IP: u32 = 0;
     pub const IPPROTO_TCP: u32 = 6;
+    pub const IPPROTO_UDP: u32 = 17;
+    pub const IPPROTO_IPV6: u32 = 41;
+    pub const IP_TOS: u32 = 1;
+    pub const IP_PKTINFO: u32 = 8;
+    pub const IP_MTU_DISCOVER: u32 = 10;
+    pub const IP_MTU: u32 = 14;
+    pub const IP_MULTICAST_IF: u32 = 32;
+    pub const IP_MULTICAST_TTL: u32 = 33;
+    pub const IP_MULTICAST_LOOP: u32 = 34;
+    pub const IP_ADD_MEMBERSHIP: u32 = 35;
+    pub const IP_DROP_MEMBERSHIP: u32 = 36;
+    pub const IP_UNBLOCK_SOURCE: u32 = 37;
+    pub const IP_BLOCK_SOURCE: u32 = 38;
+    pub const IP_ADD_SOURCE_MEMBERSHIP: u32 = 39;
+    pub const IP_DROP_SOURCE_MEMBERSHIP: u32 = 40;
+    pub const IP_MSFILTER: u32 = 41;
+    pub const MCAST_JOIN_GROUP: u32 = 42;
+    pub const MCAST_BLOCK_SOURCE: u32 = 43;
+    pub const MCAST_UNBLOCK_SOURCE: u32 = 44;
+    pub const MCAST_LEAVE_GROUP: u32 = 45;
+    pub const MCAST_JOIN_SOURCE_GROUP: u32 = 46;
+    pub const MCAST_LEAVE_SOURCE_GROUP: u32 = 47;
+    pub const MCAST_MSFILTER: u32 = 48;
+    pub const IP_MULTICAST_ALL: u32 = 49;
     pub const TCP_NODELAY: u32 = 1;
     pub const TCP_CORK: u32 = 3;
     pub const TCP_KEEPIDLE: u32 = 4;
@@ -582,8 +617,18 @@ pub mod socket {
     pub const TCP_KEEPCNT: u32 = 6;
     pub const TCP_DEFER_ACCEPT: u32 = 9;
     pub const TCP_INFO: u32 = 11;
+    pub const TCP_CONGESTION: u32 = 13;
     pub const TCP_QUICKACK: u32 = 12;
     pub const TCP_USER_TIMEOUT: u32 = 18;
+    pub const IPV6_MULTICAST_IF: u32 = 17;
+    pub const IPV6_MULTICAST_HOPS: u32 = 18;
+    pub const IPV6_MULTICAST_LOOP: u32 = 19;
+    pub const IPV6_V6ONLY: u32 = 26;
+    pub const IPV6_RECVPKTINFO: u32 = 49;
+    pub const IPV6_PKTINFO: u32 = 50;
+    pub const IPV6_DONTFRAG: u32 = 62;
+    pub const IPV6_RECVTCLASS: u32 = 66;
+    pub const IPV6_TCLASS: u32 = 67;
     pub const MSG_OOB: u32 = 1;
     pub const MSG_PEEK: u32 = 2;
     pub const MSG_DONTWAIT: u32 = 64;
@@ -729,6 +774,47 @@ pub struct WasmStat {
     pub st_ctime_sec: u64,
     pub st_ctime_nsec: u32,
     pub _pad: u32,
+    pub st_rdev: u64,
+    pub st_blksize: i32,
+    pub st_blocks: i32,
+}
+
+impl Default for WasmStat {
+    fn default() -> Self {
+        Self {
+            st_dev: 0,
+            st_ino: 0,
+            st_mode: 0,
+            st_nlink: 0,
+            st_uid: 0,
+            st_gid: 0,
+            st_size: 0,
+            st_atime_sec: 0,
+            st_atime_nsec: 0,
+            st_mtime_sec: 0,
+            st_mtime_nsec: 0,
+            st_ctime_sec: 0,
+            st_ctime_nsec: 0,
+            _pad: 0,
+            st_rdev: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod wasm_stat_tests {
+    use super::WasmStat;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn layout_matches_guest_kstat() {
+        assert_eq!(size_of::<WasmStat>(), 104);
+        assert_eq!(offset_of!(WasmStat, st_rdev), 88);
+        assert_eq!(offset_of!(WasmStat, st_blksize), 96);
+        assert_eq!(offset_of!(WasmStat, st_blocks), 100);
+    }
 }
 
 /// Directory entry structure for the Wasm POSIX interface.
@@ -913,18 +999,20 @@ pub mod process_memory {
     /// Minimum initial page count used when a binary does not import more.
     pub const DEFAULT_INITIAL_PAGES: u32 = 17;
 
-    /// Host default pthread slot reservation when a program declares
-    /// [`THREAD_SLOTS_USE_HOST_DEFAULT`].
-    pub const DEFAULT_THREAD_SLOTS: u32 = 16;
+    /// Host default concurrent pthread limit when a program declares
+    /// [`THREAD_SLOTS_USE_HOST_DEFAULT`]. This is intentionally an arbitrary
+    /// high default to avoid surprising pthread_create failures for most
+    /// programs; hosts can tune it through the kernel worker options.
+    pub const DEFAULT_THREAD_SLOTS: u32 = 1024;
 
     /// A process-wasm declaration value meaning "use the host default".
     pub const THREAD_SLOTS_USE_HOST_DEFAULT: i32 = -1;
 
-    /// A process-wasm declaration value meaning "reserve no pthread slots".
+    /// A process-wasm declaration value meaning "allow no pthreads".
     pub const THREAD_SLOTS_NONE: i32 = 0;
 
     /// Export name of the process-wasm constant-return function that declares
-    /// the requested pthread slot reservation.
+    /// the requested concurrent pthread limit.
     pub const THREAD_SLOT_DECL_EXPORT: &str = "__wasm_posix_thread_slots";
 
     /// Legacy kernel MemoryManager::MMAP_BASE. Compact hosts override this
@@ -1097,6 +1185,8 @@ pub mod abi {
     ];
 
     pub const HOST_ADAPTER_OPTIONAL_KERNEL_EXPORTS: &[&str] = &[
+        "kernel_reserve_host_region",
+        "kernel_reserve_host_region_at",
         "kernel_set_cwd",
         "kernel_set_max_addr",
         "kernel_set_mmap_base",
@@ -1165,6 +1255,7 @@ pub mod abi {
         pub const SYS_STATX: u32 = 260;
         pub const SYS_SET_ROBUST_LIST: u32 = 261;
         pub const SYS_GET_ROBUST_LIST: u32 = 262;
+        pub const SYS_TIMES: u32 = 270;
         pub const SYS_MKNOD: u32 = 271;
         pub const SYS_MKNODAT: u32 = 272;
         pub const SYS_MSYNC: u32 = 278;
@@ -1172,6 +1263,7 @@ pub mod abi {
         pub const SYS_SENDFILE: u32 = 294;
         pub const SYS_PREADV: u32 = 295;
         pub const SYS_PWRITEV: u32 = 296;
+        pub const SYS_LCHOWN: u32 = 299;
         pub const SYS_FALLOCATE: u32 = 308;
         pub const SYS_TIMER_CREATE: u32 = 326;
         pub const SYS_TIMER_SETTIME: u32 = 327;
@@ -1329,6 +1421,10 @@ pub mod abi {
                 number: SYS_GET_ROBUST_LIST,
             },
             AbiSyscallNumber {
+                name: "Times",
+                number: SYS_TIMES,
+            },
+            AbiSyscallNumber {
                 name: "Mknod",
                 number: SYS_MKNOD,
             },
@@ -1355,6 +1451,10 @@ pub mod abi {
             AbiSyscallNumber {
                 name: "Pwritev",
                 number: SYS_PWRITEV,
+            },
+            AbiSyscallNumber {
+                name: "Lchown",
+                number: SYS_LCHOWN,
             },
             AbiSyscallNumber {
                 name: "Fallocate",

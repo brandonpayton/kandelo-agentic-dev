@@ -1029,10 +1029,7 @@ fn build_http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(30))
         .timeout_read(Duration::from_secs(60))
-        .user_agent(concat!(
-            "kandelo-tools/xtask/",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(concat!("kandelo-tools/xtask/", env!("CARGO_PKG_VERSION")))
         .build()
 }
 

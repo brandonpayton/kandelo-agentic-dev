@@ -2,7 +2,7 @@
 //!
 //! The binary format is little-endian and consists of:
 //! - Header (12 bytes): magic, version, total_size
-//! - Scalars (32 bytes): ppid, uid, gid, euid, egid, pgid, sid, umask
+//! - Scalars: ppid, uid, gid, euid, egid, pgid, sid, umask and process flags
 //! - Signal state (variable): blocked mask + non-default handlers
 //! - FD table (variable): max_fds, then each open fd entry
 //! - OFD table (variable): each open file description
@@ -13,13 +13,16 @@
 //! - Program break (4 bytes): current brk value
 //! - Memory layout metadata (20 bytes): initial brk, max addr, brk limit,
 //!   mmap base, reserved prefix
+//! - Mmap mappings
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+use core::ptr;
 use wasm_posix_shared::Errno;
-use wasm_posix_shared::fd_flags::FD_CLOEXEC;
+use wasm_posix_shared::fd_flags::{FD_CLOEXEC, FD_CLOFORK};
 
 use crate::fd::{FdEntry, FdTable, OpenFileDescRef};
 use crate::lock::LockTable;
@@ -32,7 +35,7 @@ use crate::terminal::{NCCS, TerminalState, WinSize};
 
 const FORK_MAGIC: u32 = 0x464F524B; // "FORK"
 const EXEC_MAGIC: u32 = 0x45584543; // "EXEC"
-const FORK_VERSION: u32 = 8;
+const FORK_VERSION: u32 = 9;
 
 // Bounds for deserialization to prevent OOM from malformed buffers.
 const MAX_FDS: u32 = 65536;
@@ -309,6 +312,14 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u32(proc.umask)?;
     w.write_u32(proc.nice as u32)?;
     w.write_u32(proc.is_session_leader as u32)?;
+    let child_pid_ns_vpid = proc.pid_ns_next_child_pid;
+    w.write_u32(child_pid_ns_vpid)?;
+    w.write_u32(if child_pid_ns_vpid != 0 {
+        child_pid_ns_vpid.saturating_add(1)
+    } else {
+        0
+    })?;
+    w.write_u32(proc.net_namespace_isolated as u32)?;
 
     // ── Signal state ──
     w.write_u64(proc.signals.blocked)?;
@@ -477,6 +488,7 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
                     SocketDomain::Unix => 0,
                     SocketDomain::Inet => 1,
                     SocketDomain::Inet6 => 2,
+                    SocketDomain::Netlink => 3,
                 })?;
                 w.write_u32(match sock.sock_type {
                     SocketType::Stream => 0,
@@ -555,19 +567,42 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
 
 // ── Deserialize ─────────────────────────────────────────────────────────────
 
-/// Deserialize process state from a fork buffer, creating a new child process.
-///
-/// The child process gets:
-/// - `pid = child_pid`
-/// - `state = ProcessState::Running`
-/// - `exit_status = 0`
-/// - Empty lock table, pipes, dir_streams, memory (per POSIX)
-/// - Sockets are cloned from parent (POSIX: child inherits open fds including sockets)
-/// - `signals.pending = 0` (via `SignalState::from_parts`)
-pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Errno> {
-    let mut r = Reader::new(buf);
+#[derive(Clone, Copy)]
+struct ForkScalars {
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    egid: u32,
+    pgid: u32,
+    sid: u32,
+    umask: u32,
+    nice: i32,
+    pid_ns_vpid: u32,
+    pid_ns_next_child_pid: u32,
+    net_namespace_isolated: bool,
+}
 
-    // ── Header ──
+#[derive(Clone, Copy)]
+struct ExecScalars {
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    egid: u32,
+    pgid: u32,
+    sid: u32,
+    is_session_leader: bool,
+    umask: u32,
+    nice: i32,
+    parent_death_signal: u32,
+    pid_ns_vpid: u32,
+    pid_ns_next_child_pid: u32,
+    net_namespace_isolated: bool,
+}
+
+#[inline(never)]
+fn read_fork_header(r: &mut Reader<'_>) -> Result<(), Errno> {
     let magic = r.read_u32()?;
     if magic != FORK_MAGIC {
         return Err(Errno::EINVAL);
@@ -577,8 +612,11 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         return Err(Errno::EINVAL);
     }
     let _total_size = r.read_u32()?;
+    Ok(())
+}
 
-    // ── Scalars ──
+#[inline(never)]
+fn read_fork_scalars(r: &mut Reader<'_>) -> Result<ForkScalars, Errno> {
     let ppid = r.read_u32()?;
     let uid = r.read_u32()?;
     let gid = r.read_u32()?;
@@ -588,31 +626,54 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
     let sid = r.read_u32()?;
     let umask = r.read_u32()?;
     let nice = r.read_u32()? as i32;
-    let _parent_is_session_leader = r.read_u32()? != 0; // inherited as false for fork children
+    let _parent_is_session_leader = r.read_u32()? != 0;
+    let pid_ns_vpid = if r.remaining() >= 12 { r.read_u32()? } else { 0 };
+    let pid_ns_next_child_pid = if r.remaining() >= 8 { r.read_u32()? } else { 0 };
+    let net_namespace_isolated = if r.remaining() >= 4 { r.read_u32()? != 0 } else { false };
+    Ok(ForkScalars {
+        ppid,
+        uid,
+        gid,
+        euid,
+        egid,
+        pgid,
+        sid,
+        umask,
+        nice,
+        pid_ns_vpid,
+        pid_ns_next_child_pid,
+        net_namespace_isolated,
+    })
+}
 
-    // ── Signal state ──
-    let blocked = r.read_u64()?;
+#[inline(never)]
+fn read_fork_signals_into(r: &mut Reader<'_>, signals: &mut SignalState) -> Result<(), Errno> {
+    signals.blocked = r.read_u64()?;
+    signals.pending = 0;
+
     let handler_count = r.read_u32()?;
     if handler_count > 64 {
         return Err(Errno::EINVAL);
     }
-    let mut actions = [SignalAction::default(); 65];
     for _ in 0..handler_count {
         let signum = r.read_u32()?;
         let handler_val = r.read_u32()?;
         let flags = r.read_u32()?;
         let mask = r.read_u64()?;
-        if (signum as usize) < 65 {
-            actions[signum as usize] = SignalAction {
+        signals.set_deserialized_action(
+            signum,
+            SignalAction {
                 handler: u32_to_handler(handler_val),
                 flags,
                 mask,
-            };
-        }
+            },
+        );
     }
-    let signals = SignalState::from_actions(actions, blocked);
+    Ok(())
+}
 
-    // ── FD table ──
+#[inline(never)]
+fn read_fd_table(r: &mut Reader<'_>, skip_clofork: bool) -> Result<FdTable, Errno> {
     let max_fds = r.read_u32()? as usize;
     let fd_count = r.read_u32()?;
     if fd_count > MAX_FDS {
@@ -624,7 +685,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         let ofd_index = r.read_u32()? as usize;
         let fd_flags = r.read_u32()?;
         // FD_CLOFORK: skip FDs marked close-on-fork
-        if fd_flags & wasm_posix_shared::fd_flags::FD_CLOFORK != 0 {
+        if skip_clofork && fd_flags & FD_CLOFORK != 0 {
             continue;
         }
         while fd_entries.len() <= fd_num {
@@ -635,9 +696,16 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
             fd_flags,
         });
     }
-    let fd_table = FdTable::from_raw(fd_entries, max_fds);
+    Ok(FdTable::from_raw(fd_entries, max_fds))
+}
 
-    // ── OFD table ──
+#[inline(never)]
+fn read_fork_fd_table(r: &mut Reader<'_>) -> Result<FdTable, Errno> {
+    read_fd_table(r, true)
+}
+
+#[inline(never)]
+fn read_fork_ofd_table(r: &mut Reader<'_>, owner_pid: u32) -> Result<OfdTable, Errno> {
     let ofd_count = r.read_u32()?;
     if ofd_count > MAX_OFDS {
         return Err(Errno::EINVAL);
@@ -661,52 +729,54 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
             host_handle,
             offset,
             ref_count,
-            owner_pid: child_pid,
+            owner_pid,
             path,
             dir_host_handle: -1,
             dir_synth_state: 0,
             dir_entry_offset: 0,
+            dir_pending_name: Vec::new(),
+            dir_pending_ino: 0,
+            dir_pending_type: 0,
         });
     }
-    let ofd_table = OfdTable::from_raw(ofd_entries);
+    Ok(OfdTable::from_raw(ofd_entries))
+}
 
-    // ── Environment ──
-    let env_count = r.read_u32()?;
-    if env_count > MAX_ENV_VARS {
+#[inline(never)]
+fn read_vec_list(
+    r: &mut Reader<'_>,
+    max_count: u32,
+    max_len: usize,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let count = r.read_u32()?;
+    if count > max_count {
         return Err(Errno::EINVAL);
     }
-    let mut environ = Vec::with_capacity(env_count as usize);
-    for _ in 0..env_count {
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
         let len = r.read_u32()? as usize;
-        let data = r.read_bounded_bytes(len, MAX_STRING_LEN)?;
-        environ.push(data.to_vec());
+        out.push(r.read_bounded_bytes(len, max_len)?.to_vec());
     }
+    Ok(out)
+}
 
-    // ── Argv ──
-    let argv_count = r.read_u32()?;
-    if argv_count > MAX_ARGV {
-        return Err(Errno::EINVAL);
-    }
-    let mut argv = Vec::with_capacity(argv_count as usize);
-    for _ in 0..argv_count {
-        let len = r.read_u32()? as usize;
-        let data = r.read_bounded_bytes(len, MAX_STRING_LEN)?;
-        argv.push(data.to_vec());
-    }
-
-    // ── CWD ──
+#[inline(never)]
+fn read_cwd(r: &mut Reader<'_>) -> Result<Vec<u8>, Errno> {
     let cwd_len = r.read_u32()? as usize;
-    let cwd_data = r.read_bounded_bytes(cwd_len, MAX_PATH_LEN)?;
-    let cwd = cwd_data.to_vec();
+    Ok(r.read_bounded_bytes(cwd_len, MAX_PATH_LEN)?.to_vec())
+}
 
-    // ── Rlimits ──
-    let mut rlimits = [[0u64; 2]; 16];
+#[inline(never)]
+fn read_rlimits_into(r: &mut Reader<'_>, rlimits: &mut [[u64; 2]; 16]) -> Result<(), Errno> {
     for pair in rlimits.iter_mut() {
         pair[0] = r.read_u64()?;
         pair[1] = r.read_u64()?;
     }
+    Ok(())
+}
 
-    // ── Terminal ──
+#[inline(never)]
+fn read_terminal_state(r: &mut Reader<'_>) -> Result<TerminalState, Errno> {
     let c_iflag = r.read_u32()?;
     let c_oflag = r.read_u32()?;
     let c_cflag = r.read_u32()?;
@@ -723,7 +793,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
     let c_ospeed = r.read_u32().unwrap_or(0o0000017);
     let session_id = r.read_i32().unwrap_or(0);
 
-    let terminal = TerminalState {
+    Ok(TerminalState {
         c_iflag,
         c_oflag,
         c_cflag,
@@ -742,9 +812,11 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         session_id,
         line_buffer: Vec::new(),
         cooked_buffer: Vec::new(),
-    };
+    })
+}
 
-    // ── Program break ──
+#[inline(never)]
+fn read_fork_memory_into(r: &mut Reader<'_>, memory: &mut MemoryManager) -> Result<(), Errno> {
     let program_break = r.read_u32()?;
     let memory_layout = MemoryLayoutMetadata {
         initial_brk: r.read_u32()? as usize,
@@ -753,11 +825,11 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         mmap_base: r.read_u32()? as usize,
         reserved_until: r.read_u32()? as usize,
     };
-    let mut memory = MemoryManager::new();
+
+    *memory = MemoryManager::new();
     memory.set_layout_metadata(memory_layout);
     memory.set_brk(program_break as usize);
 
-    // ── mmap mappings (v5) ──
     if r.remaining() >= 4 {
         let mapping_count = r.read_u32()? as usize;
         if mapping_count > 4096 {
@@ -779,35 +851,44 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         memory.set_mappings(mappings);
     }
 
-    // ── Fork exec state (v3) ──
-    let fork_exec_path = if r.remaining() >= 4 {
-        let path_len = r.read_u32()? as usize;
-        if path_len > 0 {
-            Some(r.read_bounded_bytes(path_len, MAX_PATH_LEN)?.to_vec())
-        } else {
-            None
-        }
+    Ok(())
+}
+
+#[inline(never)]
+fn read_fork_exec_path(r: &mut Reader<'_>) -> Result<Option<Vec<u8>>, Errno> {
+    if r.remaining() < 4 {
+        return Ok(None);
+    }
+    let path_len = r.read_u32()? as usize;
+    if path_len > 0 {
+        Ok(Some(r.read_bounded_bytes(path_len, MAX_PATH_LEN)?.to_vec()))
     } else {
-        None
-    };
-    let fork_exec_argv = if r.remaining() >= 4 {
-        let argc = r.read_u32()? as usize;
-        if argc > 0 {
-            if argc > MAX_ARGV as usize {
-                return Err(Errno::EINVAL);
-            }
-            let mut args = Vec::with_capacity(argc);
-            for _ in 0..argc {
-                let len = r.read_u32()? as usize;
-                args.push(r.read_bounded_bytes(len, MAX_STRING_LEN)?.to_vec());
-            }
-            Some(args)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+        Ok(None)
+    }
+}
+
+#[inline(never)]
+fn read_fork_exec_argv(r: &mut Reader<'_>) -> Result<Option<Vec<Vec<u8>>>, Errno> {
+    if r.remaining() < 4 {
+        return Ok(None);
+    }
+    let argc = r.read_u32()? as usize;
+    if argc == 0 {
+        return Ok(None);
+    }
+    if argc > MAX_ARGV as usize {
+        return Err(Errno::EINVAL);
+    }
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let len = r.read_u32()? as usize;
+        args.push(r.read_bounded_bytes(len, MAX_STRING_LEN)?.to_vec());
+    }
+    Ok(Some(args))
+}
+
+#[inline(never)]
+fn read_fork_fd_actions(r: &mut Reader<'_>) -> Result<Vec<crate::process::FdAction>, Errno> {
     let mut fork_fd_actions = Vec::new();
     if r.remaining() >= 4 {
         let action_count = r.read_u32()? as usize;
@@ -826,198 +907,249 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
             }
         }
     }
+    Ok(fork_fd_actions)
+}
 
-    // ── Socket table (v4) ──
+#[inline(never)]
+fn read_fork_socket_table(r: &mut Reader<'_>) -> Result<SocketTable, Errno> {
     let mut sockets = SocketTable::new();
-    if r.remaining() >= 8 {
-        use crate::socket::{SocketDomain, SocketInfo, SocketState, SocketType};
-        let _total_slots = r.read_u32()? as usize;
-        let sock_count = r.read_u32()? as usize;
-        for _ in 0..sock_count {
-            let idx = r.read_u32()? as usize;
-            let domain = match r.read_u32()? {
-                0 => SocketDomain::Unix,
-                1 => SocketDomain::Inet,
-                2 => SocketDomain::Inet6,
-                _ => return Err(Errno::EINVAL),
-            };
-            let sock_type = match r.read_u32()? {
-                0 => SocketType::Stream,
-                1 => SocketType::Dgram,
-                _ => return Err(Errno::EINVAL),
-            };
-            let protocol = r.read_u32()?;
-            let state = match r.read_u32()? {
-                0 => SocketState::Unbound,
-                1 => SocketState::Bound,
-                2 => SocketState::Listening,
-                3 => SocketState::Connected,
-                4 => SocketState::Closed,
-                _ => return Err(Errno::EINVAL),
-            };
-            let peer_idx_raw = r.read_u32()?;
-            let peer_idx = if peer_idx_raw == 0xFFFFFFFF {
-                None
-            } else {
-                Some(peer_idx_raw as usize)
-            };
-            let recv_raw = r.read_u32()?;
-            let recv_buf_idx = if recv_raw == 0xFFFFFFFF {
-                None
-            } else {
-                Some(recv_raw as usize)
-            };
-            let send_raw = r.read_u32()?;
-            let send_buf_idx = if send_raw == 0xFFFFFFFF {
-                None
-            } else {
-                Some(send_raw as usize)
-            };
-            let shut_rd = r.read_u32()? != 0;
-            let shut_wr = r.read_u32()? != 0;
-            let hnh_raw = r.read_u32()?;
-            let host_net_handle = if hnh_raw == 0xFFFFFFFF {
-                None
-            } else {
-                Some(hnh_raw as i32)
-            };
-            // Options
-            let opt_count = r.read_u32()? as usize;
-            let mut options = Vec::new();
-            for _ in 0..opt_count {
-                let level = r.read_u32()?;
-                let optname = r.read_u32()?;
-                let value = r.read_u32()?;
-                options.push((level, optname, value));
-            }
-            // Addresses
-            let mut bind_addr = [0u8; 4];
-            bind_addr.copy_from_slice(r.read_bytes(4)?);
-            let bind_port = r.read_u32()? as u16;
-            let mut peer_addr = [0u8; 4];
-            peer_addr.copy_from_slice(r.read_bytes(4)?);
-            let peer_port = r.read_u32()? as u16;
-            // Listen backlog: read-and-discard. The serialize side now
-            // always writes 0; this loop tolerates older blobs (in case
-            // any in-flight serialize/deserialize crosses the format
-            // change). Pre-accepted AF_UNIX same-process connections are
-            // consume-once and stay with the parent — see SocketInfo's
-            // hand-written Clone.
-            let bl_count = r.read_u32()? as usize;
-            for _ in 0..bl_count {
-                let _ = r.read_u32()?;
-            }
-
-            let mut sock = SocketInfo::new(domain, sock_type, protocol);
-            sock.state = state;
-            sock.peer_idx = peer_idx;
-            sock.recv_buf_idx = recv_buf_idx;
-            sock.send_buf_idx = send_buf_idx;
-            sock.shut_rd = shut_rd;
-            sock.shut_wr = shut_wr;
-            sock.host_net_handle = host_net_handle;
-            sock.options = options;
-            sock.bind_addr = bind_addr;
-            sock.bind_port = bind_port;
-            sock.peer_addr = peer_addr;
-            sock.peer_port = peer_port;
-            // sock.listen_backlog stays at default (Vec::new()) — see the
-            // read-and-discard block above.
-            sock.global_pipes = r.read_u32()? != 0;
-            // Shared listener backlog idx (AF_INET listening sockets). The
-            // refcount bump for inherited references happens in
-            // `process_table::bump_inherited_resource_refcounts`, which both
-            // fork and spawn call after building the child — keeping
-            // refcount logic in one place.
-            let sb_raw = r.read_u32()?;
-            sock.shared_backlog_idx = if sb_raw == 0xFFFFFFFF {
-                None
-            } else {
-                Some(sb_raw as usize)
-            };
-            // bind_path for AF_UNIX
-            if r.remaining() >= 4 {
-                let bp_len = r.read_u32()?;
-                if bp_len != 0xFFFFFFFF {
-                    let bp = r.read_bytes(bp_len as usize)?;
-                    sock.bind_path = Some(bp.to_vec());
-                }
-            }
-            if r.remaining() >= 4 {
-                let aw_raw = r.read_u32()?;
-                sock.accept_wake_idx = if aw_raw == 0xFFFFFFFF {
-                    None
-                } else {
-                    Some(aw_raw)
-                };
-            }
-            sockets.insert_at(idx, sock);
-        }
+    if r.remaining() < 8 {
+        return Ok(sockets);
     }
 
-    Ok(Process {
-        pid: child_pid,
-        ppid,
-        uid,
-        gid,
-        euid,
-        egid,
-        pgid,
-        sid,
+    use crate::socket::{SocketDomain, SocketInfo, SocketState, SocketType};
+    let _total_slots = r.read_u32()? as usize;
+    let sock_count = r.read_u32()? as usize;
+    for _ in 0..sock_count {
+        let idx = r.read_u32()? as usize;
+        let domain = match r.read_u32()? {
+            0 => SocketDomain::Unix,
+            1 => SocketDomain::Inet,
+            2 => SocketDomain::Inet6,
+            3 => SocketDomain::Netlink,
+            _ => return Err(Errno::EINVAL),
+        };
+        let sock_type = match r.read_u32()? {
+            0 => SocketType::Stream,
+            1 => SocketType::Dgram,
+            _ => return Err(Errno::EINVAL),
+        };
+        let protocol = r.read_u32()?;
+        let state = match r.read_u32()? {
+            0 => SocketState::Unbound,
+            1 => SocketState::Bound,
+            2 => SocketState::Listening,
+            3 => SocketState::Connected,
+            4 => SocketState::Closed,
+            _ => return Err(Errno::EINVAL),
+        };
+        let peer_idx_raw = r.read_u32()?;
+        let peer_idx = if peer_idx_raw == 0xFFFFFFFF {
+            None
+        } else {
+            Some(peer_idx_raw as usize)
+        };
+        let recv_raw = r.read_u32()?;
+        let recv_buf_idx = if recv_raw == 0xFFFFFFFF {
+            None
+        } else {
+            Some(recv_raw as usize)
+        };
+        let send_raw = r.read_u32()?;
+        let send_buf_idx = if send_raw == 0xFFFFFFFF {
+            None
+        } else {
+            Some(send_raw as usize)
+        };
+        let shut_rd = r.read_u32()? != 0;
+        let shut_wr = r.read_u32()? != 0;
+        let hnh_raw = r.read_u32()?;
+        let host_net_handle = if hnh_raw == 0xFFFFFFFF {
+            None
+        } else {
+            Some(hnh_raw as i32)
+        };
+
+        let opt_count = r.read_u32()? as usize;
+        let mut options = Vec::new();
+        for _ in 0..opt_count {
+            let level = r.read_u32()?;
+            let optname = r.read_u32()?;
+            let value = r.read_u32()?;
+            options.push((level, optname, value));
+        }
+
+        let mut bind_addr = [0u8; 4];
+        bind_addr.copy_from_slice(r.read_bytes(4)?);
+        let bind_port = r.read_u32()? as u16;
+        let mut peer_addr = [0u8; 4];
+        peer_addr.copy_from_slice(r.read_bytes(4)?);
+        let peer_port = r.read_u32()? as u16;
+
+        // Listen backlog: read-and-discard. The serialize side now always
+        // writes 0; tolerate older blobs in case an in-flight fork crosses the
+        // format change.
+        let bl_count = r.read_u32()? as usize;
+        for _ in 0..bl_count {
+            let _ = r.read_u32()?;
+        }
+
+        let mut sock = SocketInfo::new(domain, sock_type, protocol);
+        sock.state = state;
+        sock.peer_idx = peer_idx;
+        sock.recv_buf_idx = recv_buf_idx;
+        sock.send_buf_idx = send_buf_idx;
+        sock.shut_rd = shut_rd;
+        sock.shut_wr = shut_wr;
+        sock.host_net_handle = host_net_handle;
+        sock.options = options;
+        sock.bind_addr = bind_addr;
+        sock.bind_port = bind_port;
+        sock.peer_addr = peer_addr;
+        sock.peer_port = peer_port;
+        sock.global_pipes = r.read_u32()? != 0;
+
+        let sb_raw = r.read_u32()?;
+        sock.shared_backlog_idx = if sb_raw == 0xFFFFFFFF {
+            None
+        } else {
+            Some(sb_raw as usize)
+        };
+
+        if r.remaining() >= 4 {
+            let bp_len = r.read_u32()?;
+            if bp_len != 0xFFFFFFFF {
+                let bp = r.read_bytes(bp_len as usize)?;
+                sock.bind_path = Some(bp.to_vec());
+            }
+        }
+        if r.remaining() >= 4 {
+            let aw_raw = r.read_u32()?;
+            sock.accept_wake_idx = if aw_raw == 0xFFFFFFFF {
+                None
+            } else {
+                Some(aw_raw)
+            };
+        }
+        sockets.insert_at(idx, sock);
+    }
+
+    Ok(sockets)
+}
+
+#[inline(never)]
+fn new_fork_child_shell(child_pid: u32, scalars: ForkScalars) -> Box<Process> {
+    let mut boxed = Box::<Process>::new_uninit();
+    let child_ptr = boxed.as_mut_ptr();
+
+    let mut rlimits = [[u64::MAX; 2]; 16];
+    rlimits[7] = [1024, 4096];
+    rlimits[3] = [8 * 1024 * 1024, u64::MAX];
+
+    unsafe {
+        ptr::addr_of_mut!((*child_ptr).pid).write(child_pid);
+        ptr::addr_of_mut!((*child_ptr).ppid).write(scalars.ppid);
+        ptr::addr_of_mut!((*child_ptr).uid).write(scalars.uid);
+        ptr::addr_of_mut!((*child_ptr).gid).write(scalars.gid);
+        ptr::addr_of_mut!((*child_ptr).euid).write(scalars.euid);
+        ptr::addr_of_mut!((*child_ptr).egid).write(scalars.egid);
+        ptr::addr_of_mut!((*child_ptr).pgid).write(scalars.pgid);
+        ptr::addr_of_mut!((*child_ptr).sid).write(scalars.sid);
         // POSIX: fork children inherit sid but are NEVER session leaders.
-        // The leader flag is explicit (not derived from sid==pid) so that a
-        // child whose new pid happens to equal the inherited sid is still
-        // correctly treated as a non-leader.
-        is_session_leader: false,
-        state: ProcessState::Running,
-        exit_status: 0,
-        fd_table,
-        ofd_table,
-        lock_table: LockTable::new(),
-        pipes: Vec::new(),
-        sockets,
-        cwd,
-        dir_streams: Vec::new(),
-        signals,
-        memory,
-        terminal,
-        environ,
-        argv,
-        umask,
-        nice,
-        rlimits,
-        alarm_deadline_ns: 0,
-        alarm_interval_ns: 0,
-        thread_name: [0u8; 16],
-        fork_child: true,
-        sigsuspend_saved_mask: None,
-        fork_exec_path,
-        fork_exec_argv,
-        fork_fd_actions,
-        next_ephemeral_port: 49152,
-        threads: Vec::new(), // POSIX: child has single thread
-        next_tid: 0,
-        eventfds: Vec::new(),
-        epolls: Vec::new(),
-        timerfds: Vec::new(),
-        signalfds: Vec::new(),
-        posix_timers: Vec::new(),
-        alt_stack_sp: 0,
-        alt_stack_flags: 2, // SS_DISABLE
-        alt_stack_size: 0,
-        alt_stack_depth: 0,
-        fork_pipe_replay: Vec::new(),
-        memfds: Vec::new(),
-        procfs_bufs: Vec::new(),
-        has_exec: false,
+        ptr::addr_of_mut!((*child_ptr).is_session_leader).write(false);
+        ptr::addr_of_mut!((*child_ptr).state).write(ProcessState::Running);
+        ptr::addr_of_mut!((*child_ptr).exit_status).write(0);
+        ptr::addr_of_mut!((*child_ptr).exit_signal).write(0);
+        ptr::addr_of_mut!((*child_ptr).stop_signal).write(0);
+        ptr::addr_of_mut!((*child_ptr).fd_table).write(FdTable::new());
+        ptr::addr_of_mut!((*child_ptr).ofd_table).write(OfdTable::new());
+        ptr::addr_of_mut!((*child_ptr).lock_table).write(LockTable::new());
+        ptr::addr_of_mut!((*child_ptr).pipes).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).sockets).write(SocketTable::new());
+        ptr::addr_of_mut!((*child_ptr).cwd).write(alloc::vec![b'/']);
+        ptr::addr_of_mut!((*child_ptr).dir_streams).write(Vec::new());
+        SignalState::write_default_to(ptr::addr_of_mut!((*child_ptr).signals));
+        ptr::addr_of_mut!((*child_ptr).memory).write(MemoryManager::new());
+        ptr::addr_of_mut!((*child_ptr).terminal).write(TerminalState::new());
+        ptr::addr_of_mut!((*child_ptr).environ).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).argv).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).umask).write(scalars.umask);
+        ptr::addr_of_mut!((*child_ptr).nice).write(scalars.nice);
+        ptr::addr_of_mut!((*child_ptr).rlimits).write(rlimits);
+        ptr::addr_of_mut!((*child_ptr).alarm_deadline_ns).write(0);
+        ptr::addr_of_mut!((*child_ptr).alarm_interval_ns).write(0);
+        ptr::addr_of_mut!((*child_ptr).thread_name).write([0u8; 16]);
+        ptr::addr_of_mut!((*child_ptr).fork_child).write(true);
+        ptr::addr_of_mut!((*child_ptr).sigsuspend_saved_mask).write(None);
+        ptr::addr_of_mut!((*child_ptr).fork_exec_path).write(None);
+        ptr::addr_of_mut!((*child_ptr).fork_exec_argv).write(None);
+        ptr::addr_of_mut!((*child_ptr).fork_fd_actions).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).next_ephemeral_port).write(49152);
+        ptr::addr_of_mut!((*child_ptr).threads).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).next_tid).write(0);
+        ptr::addr_of_mut!((*child_ptr).eventfds).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).epolls).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).timerfds).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).signalfds).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).posix_timers).write(Vec::new());
+        // Linux clears PR_SET_PDEATHSIG across fork. The setting is
+        // process-local and children must opt in for their own parent.
+        ptr::addr_of_mut!((*child_ptr).parent_death_signal).write(0);
+        ptr::addr_of_mut!((*child_ptr).alt_stack_sp).write(0);
+        ptr::addr_of_mut!((*child_ptr).alt_stack_flags).write(2); // SS_DISABLE
+        ptr::addr_of_mut!((*child_ptr).alt_stack_size).write(0);
+        ptr::addr_of_mut!((*child_ptr).alt_stack_depth).write(0);
+        ptr::addr_of_mut!((*child_ptr).fork_pipe_replay).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).memfds).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).procfs_bufs).write(Vec::new());
+        ptr::addr_of_mut!((*child_ptr).has_exec).write(false);
         // Fork children do NOT inherit the framebuffer binding. The
         // /dev/fb0 device is single-owner (FB0_OWNER); a forked child
-        // gets a private mmap copy in its own Memory but is not
-        // registered as a host display target. fbDOOM doesn't fork
-        // mid-game; documented limitation in the design doc.
-        fb_binding: None,
-        fork_count: 0,
-    })
+        // gets a private mmap copy in its own Memory but is not registered
+        // as a host display target.
+        ptr::addr_of_mut!((*child_ptr).fb_binding).write(None);
+        ptr::addr_of_mut!((*child_ptr).pid_ns_vpid).write(scalars.pid_ns_vpid);
+        ptr::addr_of_mut!((*child_ptr).pid_ns_next_child_pid)
+            .write(scalars.pid_ns_next_child_pid);
+        ptr::addr_of_mut!((*child_ptr).net_namespace_isolated)
+            .write(scalars.net_namespace_isolated);
+        ptr::addr_of_mut!((*child_ptr).fork_count).write(0);
+
+        boxed.assume_init()
+    }
+}
+
+/// Deserialize process state from a fork buffer, creating a new child process.
+///
+/// The child process gets:
+/// - `pid = child_pid`
+/// - `state = ProcessState::Running`
+/// - `exit_status = 0`
+/// - Empty lock table, pipes, dir_streams, memory (per POSIX)
+/// - Sockets are cloned from parent (POSIX: child inherits open fds including sockets)
+/// - `signals.pending = 0` (via `SignalState::from_parts`)
+pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Box<Process>, Errno> {
+    let mut r = Reader::new(buf);
+
+    read_fork_header(&mut r)?;
+    let scalars = read_fork_scalars(&mut r)?;
+    let mut child = new_fork_child_shell(child_pid, scalars);
+
+    read_fork_signals_into(&mut r, &mut child.signals)?;
+    child.fd_table = read_fork_fd_table(&mut r)?;
+    child.ofd_table = read_fork_ofd_table(&mut r, child_pid)?;
+    child.environ = read_vec_list(&mut r, MAX_ENV_VARS, MAX_STRING_LEN)?;
+    child.argv = read_vec_list(&mut r, MAX_ARGV, MAX_STRING_LEN)?;
+    child.cwd = read_cwd(&mut r)?;
+    read_rlimits_into(&mut r, &mut child.rlimits)?;
+    child.terminal = read_terminal_state(&mut r)?;
+    read_fork_memory_into(&mut r, &mut child.memory)?;
+    child.fork_exec_path = read_fork_exec_path(&mut r)?;
+    child.fork_exec_argv = read_fork_exec_argv(&mut r)?;
+    child.fork_fd_actions = read_fork_fd_actions(&mut r)?;
+    child.sockets = read_fork_socket_table(&mut r)?;
+
+    Ok(child)
 }
 
 // ── Exec Serialize ──────────────────────────────────────────────────────────
@@ -1040,7 +1172,7 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     let total_size_offset = w.pos;
     w.write_u32(0)?; // placeholder for total_size
 
-    // ── Scalars (32 bytes) ──
+    // ── Scalars ──
     // Preserve the process's own ppid (exec replaces the image, not the process)
     w.write_u32(proc.ppid)?;
     w.write_u32(proc.uid)?;
@@ -1052,6 +1184,11 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u32(proc.is_session_leader as u32)?;
     w.write_u32(proc.umask)?;
     w.write_u32(proc.nice as u32)?;
+    // PR_SET_PDEATHSIG is preserved across exec on Linux.
+    w.write_u32(proc.parent_death_signal)?;
+    w.write_u32(proc.pid_ns_vpid)?;
+    w.write_u32(proc.pid_ns_next_child_pid)?;
+    w.write_u32(proc.net_namespace_isolated as u32)?;
 
     // ── Signal state ──
     w.write_u64(proc.signals.blocked)?;
@@ -1156,6 +1293,85 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     // ── Program break ──
     w.write_u32(proc.memory.get_brk() as u32)?;
 
+    // ── Socket table ──
+    //
+    // POSIX exec replaces the program image, not the process's open file
+    // descriptions. Any socket fd that survives FD_CLOEXEC must still refer to
+    // its socket object after exec, including listener accept queues/options.
+    // Use the same wire shape as fork so socket indices encoded in socket OFDs
+    // (host_handle = -(idx + 1)) remain valid.
+    {
+        use crate::socket::{SocketDomain, SocketState, SocketType};
+        let mut sock_count = 0u32;
+        for idx in 0..proc.sockets.len() {
+            if proc.sockets.get(idx).is_some() {
+                sock_count += 1;
+            }
+        }
+        w.write_u32(proc.sockets.len() as u32)?;
+        w.write_u32(sock_count)?;
+        for idx in 0..proc.sockets.len() {
+            if let Some(sock) = proc.sockets.get(idx) {
+                w.write_u32(idx as u32)?;
+                w.write_u32(match sock.domain {
+                    SocketDomain::Unix => 0,
+                    SocketDomain::Inet => 1,
+                    SocketDomain::Inet6 => 2,
+                    SocketDomain::Netlink => 3,
+                })?;
+                w.write_u32(match sock.sock_type {
+                    SocketType::Stream => 0,
+                    SocketType::Dgram => 1,
+                })?;
+                w.write_u32(sock.protocol)?;
+                w.write_u32(match sock.state {
+                    SocketState::Unbound => 0,
+                    SocketState::Bound => 1,
+                    SocketState::Listening => 2,
+                    SocketState::Connected => 3,
+                    SocketState::Closed => 4,
+                    SocketState::Connecting => 4,
+                })?;
+                w.write_u32(sock.peer_idx.map(|v| v as u32).unwrap_or(0xFFFFFFFF))?;
+                w.write_u32(sock.recv_buf_idx.map(|v| v as u32).unwrap_or(0xFFFFFFFF))?;
+                w.write_u32(sock.send_buf_idx.map(|v| v as u32).unwrap_or(0xFFFFFFFF))?;
+                w.write_u32(if sock.shut_rd { 1 } else { 0 })?;
+                w.write_u32(if sock.shut_wr { 1 } else { 0 })?;
+                w.write_u32(sock.host_net_handle.map(|v| v as u32).unwrap_or(0xFFFFFFFF))?;
+                w.write_u32(sock.options.len() as u32)?;
+                for &(level, optname, value) in &sock.options {
+                    w.write_u32(level)?;
+                    w.write_u32(optname)?;
+                    w.write_u32(value)?;
+                }
+                w.write_bytes(&sock.bind_addr)?;
+                w.write_u32(sock.bind_port as u32)?;
+                w.write_bytes(&sock.peer_addr)?;
+                w.write_u32(sock.peer_port as u32)?;
+                // Legacy per-process accept backlog is consume-once state.
+                // Shared listener backlog indices below preserve the actual
+                // POSIX accept queue for current stream listeners.
+                w.write_u32(0u32)?;
+                w.write_u32(if sock.global_pipes { 1 } else { 0 })?;
+                w.write_u32(
+                    sock.shared_backlog_idx
+                        .map(|v| v as u32)
+                        .unwrap_or(0xFFFFFFFF),
+                )?;
+                match &sock.bind_path {
+                    Some(p) => {
+                        w.write_u32(p.len() as u32)?;
+                        w.write_bytes(p)?;
+                    }
+                    None => {
+                        w.write_u32(0xFFFFFFFF)?;
+                    }
+                }
+                w.write_u32(sock.accept_wake_idx.unwrap_or(0xFFFFFFFF))?;
+            }
+        }
+    }
+
     // ── Patch total_size ──
     let total = w.pos as u32;
     w.patch_u32(total_size_offset, total);
@@ -1165,16 +1381,8 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
 
 // ── Exec Deserialize ────────────────────────────────────────────────────────
 
-/// Deserialize process state from an exec buffer.
-///
-/// Differs from fork deserialization:
-/// - Checks EXEC_MAGIC instead of FORK_MAGIC
-/// - Reads pending signals (u64) after handler entries
-/// - Uses `SignalState::from_parts_with_pending` to preserve pending signals
-pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
-    let mut r = Reader::new(buf);
-
-    // ── Header ──
+#[inline(never)]
+fn read_exec_header(r: &mut Reader<'_>) -> Result<(), Errno> {
     let magic = r.read_u32()?;
     if magic != EXEC_MAGIC {
         return Err(Errno::EINVAL);
@@ -1184,237 +1392,113 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         return Err(Errno::EINVAL);
     }
     let _total_size = r.read_u32()?;
+    Ok(())
+}
 
-    // ── Scalars ──
-    let ppid = r.read_u32()?;
-    let uid = r.read_u32()?;
-    let gid = r.read_u32()?;
-    let euid = r.read_u32()?;
-    let egid = r.read_u32()?;
-    let pgid = r.read_u32()?;
-    let sid = r.read_u32()?;
-    let is_session_leader = r.read_u32()? != 0; // preserved across exec
-    let umask = r.read_u32()?;
-    let nice = r.read_u32()? as i32;
+#[inline(never)]
+fn read_exec_scalars(r: &mut Reader<'_>) -> Result<ExecScalars, Errno> {
+    Ok(ExecScalars {
+        ppid: r.read_u32()?,
+        uid: r.read_u32()?,
+        gid: r.read_u32()?,
+        euid: r.read_u32()?,
+        egid: r.read_u32()?,
+        pgid: r.read_u32()?,
+        sid: r.read_u32()?,
+        is_session_leader: r.read_u32()? != 0,
+        umask: r.read_u32()?,
+        nice: r.read_u32()? as i32,
+        parent_death_signal: r.read_u32()?,
+        pid_ns_vpid: if r.remaining() >= 12 { r.read_u32()? } else { 0 },
+        pid_ns_next_child_pid: if r.remaining() >= 8 { r.read_u32()? } else { 0 },
+        net_namespace_isolated: if r.remaining() >= 4 { r.read_u32()? != 0 } else { false },
+    })
+}
 
-    // ── Signal state ──
+#[inline(never)]
+fn apply_exec_scalars(proc: &mut Process, scalars: ExecScalars) {
+    proc.ppid = scalars.ppid;
+    proc.uid = scalars.uid;
+    proc.gid = scalars.gid;
+    proc.euid = scalars.euid;
+    proc.egid = scalars.egid;
+    proc.pgid = scalars.pgid;
+    proc.sid = scalars.sid;
+    proc.is_session_leader = scalars.is_session_leader;
+    proc.state = ProcessState::Running;
+    proc.exit_status = 0;
+    proc.exit_signal = 0;
+    proc.stop_signal = 0;
+    proc.umask = scalars.umask;
+    proc.nice = scalars.nice;
+    proc.parent_death_signal = scalars.parent_death_signal;
+    proc.pid_ns_vpid = scalars.pid_ns_vpid;
+    proc.pid_ns_next_child_pid = scalars.pid_ns_next_child_pid;
+    proc.net_namespace_isolated = scalars.net_namespace_isolated;
+}
+
+#[inline(never)]
+fn read_exec_signals_into(r: &mut Reader<'_>, signals: &mut SignalState) -> Result<(), Errno> {
     let blocked = r.read_u64()?;
+    signals.reset_deserialized_exec(blocked);
+
     let handler_count = r.read_u32()?;
     if handler_count > 64 {
         return Err(Errno::EINVAL);
     }
-    let mut handlers = [SignalHandler::Default; 65];
     for _ in 0..handler_count {
         let signum = r.read_u32()?;
         let handler_val = r.read_u32()?;
-        if (signum as usize) < 64 {
-            handlers[signum as usize] = u32_to_handler(handler_val);
-        }
+        signals.set_deserialized_action(
+            signum,
+            SignalAction {
+                handler: u32_to_handler(handler_val),
+                flags: 0,
+                mask: 0,
+            },
+        );
     }
-    // Read pending signals (exec preserves them, unlike fork)
+
     let pending = r.read_u64()?;
-    let signals = SignalState::from_parts_with_pending(handlers, blocked, pending);
+    signals.set_deserialized_pending(pending);
+    Ok(())
+}
 
-    // ── FD table ──
-    let max_fds = r.read_u32()? as usize;
-    let fd_count = r.read_u32()?;
-    if fd_count > MAX_FDS {
-        return Err(Errno::EINVAL);
-    }
-    let mut fd_entries: Vec<Option<FdEntry>> = Vec::new();
-    for _ in 0..fd_count {
-        let fd_num = r.read_u32()? as usize;
-        let ofd_index = r.read_u32()? as usize;
-        let fd_flags = r.read_u32()?;
-        while fd_entries.len() <= fd_num {
-            fd_entries.push(None);
-        }
-        fd_entries[fd_num] = Some(FdEntry {
-            ofd_ref: OpenFileDescRef(ofd_index),
-            fd_flags,
-        });
-    }
-    let fd_table = FdTable::from_raw(fd_entries, max_fds);
-
-    // ── OFD table ──
-    let ofd_count = r.read_u32()?;
-    if ofd_count > MAX_OFDS {
-        return Err(Errno::EINVAL);
-    }
-    let mut ofd_entries: Vec<Option<OpenFileDesc>> = Vec::new();
-    for _ in 0..ofd_count {
-        let index = r.read_u32()? as usize;
-        let file_type = u32_to_file_type(r.read_u32()?)?;
-        let status_flags = r.read_u32()?;
-        let host_handle = r.read_i64()?;
-        let offset = r.read_i64()?;
-        let ref_count = r.read_u32()?;
-        let path_len = r.read_u32()? as usize;
-        let path = r.read_bounded_bytes(path_len, MAX_PATH_LEN)?.to_vec();
-        while ofd_entries.len() <= index {
-            ofd_entries.push(None);
-        }
-        ofd_entries[index] = Some(OpenFileDesc {
-            file_type,
-            status_flags,
-            host_handle,
-            offset,
-            ref_count,
-            owner_pid: pid,
-            path,
-            dir_host_handle: -1,
-            dir_synth_state: 0,
-            dir_entry_offset: 0,
-        });
-    }
-    let ofd_table = OfdTable::from_raw(ofd_entries);
-
-    // ── Environment ──
-    let env_count = r.read_u32()?;
-    if env_count > MAX_ENV_VARS {
-        return Err(Errno::EINVAL);
-    }
-    let mut environ = Vec::with_capacity(env_count as usize);
-    for _ in 0..env_count {
-        let len = r.read_u32()? as usize;
-        let data = r.read_bounded_bytes(len, MAX_STRING_LEN)?;
-        environ.push(data.to_vec());
-    }
-
-    // ── Argv ──
-    let argv_count = r.read_u32()?;
-    if argv_count > MAX_ARGV {
-        return Err(Errno::EINVAL);
-    }
-    let mut argv = Vec::with_capacity(argv_count as usize);
-    for _ in 0..argv_count {
-        let len = r.read_u32()? as usize;
-        let data = r.read_bounded_bytes(len, MAX_STRING_LEN)?;
-        argv.push(data.to_vec());
-    }
-
-    // ── CWD ──
-    let cwd_len = r.read_u32()? as usize;
-    let cwd_data = r.read_bounded_bytes(cwd_len, MAX_PATH_LEN)?;
-    let cwd = cwd_data.to_vec();
-
-    // ── Rlimits ──
-    let mut rlimits = [[0u64; 2]; 16];
-    for pair in rlimits.iter_mut() {
-        pair[0] = r.read_u64()?;
-        pair[1] = r.read_u64()?;
-    }
-
-    // ── Terminal ──
-    let c_iflag = r.read_u32()?;
-    let c_oflag = r.read_u32()?;
-    let c_cflag = r.read_u32()?;
-    let c_lflag = r.read_u32()?;
-    let c_cc_data = r.read_bytes(NCCS)?;
-    let mut c_cc = [0u8; NCCS];
-    c_cc.copy_from_slice(c_cc_data);
-    let ws_row = r.read_u16()?;
-    let ws_col = r.read_u16()?;
-    let ws_xpixel = r.read_u16()?;
-    let ws_ypixel = r.read_u16()?;
-    let c_line = r.read_u8().unwrap_or(0);
-    let c_ispeed = r.read_u32().unwrap_or(0o0000017); // B38400
-    let c_ospeed = r.read_u32().unwrap_or(0o0000017);
-    let session_id = r.read_i32().unwrap_or(0);
-
-    let terminal = TerminalState {
-        c_iflag,
-        c_oflag,
-        c_cflag,
-        c_lflag,
-        c_line,
-        c_cc,
-        c_ispeed,
-        c_ospeed,
-        winsize: WinSize {
-            ws_row,
-            ws_col,
-            ws_xpixel,
-            ws_ypixel,
-        },
-        foreground_pgid: 1,
-        session_id,
-        line_buffer: Vec::new(),
-        cooked_buffer: Vec::new(),
-    };
-
-    // ── Program break ──
-    // Read but discard: POSIX exec resets the program break (Linux does the
-    // same), and the host calls `kernel_set_brk_base` with the new program's
-    // `__heap_base` immediately after exec to install the correct value
-    // before `_start` runs. Preserving the previous program's brk here would
-    // leave malloc allocating from inside the new program's stack region
-    // when the new program has a larger data section than the old one
-    // (e.g. /bin/sh exec'ing mariadbd).
+#[inline(never)]
+fn read_exec_memory_into(r: &mut Reader<'_>, memory: &mut MemoryManager) -> Result<(), Errno> {
+    // POSIX/Linux exec resets the program break. The host installs the new
+    // program's heap base immediately after exec setup, before `_start`.
     let _program_break = r.read_u32()?;
-    let memory = MemoryManager::new();
+    *memory = MemoryManager::new();
+    Ok(())
+}
 
-    Ok(Process {
-        pid,
-        ppid,
-        uid,
-        gid,
-        euid,
-        egid,
-        pgid,
-        sid,
-        is_session_leader,
-        state: ProcessState::Running,
-        exit_status: 0,
-        fd_table,
-        ofd_table,
-        lock_table: LockTable::new(),
-        pipes: Vec::new(),
-        sockets: SocketTable::new(),
-        cwd,
-        dir_streams: Vec::new(),
-        signals,
-        memory,
-        terminal,
-        environ,
-        argv,
-        umask,
-        nice,
-        rlimits,
-        alarm_deadline_ns: 0,
-        alarm_interval_ns: 0,
-        thread_name: [0u8; 16],
-        fork_child: false,
-        sigsuspend_saved_mask: None,
-        fork_exec_path: None,
-        fork_exec_argv: None,
-        fork_fd_actions: Vec::new(),
-        next_ephemeral_port: 49152,
-        threads: Vec::new(), // exec resets to single thread
-        next_tid: 0,
-        eventfds: Vec::new(),
-        epolls: Vec::new(),
-        timerfds: Vec::new(),
-        signalfds: Vec::new(),
-        posix_timers: Vec::new(),
-        alt_stack_sp: 0,
-        alt_stack_flags: 2, // SS_DISABLE
-        alt_stack_size: 0,
-        alt_stack_depth: 0,
-        fork_pipe_replay: Vec::new(),
-        memfds: Vec::new(),
-        procfs_bufs: Vec::new(),
-        has_exec: false,
-        // exec wipes any prior framebuffer binding — the new program
-        // must open and mmap /dev/fb0 itself.
-        fb_binding: None,
-        // The fork counter exists as a kernel-side regression guardrail.
-        // Resetting on exec keeps semantics simple: the next spawn-from-this-pid
-        // test starts from a clean slate. The plan's regression check inspects
-        // the *parent* process's counter, not the post-exec child, so this
-        // reset is safe.
-        fork_count: 0,
-    })
+/// Deserialize process state from an exec buffer.
+///
+/// Differs from fork deserialization:
+/// - Checks EXEC_MAGIC instead of FORK_MAGIC
+/// - Reads pending signals (u64) after handler entries
+/// - Preserves pending signals without constructing a large stack array
+pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Box<Process>, Errno> {
+    let mut r = Reader::new(buf);
+
+    read_exec_header(&mut r)?;
+    let scalars = read_exec_scalars(&mut r)?;
+
+    let mut exec_proc = Process::new_boxed(pid);
+    apply_exec_scalars(&mut exec_proc, scalars);
+    read_exec_signals_into(&mut r, &mut exec_proc.signals)?;
+    exec_proc.fd_table = read_fd_table(&mut r, false)?;
+    exec_proc.ofd_table = read_fork_ofd_table(&mut r, pid)?;
+    exec_proc.environ = read_vec_list(&mut r, MAX_ENV_VARS, MAX_STRING_LEN)?;
+    exec_proc.argv = read_vec_list(&mut r, MAX_ARGV, MAX_STRING_LEN)?;
+    exec_proc.cwd = read_cwd(&mut r)?;
+    read_rlimits_into(&mut r, &mut exec_proc.rlimits)?;
+    exec_proc.terminal = read_terminal_state(&mut r)?;
+    read_exec_memory_into(&mut r, &mut exec_proc.memory)?;
+    exec_proc.sockets = read_fork_socket_table(&mut r)?;
+
+    Ok(exec_proc)
 }
 
 #[cfg(test)]
@@ -1587,6 +1671,31 @@ mod tests {
     }
 
     #[test]
+    fn test_fork_clears_parent_death_signal() {
+        let mut proc = Process::new(1);
+        proc.parent_death_signal = 15;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_fork_state(&proc, &mut buf).unwrap();
+        let child = deserialize_fork_state(&buf[..written], 2).unwrap();
+
+        assert_eq!(child.parent_death_signal, 0);
+        assert_eq!(child.ppid, 1);
+    }
+
+    #[test]
+    fn test_exec_preserves_parent_death_signal() {
+        let mut proc = Process::new(1);
+        proc.parent_death_signal = 15;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 1).unwrap();
+
+        assert_eq!(restored.parent_death_signal, 15);
+    }
+
+    #[test]
     fn test_exec_state_filters_cloexec_fds() {
         use wasm_posix_shared::fd_flags::FD_CLOEXEC;
         let mut proc = Process::new(1);
@@ -1650,6 +1759,40 @@ mod tests {
         let restored = deserialize_exec_state(&buf[..written], 5).unwrap();
 
         assert_eq!(restored.ppid, 3); // ppid preserved
+    }
+
+    #[test]
+    fn test_exec_preserves_surviving_socket_state() {
+        use crate::fd::OpenFileDescRef;
+        use crate::ofd::FileType;
+        use crate::socket::{SocketDomain, SocketInfo, SocketState, SocketType};
+
+        let mut proc = Process::new(7);
+        let mut sock = SocketInfo::new(SocketDomain::Unix, SocketType::Stream, 0);
+        sock.state = SocketState::Listening;
+        sock.shared_backlog_idx = Some(123);
+        sock.accept_wake_idx = Some(456);
+        let sock_idx = proc.sockets.alloc(sock);
+        let ofd_idx =
+            proc.ofd_table
+                .create(FileType::Socket, 0, -((sock_idx as i64) + 1), Vec::new());
+        let fd = proc.fd_table.alloc(OpenFileDescRef(ofd_idx), 0).unwrap();
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 7).unwrap();
+
+        let restored_ofd_idx = restored.fd_table.get(fd).unwrap().ofd_ref.0;
+        let restored_ofd = restored.ofd_table.get(restored_ofd_idx).unwrap();
+        assert_eq!(restored_ofd.file_type, FileType::Socket);
+        assert_eq!(restored_ofd.host_handle, -((sock_idx as i64) + 1));
+
+        let restored_sock = restored.sockets.get(sock_idx).expect("socket survives exec");
+        assert_eq!(restored_sock.domain, SocketDomain::Unix);
+        assert_eq!(restored_sock.sock_type, SocketType::Stream);
+        assert_eq!(restored_sock.state, SocketState::Listening);
+        assert_eq!(restored_sock.shared_backlog_idx, Some(123));
+        assert_eq!(restored_sock.accept_wake_idx, Some(456));
     }
 
     #[test]
@@ -1760,6 +1903,96 @@ mod tests {
     }
 
     #[test]
+    fn test_fork_from_main_treats_parent_pthread_slots_as_free_memory() {
+        use wasm_posix_shared::mmap::*;
+
+        let mut proc = Process::new(1);
+        let slot_len = 0x40000;
+        let first = proc.memory.reserve_host_region(slot_len);
+        let second = proc.memory.reserve_host_region(slot_len);
+        assert_ne!(first, wasm_posix_shared::mmap::MAP_FAILED);
+        assert_ne!(second, wasm_posix_shared::mmap::MAP_FAILED);
+        assert_eq!(proc.memory.reserved_regions().len(), 2);
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_fork_state(&proc, &mut buf).unwrap();
+        let mut child = deserialize_fork_state(&buf[..written], 42).unwrap();
+
+        // POSIX fork resumes only the calling thread. Parent pthread slots
+        // are process-memory bytes in the child, not automatically-live host
+        // reservations. The host installs one exact caller-slot reservation
+        // separately for fork-from-pthread children.
+        assert!(child.memory.reserved_regions().is_empty());
+        assert!(child.memory.can_grow_at(first, slot_len));
+        assert!(child.memory.can_grow_at(second, slot_len));
+
+        let fixed_anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+        assert_eq!(
+            child
+                .memory
+                .mmap_anonymous(first, slot_len, PROT_READ | PROT_WRITE, fixed_anon),
+            first
+        );
+        assert_eq!(
+            child
+                .memory
+                .mmap_anonymous(second, slot_len, PROT_READ | PROT_WRITE, fixed_anon),
+            second
+        );
+    }
+
+    #[test]
+    fn test_fork_from_pthread_retains_only_caller_slot() {
+        use wasm_posix_shared::mmap::*;
+
+        let mut proc = Process::new(1);
+        let slot_len = 0x40000;
+        let first = proc.memory.reserve_host_region(slot_len);
+        let caller = proc.memory.reserve_host_region(slot_len);
+        let third = proc.memory.reserve_host_region(slot_len);
+        assert_ne!(first, MAP_FAILED);
+        assert_ne!(caller, MAP_FAILED);
+        assert_ne!(third, MAP_FAILED);
+        assert_eq!(proc.memory.reserved_regions().len(), 3);
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_fork_state(&proc, &mut buf).unwrap();
+        let mut child = deserialize_fork_state(&buf[..written], 42).unwrap();
+
+        // `kernel_fork_process` does not inherit parent dynamic reservations.
+        // For fork-from-pthread, the host then retains only the caller slot
+        // with `kernel_reserve_host_region_at`.
+        assert!(child.memory.reserved_regions().is_empty());
+        assert_eq!(child.memory.reserve_host_region_at(caller, slot_len), caller);
+        assert_eq!(child.memory.reserved_regions().len(), 1);
+        assert!(child.memory.overlaps_host_reserved_region(caller, slot_len));
+
+        assert!(child.memory.can_grow_at(first, slot_len));
+        assert!(!child.memory.can_grow_at(caller, slot_len));
+        assert!(child.memory.can_grow_at(third, slot_len));
+
+        let fixed_anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+        assert_eq!(
+            child
+                .memory
+                .mmap_anonymous(caller, slot_len, PROT_READ | PROT_WRITE, fixed_anon),
+            MAP_FAILED
+        );
+        assert_eq!(
+            child
+                .memory
+                .mmap_anonymous(first, slot_len, PROT_READ | PROT_WRITE, fixed_anon),
+            first
+        );
+        assert_eq!(
+            child
+                .memory
+                .mmap_anonymous(third, slot_len, PROT_READ | PROT_WRITE, fixed_anon),
+            third
+        );
+    }
+
+    #[test]
     fn test_exec_resets_program_break() {
         // POSIX/Linux: exec resets the program break. The host re-installs
         // it via `kernel_set_brk_base(__heap_base)` immediately after, so
@@ -1839,6 +2072,7 @@ mod tests {
         w.write_u32(FORK_MAGIC).unwrap();
         w.write_u32(FORK_VERSION).unwrap();
         w.write_u32(0).unwrap(); // total_size (ignored on read)
+
         // Scalars: ppid, uid, gid, euid, egid, pgid, sid, umask, nice
         for _ in 0..9 {
             w.write_u32(0).unwrap();
@@ -1872,6 +2106,7 @@ mod tests {
         w.write_u32(0).unwrap(); // handler_count
         w.write_u32(1024).unwrap(); // max_fds
         w.write_u32(0).unwrap(); // fd_count
+
         // OFD table: 1 entry with huge path
         w.write_u32(1).unwrap(); // ofd_count
         w.write_u32(0).unwrap(); // index

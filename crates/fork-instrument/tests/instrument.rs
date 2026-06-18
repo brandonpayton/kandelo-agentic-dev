@@ -18,10 +18,10 @@
 use std::collections::HashSet;
 
 use fork_instrument::runtime::names as runtime_names;
-use fork_instrument::{Options, instrument};
+use fork_instrument::{instrument, Options};
 use walrus::{
-    ExportItem, FunctionId, FunctionKind, LocalFunction, Module,
     ir::{self, Instr, InstrSeqId},
+    ExportItem, FunctionId, FunctionKind, LocalFunction, Module,
 };
 
 // --- Helpers ----------------------------------------------------------
@@ -41,6 +41,49 @@ fn validate(bytes: &[u8]) {
     validator.validate_all(bytes).expect("valid wasm");
 }
 
+fn insert_leading_dylink_section(mut wasm: Vec<u8>) -> Vec<u8> {
+    // Minimal dylink.0 section with WASM_DYLINK_MEM_INFO
+    // {memorySize=0, memoryAlign=0, tableSize=0, tableAlign=0}.
+    let dylink = [
+        0x00, // custom section
+        0x0f, // payload size
+        0x08, b'd', b'y', b'l', b'i', b'n', b'k', b'.', b'0', 0x01, // WASM_DYLINK_MEM_INFO
+        0x04, // subsection payload size
+        0x00, 0x00, 0x00, 0x00,
+    ];
+    wasm.splice(8..8, dylink);
+    wasm
+}
+
+fn first_custom_section_name(bytes: &[u8]) -> Option<String> {
+    let mut offset = 8usize;
+    if bytes.get(offset).copied()? != 0 {
+        return None;
+    }
+    offset += 1;
+    let _section_size = read_var_u32(bytes, &mut offset)?;
+    let name_len = read_var_u32(bytes, &mut offset)? as usize;
+    let name = bytes.get(offset..offset + name_len)?;
+    Some(String::from_utf8_lossy(name).into_owned())
+}
+
+fn read_var_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    let mut result = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*offset)?;
+        *offset += 1;
+        result |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
+}
+
 fn func_by_name(module: &Module, name: &str) -> FunctionId {
     module
         .funcs
@@ -55,6 +98,34 @@ fn local_func(module: &Module, id: FunctionId) -> &LocalFunction {
         FunctionKind::Local(l) => l,
         _ => panic!("function is not local"),
     }
+}
+
+#[test]
+fn preserves_leading_dylink_section_for_side_modules() {
+    let input = insert_leading_dylink_section(parse_wat(
+        r#"
+        (module
+          (import "env" "fork" (func $fork (result i32)))
+          (memory (import "env" "memory") 1)
+          (func $call_fork (export "call_fork") (result i32)
+            (call $fork)))
+        "#,
+    ));
+
+    let output = instrument(
+        &input,
+        &Options {
+            entry_import: "env.fork".into(),
+        },
+    )
+    .expect("instrument side module");
+
+    validate(&output);
+    assert_eq!(
+        first_custom_section_name(&output).as_deref(),
+        Some("dylink.0"),
+        "dynamic-linking side modules must keep dylink.0 as the first section",
+    );
 }
 
 fn entry_instr_kinds(module: &Module, id: FunctionId) -> Vec<InstrKind> {
@@ -152,11 +223,7 @@ fn nested_of(instr: &Instr) -> Vec<InstrSeqId> {
 }
 
 /// Invoke `visit` for every instruction reachable from `seq`.
-fn walk_all<F: FnMut(InstrSeqId, &Instr)>(
-    f: &LocalFunction,
-    seq: InstrSeqId,
-    visit: &mut F,
-) {
+fn walk_all<F: FnMut(InstrSeqId, &Instr)>(f: &LocalFunction, seq: InstrSeqId, visit: &mut F) {
     for (instr, _) in &f.block(seq).instrs {
         visit(seq, instr);
         for child in nested_of(instr) {
@@ -504,8 +571,8 @@ fn instrument_functions_returns_rewritten_set() {
     let bytes = wat::parse_str(FIXTURE_TRANSITIVE).unwrap();
     let mut module = Module::from_buffer(&bytes).unwrap();
 
-    let seed = call_graph::find_import_func(&module, "kernel.kernel_fork")
-        .expect("seed import present");
+    let seed =
+        call_graph::find_import_func(&module, "kernel.kernel_fork").expect("seed import present");
     let fork_path = call_graph::reaching_closure(&module, seed);
     let runtime = inject_runtime(&mut module, 0);
     let b1_plan = B1ScratchPlan::default();
@@ -609,17 +676,13 @@ fn non_fork_call_remains_bare_in_chunk_0() {
     // is preserved verbatim).
     let helper = func_by_name(&module, "helper");
     let mut helper_calls = 0usize;
-    walk_all(
-        local_func(&module, caller),
-        unwind_save,
-        &mut |_, instr| {
-            if let Instr::Call(c) = instr {
-                if c.func == helper {
-                    helper_calls += 1;
-                }
+    walk_all(local_func(&module, caller), unwind_save, &mut |_, instr| {
+        if let Instr::Call(c) = instr {
+            if c.func == helper {
+                helper_calls += 1;
             }
-        },
-    );
+        }
+    });
     assert_eq!(
         helper_calls, 1,
         "non-fork-path helper call should survive verbatim (once)",
@@ -737,11 +800,7 @@ fn two_calls_assign_sequential_call_idx() {
     let call_idx_local = call_idx_local.expect("call_idx local discoverable from br_table");
 
     // Now count Const values immediately preceding LocalSet(call_idx).
-    fn walk_seqs<F: FnMut(InstrSeqId)>(
-        f: &LocalFunction,
-        seq: InstrSeqId,
-        visit: &mut F,
-    ) {
+    fn walk_seqs<F: FnMut(InstrSeqId)>(f: &LocalFunction, seq: InstrSeqId, visit: &mut F) {
         visit(seq);
         for (instr, _) in &f.block(seq).instrs {
             for child in nested_of(instr) {
@@ -971,7 +1030,11 @@ fn postamble_emits_defaults_for_each_result_type() {
 
     let caller = func_by_name(&module, "caller");
     let kinds = entry_instr_kinds(&module, caller);
-    let trailing_consts = kinds.iter().rev().take_while(|k| **k == InstrKind::Const).count();
+    let trailing_consts = kinds
+        .iter()
+        .rev()
+        .take_while(|k| **k == InstrKind::Const)
+        .count();
     assert_eq!(
         trailing_consts, 2,
         "postamble should emit one Const per result type: {kinds:?}",
@@ -1431,10 +1494,10 @@ fn catch_ref_clause_is_rewritten_with_capture_block() {
     });
     let try_table = try_table.expect("try_table should still exist after 6d");
 
-    let retargeted = try_table.catches.iter().any(|c| matches!(
-        c,
-        ir::TryTableCatch::CatchRef { .. }
-    ));
+    let retargeted = try_table
+        .catches
+        .iter()
+        .any(|c| matches!(c, ir::TryTableCatch::CatchRef { .. }));
     assert!(
         retargeted,
         "try_table should still have a CatchRef clause: {:?}",
@@ -1478,7 +1541,10 @@ fn plain_catch_only_try_table_is_not_6d_rewritten() {
     let try_table = try_table.expect("try_table should still exist");
 
     assert!(
-        try_table.catches.iter().all(|c| matches!(c, ir::TryTableCatch::Catch { .. })),
+        try_table
+            .catches
+            .iter()
+            .all(|c| matches!(c, ir::TryTableCatch::Catch { .. })),
         "plain-catch-only try_tables should not be retargeted by Phase 6d",
     );
 }
@@ -2069,7 +2135,6 @@ fn collect_try_tables(f: &LocalFunction) -> Vec<ir::TryTable> {
     });
     out
 }
-
 
 #[test]
 fn b1_stage_2_plain_catch_arm_retargets_to_capture_block() {
