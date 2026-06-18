@@ -135,6 +135,7 @@ interface ProcessInfo {
 }
 const processes = new Map<number, ProcessInfo>();
 const processTeardowns = new Map<number, Promise<void>>();
+const vmInterruptTimers = new Map<number, ReturnType<typeof setTimeout>>();
 // Includes standalone thread-worker teardown promises that may outlive the
 // process map entry they came from.
 const workerTeardowns = new Set<Promise<void>>();
@@ -224,6 +225,41 @@ interface ThreadWorkerInfo {
 }
 const threadWorkers = new Map<number, ThreadWorkerInfo[]>();
 const threadExits = new ThreadExitCoordinator();
+
+function clearVmInterruptTimer(pid: number): void {
+  const timer = vmInterruptTimers.get(pid);
+  if (timer) clearTimeout(timer);
+  vmInterruptTimers.delete(pid);
+}
+
+function handleVmInterruptTimer(msg: {
+  pid: number;
+  timedOutPtr: number;
+  vmInterruptPtr: number;
+  seconds: number;
+}): void {
+  clearVmInterruptTimer(msg.pid);
+  if (!(msg.seconds > 0)) return;
+  const requestedDelayMs = Math.min(msg.seconds, 999999999) * 1000;
+  // The process worker can be stuck in a CPU-bound Wasm loop, so a timer in
+  // that worker cannot set cooperative runtime interrupt flags. Run the timer
+  // from this kernel worker instead; the process memory is shared, matching
+  // the Node host's VM-interrupt timer path.
+  const delayMs = Math.max(1, requestedDelayMs - 100);
+  const timer = setTimeout(() => {
+    vmInterruptTimers.delete(msg.pid);
+    const info = processes.get(msg.pid);
+    if (!info) return;
+    const flags = new Uint8Array(info.memory.buffer);
+    if (msg.timedOutPtr >= 0 && msg.timedOutPtr < flags.length) {
+      Atomics.store(flags, msg.timedOutPtr, 1);
+    }
+    if (msg.vmInterruptPtr >= 0 && msg.vmInterruptPtr < flags.length) {
+      Atomics.store(flags, msg.vmInterruptPtr, 1);
+    }
+  }, delayMs);
+  vmInterruptTimers.set(msg.pid, timer);
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1114,12 +1150,7 @@ function installProcessWorkerListeners(
     finalize(128 + 11, "worker exit event");
   });
   worker.on("message", (msg: unknown) => {
-    const m = msg as {
-      type?: string;
-      message?: string;
-      pid?: number;
-      status?: number;
-    };
+    const m = msg as WorkerToHostMessage;
     if (m.type === "error") {
       markProcessWorkerQuiesced(worker);
       if (finishRetiredProcessWorker(worker)) return;
@@ -1139,6 +1170,8 @@ function installProcessWorkerListeners(
       markProcessWorkerQuiesced(worker);
       if (finishRetiredProcessWorker(worker)) return;
       finalize(m.status ?? 0, "worker-main exit message");
+    } else if (m.type === "vm_interrupt_timer") {
+      handleVmInterruptTimer(m);
     }
   });
 }
@@ -1266,6 +1299,7 @@ async function handleExec(
   // crash detector and tear down the kernel's view of the still-alive
   // (post-exec) process.
   const oldInfo = processes.get(pid);
+  clearVmInterruptTimer(pid);
   const oldThreadWorkerCount = threadWorkers.get(pid)?.length ?? 0;
   const canRetireOldProcessWorker =
     !!oldInfo?.worker &&
@@ -1581,6 +1615,8 @@ async function handleClone(
       // worker-main posted {type:"error"} — instantiation failure, top-level
       // throw, etc. Without this the parent's pthread_join blocks forever.
       failThread((m as { message?: string }).message ?? "thread error");
+    } else if (m.type === "vm_interrupt_timer") {
+      handleVmInterruptTimer(m);
     }
   });
   threadWorker.on("error", (err: Error) => {
@@ -1611,6 +1647,7 @@ async function finishProcessExit(
   exitStatus: number,
   exitInfo?: ProcessExitInfo,
 ): Promise<void> {
+  clearVmInterruptTimer(pid);
   const info = processes.get(pid);
   const workerAlreadyQuiesced =
     !!info && quiescedProcessWorkers.has(info.worker as object);
@@ -1675,6 +1712,7 @@ async function handleTerminateProcess(
   msg: Extract<MainToKernelMessage, { type: "terminate_process" }>,
 ) {
   const pid = msg.pid;
+  clearVmInterruptTimer(pid);
 
   // Terminate thread workers
   const threads = threadWorkers.get(pid);
@@ -1917,6 +1955,8 @@ async function handleDestroy(
   for (const retired of retiredProcessWorkers.values()) {
     void terminateTrackedWorker(retired.info.worker);
   }
+  for (const timer of vmInterruptTimers.values()) clearTimeout(timer);
+  vmInterruptTimers.clear();
   processes.clear();
   threadModuleCache.clear();
   threadWorkers.clear();
