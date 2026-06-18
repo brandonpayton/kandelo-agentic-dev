@@ -1953,6 +1953,7 @@ export class SharedFS {
   unlink(path: string): void {
     const { parentIno, name } = this.pathResolveParent(path);
     const nameBytes = encoder.encode(name);
+    const requiresDirectory = path.length > 1 && path.endsWith("/");
 
     this.inodeWriteLock(parentIno);
     try {
@@ -1961,6 +1962,9 @@ export class SharedFS {
 
       const childOff = this.inodeOffset(childIno);
       const mode = this.r32(childOff + INO_MODE);
+      if (requiresDirectory && (mode & S_IFMT) !== S_IFDIR) {
+        throw new SFSError(ENOTDIR);
+      }
       if ((mode & S_IFMT) === S_IFDIR) throw new SFSError(EISDIR);
 
       const rc = this.dirRemoveEntry(parentIno, nameBytes);
