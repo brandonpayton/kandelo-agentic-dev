@@ -58,6 +58,11 @@ const ETC_GROUP = [
   "",
 ].join("\n");
 
+const ETC_SERVICES = readFileSync(
+  join(REPO_ROOT, "images/rootfs/etc/services"),
+  "utf8",
+);
+
 const COREUTILS_NAMES = [
   "arch", "b2sum", "base32", "base64", "basename", "basenc", "cat",
   "chcon", "chgrp", "chmod", "chown", "chroot", "cksum", "comm", "cp",
@@ -338,6 +343,7 @@ async function main() {
   fs.chmod("/tmp", 0o1777);
   writeVfsFile(fs, "/etc/passwd", ETC_PASSWD);
   writeVfsFile(fs, "/etc/group", ETC_GROUP);
+  writeVfsFile(fs, "/etc/services", ETC_SERVICES);
 
   writeVfsBinary(fs, "/usr/bin/dash", new Uint8Array(readFileSync(DASH_WASM)));
   symlink(fs, "/usr/bin/dash", "/bin/sh");
