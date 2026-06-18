@@ -588,6 +588,68 @@ describe("MemoryFileSystem", () => {
     expect(() => mfs.stat("/todelete.txt")).toThrow();
   });
 
+  it("rejects rename source paths that require a non-directory to be a directory", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    const fd = mfs.open("/file.txt", O_CREAT | O_WRONLY, 0o644);
+    mfs.close(fd);
+
+    expect(() => mfs.rename("/file.txt/", "/renamed.txt")).toThrow(
+      /Not a directory/,
+    );
+    expect(mfs.stat("/file.txt").size).toBe(0);
+    expect(() => mfs.stat("/renamed.txt")).toThrow(/No such file/);
+  });
+
+  it("preserves POSIX type checks when renaming directories onto existing paths", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    mfs.mkdir("/dir", 0o755);
+    const fd = mfs.open("/file.txt", O_CREAT | O_WRONLY, 0o644);
+    mfs.close(fd);
+    mfs.symlink("/file.txt", "/link.txt");
+
+    expect(() => mfs.rename("/dir", "/file.txt")).toThrow(/Not a directory/);
+    expect(() => mfs.rename("/dir", "/link.txt")).toThrow(/Not a directory/);
+
+    expect(mfs.stat("/dir").mode & 0xf000).toBe(0x4000);
+    expect(mfs.stat("/file.txt").mode & 0xf000).toBe(0x8000);
+    expect(mfs.readlink("/link.txt")).toBe("/file.txt");
+  });
+
+  it("renames directories over empty directories and updates dot-dot", () => {
+    const sab = new SharedArrayBuffer(4 * 1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    const O_CREAT = 0x0040,
+      O_WRONLY = 0x0001;
+
+    mfs.mkdir("/old-parent", 0o755);
+    mfs.mkdir("/new-parent", 0o755);
+    mfs.mkdir("/old-parent/child", 0o755);
+    const siblingFd = mfs.open(
+      "/new-parent/sibling.txt",
+      O_CREAT | O_WRONLY,
+      0o644,
+    );
+    mfs.close(siblingFd);
+
+    mfs.rename("/old-parent/child", "/new-parent/child");
+    expect(mfs.stat("/new-parent/child/../sibling.txt").mode & 0xf000).toBe(
+      0x8000,
+    );
+
+    mfs.mkdir("/empty-dest", 0o755);
+    mfs.rename("/new-parent/child", "/empty-dest");
+    expect(mfs.stat("/empty-dest").mode & 0xf000).toBe(0x4000);
+    expect(() => mfs.stat("/new-parent/child")).toThrow(/No such file/);
+  });
+
   it("keeps an unlinked open file alive until close", () => {
     const sab = new SharedArrayBuffer(4 * 1024 * 1024);
     const mfs = MemoryFileSystem.create(sab);
