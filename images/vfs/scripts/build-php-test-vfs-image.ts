@@ -38,6 +38,8 @@ const COREUTILS_WASM = process.env.COREUTILS_WASM
   ?? tryResolveBinary("programs/coreutils.wasm");
 const SED_WASM = process.env.SED_WASM
   ?? tryResolveBinary("programs/sed.wasm");
+const GREP_WASM = process.env.GREP_WASM
+  ?? tryResolveBinary("programs/grep.wasm");
 const OUT_FILE = process.env.PHP_TEST_VFS_OUT
   ?? join(REPO_ROOT, "apps/browser-demos/public/php-test.vfs.zst");
 const FS_INITIAL_BYTES = Number(process.env.PHP_TEST_VFS_INITIAL_BYTES ?? 256 * 1024 * 1024);
@@ -79,6 +81,116 @@ const COREUTILS_NAMES = [
   "tty", "uname", "unexpand", "uniq", "unlink", "vdir", "wc", "whoami",
   "yes",
 ];
+
+const PGREP_SCRIPT = `#!/bin/sh
+if [ "$1" != "-P" ] || [ -z "$2" ]; then
+  exit 2
+fi
+want_ppid=$2
+found=1
+for stat in /proc/[0-9]*/stat; do
+  [ -r "$stat" ] || continue
+  line=$(cat "$stat" 2>/dev/null) || continue
+  pid=\${line%% *}
+  after=\${line#*) }
+  set -- $after
+  ppid=$2
+  if [ "$ppid" = "$want_ppid" ]; then
+    printf '%s\\n' "$pid"
+    found=0
+  fi
+done
+exit "$found"
+`;
+
+const PS_SCRIPT = `#!/bin/sh
+pids=
+format=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p|--pid)
+      shift
+      pids=$1
+      ;;
+    -p*)
+      pids=\${1#-p}
+      ;;
+    -o|--format)
+      shift
+      format=$1
+      ;;
+    -o*)
+      format=\${1#-o}
+      ;;
+    *)
+      ;;
+  esac
+  shift
+done
+
+[ -n "$format" ] || format=pid,command
+header=1
+case "$format" in
+  *=*)
+    header=0
+    ;;
+esac
+
+fields=$(printf '%s' "$format" | tr ',' ' ')
+if [ -n "$pids" ]; then
+  pid_list=$(printf '%s' "$pids" | tr ',' ' ')
+else
+  pid_list=
+  for proc_dir in /proc/[0-9]*; do
+    [ -d "$proc_dir" ] || continue
+    pid_list="$pid_list \${proc_dir#/proc/}"
+  done
+fi
+
+if [ "$header" = 1 ]; then
+  out=
+  for field in $fields; do
+    field=\${field%=}
+    case "$field" in
+      pid) label=PID ;;
+      nice|ni) label=NICE ;;
+      comm|command|args) label=COMMAND ;;
+      *) label=$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]') ;;
+    esac
+    out="$out\${out:+ }$label"
+  done
+  printf '%s\\n' "$out"
+fi
+
+found=0
+for pid in $pid_list; do
+  stat=/proc/$pid/stat
+  [ -r "$stat" ] || continue
+  line=$(cat "$stat" 2>/dev/null) || continue
+  comm=\${line#*(}
+  comm=\${comm%)*}
+  after=\${line#*) }
+  set -- $after
+  nice=\${17:-0}
+  cmd=$(tr '\\000' ' ' < /proc/$pid/cmdline 2>/dev/null)
+  [ -n "$cmd" ] || cmd=$comm
+  row=
+  for field in $fields; do
+    field=\${field%=}
+    case "$field" in
+      pid) value=$pid ;;
+      nice|ni) value=$nice ;;
+      comm|command|args) value=$cmd ;;
+      *) value= ;;
+    esac
+    row="$row\${row:+ }$value"
+  done
+  printf '%s\\n' "$row"
+  found=1
+done
+
+[ "$found" = 1 ]
+`;
 
 function resolvePhpSource(): string {
   return process.env.PHP_SOURCE_DIR
@@ -322,6 +434,9 @@ async function main() {
   if (!SED_WASM || !existsSync(SED_WASM)) {
     throw new Error("sed.wasm not found. Run: scripts/fetch-binaries.sh or set SED_WASM");
   }
+  if (!GREP_WASM || !existsSync(GREP_WASM)) {
+    throw new Error("grep.wasm not found. Run: scripts/fetch-binaries.sh or set GREP_WASM");
+  }
   const phpSrc = resolvePhpSource();
   if (!existsSync(phpSrc)) {
     throw new Error(`php-src not found at ${phpSrc}`);
@@ -359,6 +474,18 @@ async function main() {
 
   writeVfsBinary(fs, "/usr/bin/sed", new Uint8Array(readFileSync(SED_WASM)));
   symlink(fs, "/usr/bin/sed", "/bin/sed");
+
+  writeVfsBinary(fs, "/usr/bin/grep", new Uint8Array(readFileSync(GREP_WASM)));
+  symlink(fs, "/usr/bin/grep", "/bin/grep");
+  symlink(fs, "/usr/bin/grep", "/usr/bin/egrep");
+  symlink(fs, "/usr/bin/grep", "/bin/egrep");
+  symlink(fs, "/usr/bin/grep", "/usr/bin/fgrep");
+  symlink(fs, "/usr/bin/grep", "/bin/fgrep");
+
+  writeVfsFile(fs, "/usr/bin/pgrep", PGREP_SCRIPT, 0o755);
+  symlink(fs, "/usr/bin/pgrep", "/bin/pgrep");
+  writeVfsFile(fs, "/usr/bin/ps", PS_SCRIPT, 0o755);
+  symlink(fs, "/usr/bin/ps", "/bin/ps");
 
   writeVfsBinary(fs, "/usr/local/bin/php", new Uint8Array(readFileSync(PHP_WASM)));
   if (PHP_EXTENSION_DIR && existsSync(PHP_EXTENSION_DIR)) {
