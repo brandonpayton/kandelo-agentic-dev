@@ -64,7 +64,9 @@ import { CentralizedKernelWorker } from "./kernel-worker";
 import type {
   ForkFromThreadContext,
   ResolvedSpawnProgram,
+  SpawnProgramResolution,
 } from "./kernel-worker";
+import type { KernelPointer } from "./kernel";
 import { BrowserWorkerAdapter } from "./worker-adapter-browser";
 import { VirtualPlatformIO } from "./vfs/vfs";
 import { MemoryFileSystem } from "./vfs/memory-fs";
@@ -77,14 +79,21 @@ import {
 import type { MountConfig } from "./vfs/types";
 import { TlsNetworkBackend } from "./networking/tls-network-backend";
 import { patchWasmForThread } from "./worker-main";
-import { detectPtrWidth, extractHeapBase } from "./constants";
+import { detectPtrWidth, extractHeapBase, isWasmModuleBytes } from "./constants";
+import { ThreadExitCoordinator } from "./thread-exit-coordinator";
+import {
+  classifiedSignalOrFallback,
+  classifiedTrapExitStatus,
+  signalExitStatus,
+  SIGSEGV,
+} from "./trap-signals";
 import type {
   CentralizedWorkerInitMessage,
   CentralizedThreadInitMessage,
   WorkerToHostMessage,
 } from "./worker-protocol";
 import { ThreadPageAllocator } from "./thread-allocator";
-import { CH_TOTAL_SIZE, DEFAULT_MAX_PAGES } from "./constants";
+import { CH_TOTAL_SIZE, DEFAULT_MAX_PAGES, PAGES_PER_THREAD } from "./constants";
 import {
   computeProcessMemoryLayout,
   createProcessMemory,
@@ -108,6 +117,7 @@ let io: VirtualPlatformIO;
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
 let defaultEnv: string[] = [];
+const ENOEXEC = 8;
 
 // Process tracking
 interface ProcessInfo {
@@ -115,12 +125,20 @@ interface ProcessInfo {
   programBytes: ArrayBuffer;
   programModule?: WebAssembly.Module;
   worker: ReturnType<BrowserWorkerAdapter["createWorker"]>;
+  argv: string[];
   channelOffset: number;
   ptrWidth: 4 | 8;
   layout: ProcessMemoryLayout;
   threadAllocator: ThreadPageAllocator;
 }
 const processes = new Map<number, ProcessInfo>();
+const processTeardowns = new Map<number, Promise<void>>();
+// Includes standalone thread-worker teardown promises that may outlive the
+// process map entry they came from.
+const workerTeardowns = new Set<Promise<void>>();
+const threadedProcessPids = new Set<number>();
+const THREADED_WORKER_TERMINATION_SETTLE_MS = 250;
+const NODE_PROCESS_WORKER_TERMINATION_SETTLE_MS = 2000;
 
 /**
  * Workers we deliberately terminated — exec, exit, top-level destroy. The
@@ -149,14 +167,17 @@ async function resolveExecutableForLaunch(
   path: string,
   argv: string[],
   depth = 0,
-): Promise<ResolvedSpawnProgram | null> {
+): Promise<ResolvedSpawnProgram | { errno: number } | null> {
   if (depth > MAX_SHEBANG_DEPTH) return null;
   await memfs.ensureMaterialized(path);
   const bytes = readFileFromFs(path);
   if (!bytes) return null;
 
   const shebang = parseShebang(bytes);
-  if (!shebang) return { programBytes: bytes, argv };
+  if (!shebang) {
+    if (!isWasmModuleBytes(bytes)) return { errno: ENOEXEC };
+    return { programBytes: bytes, argv };
+  }
 
   const scriptArgv = [
     shebang.interpreter,
@@ -178,12 +199,77 @@ interface ThreadWorkerInfo {
   termination?: Promise<void>;
 }
 const threadWorkers = new Map<number, ThreadWorkerInfo[]>();
+const threadExits = new ThreadExitCoordinator();
+const reportedNonzeroProcessExits = new Set<number>();
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function basename(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx >= 0 ? path.slice(idx + 1) : path;
+}
+
+function processWorkerTerminationSettleMs(argv: readonly string[] | undefined): number {
+  const name = basename(argv?.[0] ?? "");
+  // Chrome can still have SpiderMonkey Node's process Worker teardown in
+  // flight after worker.terminate() resolves. Launching another Node-mode
+  // process too quickly can make the second process trap in its wasm runtime.
+  return name === "node" || name === "spidermonkey-node" || name === "spidermonkey-node.wasm"
+    ? NODE_PROCESS_WORKER_TERMINATION_SETTLE_MS
+    : 0;
+}
+
+function reportNonzeroProcessExitDiagnostic(
+  pid: number,
+  status: number,
+  source: string,
+): void {
+  if (status === 0 || reportedNonzeroProcessExits.has(pid)) return;
+  reportedNonzeroProcessExits.add(pid);
+  const info = processes.get(pid);
+  const syscalls = kernelWorker.dumpLastSyscalls(pid) || "<none>";
+  const serviceLog = readServiceLogForProcess(info?.argv);
+  const diagnostic =
+    `[kernel-worker] nonzero process exit pid=${pid} status=${status} source=${source} argv=${JSON.stringify(info?.argv ?? [])}` +
+    (serviceLog ? `\n${serviceLog}` : "") +
+    `\n${syscalls}`;
+  console.warn(diagnostic);
+  post({ type: "stderr", pid, data: new TextEncoder().encode(`${diagnostic}\n`) });
+}
+
+function readServiceLogForProcess(argv: readonly string[] | undefined): string | null {
+  const name = basename(argv?.[0] ?? "");
+  const logPath = name === "nginx" ? "/var/log/nginx.log" : null;
+  if (!logPath) return null;
+  const bytes = readFileFromFs(logPath);
+  if (!bytes || bytes.byteLength === 0) return `${logPath}: <empty>`;
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes).trimEnd();
+  return `${logPath}:\n${text || "<empty>"}`;
+}
+
+async function waitForProcessTeardowns(): Promise<void> {
+  while (processTeardowns.size > 0 || workerTeardowns.size > 0) {
+    await Promise.allSettled([
+      ...processTeardowns.values(),
+      ...workerTeardowns,
+    ]);
+  }
+}
 
 async function terminateTrackedWorker(
   worker: ReturnType<BrowserWorkerAdapter["createWorker"]>,
+  settleMs = 0,
 ): Promise<void> {
   intentionallyTerminated.add(worker as object);
-  await worker.terminate().catch(() => {});
+  const teardown = (async () => {
+    await worker.terminate().catch(() => {});
+    if (settleMs > 0) await delay(settleMs);
+  })();
+  workerTeardowns.add(teardown);
+  void teardown.finally(() => workerTeardowns.delete(teardown));
+  await teardown;
 }
 
 async function terminateThreadWorkers(pid: number): Promise<void> {
@@ -191,7 +277,11 @@ async function terminateThreadWorkers(pid: number): Promise<void> {
   if (!threads) return;
   threadWorkers.delete(pid);
   for (const t of threads) {
-    await (t.termination ?? terminateTrackedWorker(t.worker));
+    await (
+      t.termination ??
+      terminateTrackedWorker(t.worker, THREADED_WORKER_TERMINATION_SETTLE_MS)
+    );
+    threadExits.release(pid, t.channelOffset);
   }
 }
 const ptyByPid = new Map<number, number>();
@@ -203,9 +293,33 @@ let kernelMemory: WebAssembly.Memory | null = null;
 // HTTP bridge port (transferred from main thread → service worker comms)
 let bridgePort: MessagePort | null = null;
 let bridgeTargetPort: number | null = null; // The specific HTTP port to route bridge requests to
+let nextBridgeActivityId = 1;
+const activeBridgeRequests = new Set<number>();
 
 function post(msg: KernelToMainMessage, transfer?: Transferable[]) {
   (globalThis as any).postMessage(msg, transfer ?? []);
+}
+
+function reportBridgePendingRequests(): void {
+  post({ type: "http_bridge_pending", count: activeBridgeRequests.size });
+}
+
+function beginBridgeRequest(): number {
+  const activityId = nextBridgeActivityId++;
+  activeBridgeRequests.add(activityId);
+  reportBridgePendingRequests();
+  return activityId;
+}
+
+function endBridgeRequest(activityId: number): void {
+  if (!activeBridgeRequests.delete(activityId)) return;
+  reportBridgePendingRequests();
+}
+
+function resetBridgePendingRequests(): void {
+  if (activeBridgeRequests.size === 0) return;
+  activeBridgeRequests.clear();
+  reportBridgePendingRequests();
 }
 
 function formatError(err: unknown): string {
@@ -246,19 +360,78 @@ function createSharedProcessMemory(
 function threadAllocatorForLayout(
   layout: ProcessMemoryLayout,
   ptrWidth: 4 | 8,
+  pid: number,
 ): ThreadPageAllocator {
   return new ThreadPageAllocator({
     firstSlotStartPage: layout.firstThreadSlotPage,
     maxPageExclusive: layout.threadArenaEndPage,
     ptrWidth,
     reservedSlots: layout.threadSlotCount,
+    reserveSlotStartPage: () =>
+      kernelWorker.reserveHostRegion(pid, PAGES_PER_THREAD * PAGE_SIZE) / PAGE_SIZE,
   });
 }
 
+interface ProcessMemoryAllocationContext {
+  operation: "spawn" | "exec" | "posix_spawn";
+  path?: string;
+  argv?: readonly string[];
+}
+
+function processMemoryAllocationDiagnostics(
+  pid: number,
+  ptrWidth: 4 | 8,
+  layout: ProcessMemoryLayout,
+  heapBase: bigint | number | null,
+  context?: ProcessMemoryAllocationContext,
+) {
+  let totalLiveBufferBytes = 0;
+  const liveProcesses = Array.from(processes.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([livePid, info]) => {
+      const bufferBytes = info.memory.buffer.byteLength;
+      totalLiveBufferBytes += bufferBytes;
+      return {
+        pid: livePid,
+        argv: info.argv.slice(0, 8),
+        ptrWidth: info.ptrWidth,
+        currentPages: Math.ceil(bufferBytes / PAGE_SIZE),
+        maximumPages: info.layout.maximumPages,
+        bufferBytes,
+      };
+    });
+
+  return {
+    operation: context?.operation,
+    pid,
+    path: context?.path,
+    argv: context?.argv,
+    ptrWidth,
+    heapBase: heapBase == null ? null : heapBase.toString(),
+    requestedLayout: {
+      initialPages: layout.initialPages,
+      maximumPages: layout.maximumPages,
+      controlBase: layout.controlBase,
+      brkBase: layout.brkBase,
+      mmapBase: layout.mmapBase,
+      maxAddr: layout.maxAddr,
+      threadSlotCount: layout.threadSlotCount,
+      threadArenaEndPage: layout.threadArenaEndPage,
+    },
+    liveProcessCount: processes.size,
+    pendingProcessTeardowns: processTeardowns.size,
+    pendingWorkerTeardowns: workerTeardowns.size,
+    totalLiveBufferBytes,
+    liveProcesses,
+  };
+}
+
 function createFreshProcessMemory(
+  pid: number,
   programBytes: ArrayBuffer,
   ptrWidth: 4 | 8,
   processMaxPages = maxPages,
+  context?: ProcessMemoryAllocationContext,
 ): {
   memory: WebAssembly.Memory;
   layout: ProcessMemoryLayout;
@@ -272,12 +445,23 @@ function createFreshProcessMemory(
     programBytes,
     heapBase,
   });
-  const memory = createProcessMemory(ptrWidth, layout);
+  let memory: WebAssembly.Memory;
+  try {
+    memory = createProcessMemory(ptrWidth, layout);
+  } catch (e) {
+    console.error(
+      "[kernel-worker] process memory allocation failed",
+      JSON.stringify(
+        processMemoryAllocationDiagnostics(pid, ptrWidth, layout, heapBase, context),
+      ),
+    );
+    throw e;
+  }
   new Uint8Array(memory.buffer, layout.channelOffset, CH_TOTAL_SIZE).fill(0);
   return {
     memory,
     layout,
-    threadAllocator: threadAllocatorForLayout(layout, ptrWidth),
+    threadAllocator: threadAllocatorForLayout(layout, ptrWidth, pid),
   };
 }
 
@@ -408,6 +592,9 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   } else {
     throw new Error("init: vfsImage or fsSab required");
   }
+  memfs.subscribeLazyDownloads((event) => {
+    post({ type: "lazy_download", event });
+  });
   io = new VirtualPlatformIO(mounts, new BrowserTimeProvider());
 
   // Create TLS-MITM network backend. Programs do real TLS handshakes via
@@ -469,6 +656,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       onSpawn: handlePosixSpawn,
       onClone: (pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, memory) =>
         handleClone(pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, memory),
+      onThreadExit: (pid, _tid, channelOffset) => handleThreadExit(pid, channelOffset),
       onExit: (pid, exitStatus) => handleExit(pid, exitStatus),
     },
   );
@@ -557,6 +745,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   // Accept bridge port for HTTP request handling
   if (msg.bridgePort) {
     bridgePort = msg.bridgePort;
+    resetBridgePendingRequests();
   }
 
   post({ type: "ready" });
@@ -566,6 +755,8 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
 
 async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>) {
   try {
+    await waitForProcessTeardowns();
+
     let programBytes: ArrayBuffer;
     if (msg.programBytes) {
       programBytes = msg.programBytes;
@@ -582,16 +773,26 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       return;
     }
 
+    if (!isWasmModuleBytes(programBytes)) {
+      respondError(msg.requestId, "ENOEXEC: program is not a WebAssembly module");
+      return;
+    }
+
     // Pid: if the caller pre-picked one, honor it (legacy spawn() callers
     // still do); otherwise the worker is the source of truth and allocates.
     const pid = msg.pid ?? kernelWorker.allocatePid();
+    const path = msg.programPath ?? msg.argv[0];
     const pages = msg.maxPages ?? maxPages;
     const ptrWidth = detectPtrWidth(programBytes);
     const {
       memory,
       layout,
       threadAllocator,
-    } = createFreshProcessMemory(programBytes, ptrWidth, pages);
+    } = createFreshProcessMemory(pid, programBytes, ptrWidth, pages, {
+      operation: "spawn",
+      path,
+      argv: msg.argv,
+    });
     const channelOffset = layout.channelOffset;
 
     kernelWorker.registerProcess(pid, memory, [channelOffset], {
@@ -641,6 +842,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       memory,
       programBytes,
       worker,
+      argv: msg.argv,
       channelOffset,
       ptrWidth,
       layout,
@@ -679,7 +881,7 @@ function installProcessWorkerListeners(
   pid: number,
 ): void {
   let exited = false;
-  const finalize = (status: number, source: string) => {
+  const finalize = (status: number, source: string, crashSignum?: number) => {
     if (exited) return;
     exited = true;
     if (processes.get(pid)?.worker !== worker) return; // already replaced (e.g. by exec)
@@ -689,19 +891,21 @@ function installProcessWorkerListeners(
     } else {
       console.warn(message);
     }
-    handleExit(pid, status);
+    reportNonzeroProcessExitDiagnostic(pid, status, source);
+    handleExit(pid, status, crashSignum);
   };
 
-  // Status conventions match the Node host (PR #410):
-  //   139 = 128 + SIGSEGV (11) — uncaught wasm trap, worker died without
-  //         a SYS_exit_group. Matches a Linux child killed by SIGSEGV.
-  //   -1  — worker-main caught an instantiation/init error and posted
-  //         {type:"error"}. Same convention as Node-side handleSpawn.
+  // Status conventions match the Node host:
+  //   128+signal — classified Wasm trap, or generic SIGSEGV when a worker
+  //         dies without a trap reason. Matches Linux signal-death status.
+  //   -1  — worker-main caught an unclassified instantiation/init error
+  //         and posted {type:"error"}.
   //   m.status — worker-main posted {type:"exit"}, normal exit path.
   worker.on("error", (err: Error) => {
     if (intentionallyTerminated.has(worker as object)) return;
     console.error(`[kernel-worker] Worker error pid=${pid}:`, err.message);
-    finalize(128 + 11, "worker.onerror");
+    const signum = classifiedSignalOrFallback(err);
+    finalize(signalExitStatus(signum), "worker.onerror", signum);
   });
   worker.on("exit", (code: number) => {
     // BrowserWorkerHandle synthesizes an "exit" event when the underlying
@@ -715,14 +919,14 @@ function installProcessWorkerListeners(
     // finalized via the "error" handler above, so this is a no-op there.
     // If "exit" fires without a prior "error" (worker died via some path
     // we don't yet model), still treat it as a crash.
-    finalize(128 + 11, "worker exit event");
+    finalize(signalExitStatus(SIGSEGV), "worker exit event", SIGSEGV);
   });
   worker.on("message", (msg: unknown) => {
     const m = msg as { type?: string; message?: string; pid?: number; status?: number };
     if (m.type === "error") {
       console.error(`[kernel-worker] Process error pid=${pid}:`, m.message);
       // Forward to host stderr so the demo log shows the actual failure
-      // ("Centralized worker failed: …" with the wasm trap or
+      // ("Kernel worker failed: ..." with the wasm trap or
       // instantiation error). Without this, a process death in the
       // browser is invisible to the user — only console.error in the
       // kernel-worker scope, which most users don't open. Mirrors the
@@ -731,7 +935,8 @@ function installProcessWorkerListeners(
         `[process-worker] ${m.message ?? "unknown error"}\n`,
       );
       post({ type: "stderr", pid, data: errBytes });
-      finalize(-1, "worker-main error message");
+      const signum = classifiedSignalOrFallback(m.message);
+      finalize(classifiedTrapExitStatus(m.message) ?? -1, "worker-main error message", signum);
     } else if (m.type === "exit") {
       finalize(m.status ?? 0, "worker-main exit message");
     }
@@ -746,6 +951,8 @@ async function handleFork(
   parentMemory: WebAssembly.Memory,
   threadFork?: ForkFromThreadContext,
 ): Promise<number[]> {
+  await waitForProcessTeardowns();
+
   const parentInfo = processes.get(parentPid);
   if (!parentInfo) throw new Error(`Unknown parent pid ${parentPid}`);
 
@@ -801,10 +1008,11 @@ async function handleFork(
     programBytes: parentInfo.programBytes,
     programModule: parentInfo.programModule,
     worker: childWorker,
+    argv: parentInfo.argv,
     channelOffset: childChannelOffset,
     ptrWidth,
     layout: childLayout,
-    threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth),
+    threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth, childPid),
   });
 
   installProcessWorkerListeners(childWorker, childPid);
@@ -820,6 +1028,7 @@ async function handleExec(
 ): Promise<number> {
   const resolved = await resolveExecutableForLaunch(path, argv);
   if (!resolved) return -2; // ENOENT
+  if ("errno" in resolved) return -resolved.errno;
   const { programBytes: bytes, argv: launchArgv } = resolved;
 
   // Program found — run kernel exec setup
@@ -853,7 +1062,11 @@ async function handleExec(
     memory: newMemory,
     layout: newLayout,
     threadAllocator: newThreadAllocator,
-  } = createFreshProcessMemory(bytes, ptrWidth);
+  } = createFreshProcessMemory(pid, bytes, ptrWidth, maxPages, {
+    operation: "exec",
+    path,
+    argv: launchArgv,
+  });
   const newChannelOffset = newLayout.channelOffset;
 
   kernelWorker.registerProcess(pid, newMemory, [newChannelOffset], {
@@ -890,6 +1103,7 @@ async function handleExec(
     memory: newMemory,
     programBytes: bytes,
     worker: newWorker,
+    argv: launchArgv,
     channelOffset: newChannelOffset,
     ptrWidth,
     layout: newLayout,
@@ -934,7 +1148,7 @@ async function handleExec(
 async function handlePosixSpawnResolve(
   path: string,
   argv: string[],
-): Promise<ResolvedSpawnProgram | null> {
+): Promise<SpawnProgramResolution | null> {
   return resolveExecutableForLaunch(path, argv);
 }
 
@@ -949,6 +1163,8 @@ async function handlePosixSpawn(
   argv: string[],
   envp: string[],
 ): Promise<number> {
+  await waitForProcessTeardowns();
+
   post({ type: "proc_event", kind: "spawn", pid: childPid });
 
   const ptrWidth = detectPtrWidth(programBytes);
@@ -956,7 +1172,11 @@ async function handlePosixSpawn(
     memory: newMemory,
     layout: newLayout,
     threadAllocator,
-  } = createFreshProcessMemory(programBytes, ptrWidth);
+  } = createFreshProcessMemory(childPid, programBytes, ptrWidth, maxPages, {
+    operation: "posix_spawn",
+    path: argv[0],
+    argv,
+  });
   const newChannelOffset = newLayout.channelOffset;
 
   // Kernel already created the child via kernel_spawn_process.
@@ -987,6 +1207,7 @@ async function handlePosixSpawn(
     memory: newMemory,
     programBytes,
     worker: newWorker,
+    argv,
     channelOffset: newChannelOffset,
     ptrWidth,
     layout: newLayout,
@@ -1010,6 +1231,7 @@ async function handleClone(
 ): Promise<number> {
   const processInfo = processes.get(pid);
   if (!processInfo) throw new Error(`Unknown pid ${pid} for clone`);
+  threadedProcessPids.add(pid);
 
   // Auto-compile thread module if not already cached.
   // The cache is per-PID so each process's module is compiled once and reused
@@ -1075,6 +1297,7 @@ async function handleClone(
     if (reclaimed) return;
     reclaimed = true;
     processInfo.threadAllocator.free(alloc.basePage);
+    threadExits.release(pid, alloc.channelOffset);
     const threads = threadWorkers.get(pid);
     if (threads) {
       const idx = threads.indexOf(threadEntry);
@@ -1083,10 +1306,14 @@ async function handleClone(
   };
   const terminateThreadEntry = (): Promise<void> => {
     if (!threadEntry.termination) {
-      threadEntry.termination = terminateTrackedWorker(threadWorker).finally(reclaimThread);
+      threadEntry.termination = terminateTrackedWorker(
+        threadWorker,
+        THREADED_WORKER_TERMINATION_SETTLE_MS,
+      ).finally(reclaimThread);
     }
     return threadEntry.termination;
   };
+  threadExits.register(pid, alloc.channelOffset, terminateThreadEntry);
 
   const failThread = (reason: string) => {
     const text = `[kernel-worker] pid=${pid} tid=${tid}: ${reason}\n`;
@@ -1114,46 +1341,77 @@ async function handleClone(
   return tid;
 }
 
-function handleExit(pid: number, exitStatus: number): void {
+function handleThreadExit(pid: number, channelOffset: number): boolean {
+  return threadExits.requestExit(pid, channelOffset);
+}
+
+function signalFromExitStatus(exitStatus: number): number | null {
+  return exitStatus >= 128 ? (exitStatus - 128) & 0x7f : null;
+}
+
+function handleExit(pid: number, exitStatus: number, crashSignum?: number): void {
+  void finishProcessExit(pid, exitStatus, crashSignum);
+}
+
+async function finishProcessExit(
+  pid: number,
+  exitStatus: number,
+  crashSignum: number = signalFromExitStatus(exitStatus) ?? SIGSEGV,
+): Promise<void> {
+  if (processTeardowns.has(pid)) return;
+
   const info = processes.get(pid);
+  reportNonzeroProcessExitDiagnostic(pid, exitStatus, "kernel process exit");
+  const threadedSettleMs = threadedProcessPids.has(pid)
+    ? THREADED_WORKER_TERMINATION_SETTLE_MS
+    : 0;
+  const settleMs = Math.max(
+    threadedSettleMs,
+    processWorkerTerminationSettleMs(info?.argv),
+  );
+  threadedProcessPids.delete(pid);
 
-  // Synthesize a SIGSEGV-style reap *before* `deactivateProcess` in
-  // case the worker died without sending SYS_EXIT_GROUP (uncaught
-  // wasm trap → onerror, worker-main `{type:"error"}` → finalize(-1),
-  // externally terminated Worker → "exit" event). Without this, a
-  // concurrent waitpid in the parent blocks until destroy because
-  // the kernel never marked the child as a zombie. Idempotent via
-  // `hostReaped`: when the kernel already processed a clean
-  // SYS_EXIT_GROUP for this pid, this is a no-op. Mirrors
-  // `finalizeProcessWorker` in host/src/node-kernel-worker-entry.ts.
-  try { kernelWorker.notifyHostProcessCrashed(pid); } catch { /* best-effort */ }
-  // Check if this is a "top-level" process or a fork child
-  // For now, always deactivate — the main thread tracks exit promises
-  kernelWorker.deactivateProcess(pid);
+  const teardown = (async () => {
+    // Synthesize a signal-style reap *before* `deactivateProcess` in
+    // case the worker died without sending SYS_EXIT_GROUP (uncaught
+    // wasm trap -> onerror, worker-main `{type:"error"}` -> finalize(-1),
+    // externally terminated Worker -> "exit" event). Without this, a
+    // concurrent waitpid in the parent blocks until destroy because
+    // the kernel never marked the child as a zombie. Idempotent via
+    // `hostReaped`: when the kernel already processed a clean
+    // SYS_EXIT_GROUP for this pid, this is a no-op. Mirrors
+    // `finalizeProcessWorker` in host/src/node-kernel-worker-entry.ts.
+    try { kernelWorker.notifyHostProcessCrashed(pid, crashSignum); } catch { /* best-effort */ }
 
-  // Terminate any surviving thread workers for this process; the main
-  // process worker exiting means their shared state (memory, fd table,
-  // signal mask) is gone. Mirrors handleExit in Node-side
-  // node-kernel-worker-entry.ts; without this, threads of an exited
-  // process leak Web Workers indefinitely.
-  const threads = threadWorkers.get(pid);
-  if (threads) {
-    for (const t of threads) {
-      void (t.termination ?? terminateTrackedWorker(t.worker));
+    // Keep the pid registered until the process worker is gone. musl's
+    // _Exit() loops on SYS_exit after SYS_exit_group returns; while worker
+    // termination is in flight those duplicate exits still need channel
+    // completions, otherwise the worker can park in Atomics.wait with no
+    // registered listener left to wake it.
+    await terminateThreadWorkers(pid);
+    if (info?.worker) {
+      await terminateTrackedWorker(info.worker, settleMs);
     }
-    threadWorkers.delete(pid);
-  }
 
-  if (info?.worker) {
-    void terminateTrackedWorker(info.worker);
-  }
+    // Check if this is a "top-level" process or a fork child. For now,
+    // always deactivate after worker termination; the main thread tracks
+    // exit promises, and no further guest syscalls can arrive on this
+    // channel once the worker is gone.
+    kernelWorker.deactivateProcess(pid);
 
-  processes.delete(pid);
-  threadModuleCache.delete(pid);
-  ptyByPid.delete(pid);
+    processes.delete(pid);
+    threadModuleCache.delete(pid);
+    ptyByPid.delete(pid);
+  })();
+  processTeardowns.set(pid, teardown);
 
-  // Notify main thread
   post({ type: "exit", pid, status: exitStatus });
+
+  try {
+    await teardown;
+  } finally {
+    processTeardowns.delete(pid);
+  }
 }
 
 // ── Terminate ──
@@ -1165,7 +1423,10 @@ async function handleTerminateProcess(msg: Extract<MainToKernelMessage, { type: 
   const threads = threadWorkers.get(pid);
   if (threads) {
     for (const t of threads) {
-      await (t.termination ?? terminateTrackedWorker(t.worker));
+      await (
+        t.termination ??
+        terminateTrackedWorker(t.worker, THREADED_WORKER_TERMINATION_SETTLE_MS)
+      );
       try {
         kernelWorker.notifyThreadExit(pid, t.tid);
         kernelWorker.removeChannel(pid, t.channelOffset);
@@ -1186,6 +1447,7 @@ async function handleTerminateProcess(msg: Extract<MainToKernelMessage, { type: 
 
   processes.delete(pid);
   threadModuleCache.delete(pid);
+  threadedProcessPids.delete(pid);
   ptyByPid.delete(pid);
   respond(msg.requestId, true);
 }
@@ -1195,12 +1457,12 @@ async function handleTerminateProcess(msg: Extract<MainToKernelMessage, { type: 
 function handlePipeRead(msg: Extract<MainToKernelMessage, { type: "pipe_read" }>) {
   if (!kernelInstance) { respond(msg.requestId, null); return; }
   const pipeRead = kernelInstance.exports.kernel_pipe_read as (
-    pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number,
+    pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number,
   ) => number;
   const scratchOffset = (kernelWorker as any).tcpScratchOffset || (kernelWorker as any).scratchOffset;
   const chunks: Uint8Array[] = [];
   for (;;) {
-    const n = pipeRead(msg.pid, msg.pipeIdx, BigInt(scratchOffset), PAGE_SIZE);
+    const n = pipeRead(msg.pid, msg.pipeIdx, kernelWorker.toKernelPtr(scratchOffset), PAGE_SIZE);
     if (n <= 0) break;
     const mem = new Uint8Array(kernelMemory!.buffer);
     chunks.push(mem.slice(scratchOffset, scratchOffset + n));
@@ -1219,7 +1481,7 @@ function handlePipeRead(msg: Extract<MainToKernelMessage, { type: "pipe_read" }>
 function handlePipeWrite(msg: Extract<MainToKernelMessage, { type: "pipe_write" }>) {
   if (!kernelInstance) { respond(msg.requestId, -1); return; }
   const pipeWrite = kernelInstance.exports.kernel_pipe_write as (
-    pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number,
+    pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number,
   ) => number;
   const scratchOffset = (kernelWorker as any).tcpScratchOffset || (kernelWorker as any).scratchOffset;
   let written = 0;
@@ -1228,7 +1490,7 @@ function handlePipeWrite(msg: Extract<MainToKernelMessage, { type: "pipe_write" 
     const chunk = Math.min(data.length - written, PAGE_SIZE);
     let mem = new Uint8Array(kernelMemory!.buffer);
     mem.set(data.subarray(written, written + chunk), scratchOffset);
-    const n = pipeWrite(msg.pid, msg.pipeIdx, BigInt(scratchOffset), chunk);
+    const n = pipeWrite(msg.pid, msg.pipeIdx, kernelWorker.toKernelPtr(scratchOffset), chunk);
     if (n <= 0) break;
     written += n;
   }
@@ -1324,13 +1586,18 @@ async function handleDestroy(msg: Extract<MainToKernelMessage, { type: "destroy"
   }
   for (const threads of threadWorkers.values()) {
     for (const t of threads) {
-      await (t.termination ?? terminateTrackedWorker(t.worker));
+      await (
+        t.termination ??
+        terminateTrackedWorker(t.worker, THREADED_WORKER_TERMINATION_SETTLE_MS)
+      );
     }
   }
   processes.clear();
   threadModuleCache.clear();
   threadWorkers.clear();
+  threadedProcessPids.clear();
   ptyByPid.clear();
+  await waitForProcessTeardowns();
   respond(msg.requestId, true);
 }
 
@@ -1398,30 +1665,32 @@ function handleRegisterPtyOutput(msg: Extract<MainToKernelMessage, { type: "regi
 
 async function handleHttpRequest(requestId: number, request: any) {
   if (!kernelInstance || !bridgePort) return;
+  const portRef = bridgePort;
+  const activityId = beginBridgeRequest();
   const url = request.url || "?";
 
-  // Resolve the port to dispatch to. The SW bridge configures one
-  // bridgeTargetPort per page; if not set, fall back to the first
-  // registered listener (matches earlier behavior).
-  let port = bridgeTargetPort;
-  if (port == null) {
-    const ports: number[] = Array.from(
-      (kernelWorker as any).tcpListenerTargets?.keys() ?? [],
-    );
-    port = ports[0] ?? null;
-  }
-  if (port == null) {
-    console.warn(`[bridge] no listener target for req#${requestId} ${url}`);
-    bridgePort.postMessage({
-      type: "http-error",
-      requestId,
-      error: "No listener target available",
-    });
-    return;
-  }
-
-  console.log(`[bridge] req#${requestId} ${request.method} ${url} → port=${port}`);
   try {
+    // Resolve the port to dispatch to. The SW bridge configures one
+    // bridgeTargetPort per page; if not set, fall back to the first
+    // registered listener (matches earlier behavior).
+    let port = bridgeTargetPort;
+    if (port == null) {
+      const ports: number[] = Array.from(
+        (kernelWorker as any).tcpListenerTargets?.keys() ?? [],
+      );
+      port = ports[0] ?? null;
+    }
+    if (port == null) {
+      console.warn(`[bridge] no listener target for req#${requestId} ${url}`);
+      portRef.postMessage({
+        type: "http-error",
+        requestId,
+        error: "No listener target available",
+      });
+      return;
+    }
+
+    console.debug(`[bridge] req#${requestId} ${request.method} ${url} -> port=${port}`);
     const response = await kernelWorker.sendHttpRequest(
       port,
       {
@@ -1432,7 +1701,7 @@ async function handleHttpRequest(requestId: number, request: any) {
       },
       { debugLabel: `req#${requestId}` },
     );
-    bridgePort.postMessage({
+    portRef.postMessage({
       type: "http-response",
       requestId,
       status: response.status,
@@ -1441,11 +1710,13 @@ async function handleHttpRequest(requestId: number, request: any) {
     });
   } catch (e) {
     console.warn(`[bridge] req#${requestId} ${url} failed:`, e);
-    bridgePort.postMessage({
+    portRef.postMessage({
       type: "http-error",
       requestId,
       error: e instanceof Error ? e.message : String(e),
     });
+  } finally {
+    endBridgeRequest(activityId);
   }
 }
 
@@ -1589,6 +1860,12 @@ sw.onmessage = (e: MessageEvent) => {
       }
       break;
     }
+    case "kms_attach_canvas":
+      kernelWorker.attachKmsCanvas(msg.crtcId, msg.canvas, msg.stats, msg.opts);
+      break;
+    case "kms_attach_stats":
+      kernelWorker.attachKmsStats(msg.crtcId, msg.stats);
+      break;
     default: {
       // Handle non-protocol messages (e.g., bridge port transfer)
       const raw = e.data as any;
@@ -1628,6 +1905,7 @@ sw.onmessage = (e: MessageEvent) => {
         (globalThis as { __sysprof?: boolean }).__sysprof = false;
       } else if (raw?.type === "set_bridge_port" && raw.bridgePort) {
         bridgePort = raw.bridgePort;
+        resetBridgePendingRequests();
         if (typeof raw.httpPort === "number") {
           bridgeTargetPort = raw.httpPort;
         }

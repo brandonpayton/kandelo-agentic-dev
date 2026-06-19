@@ -21,7 +21,7 @@
  *   72      64KB  data transfer buffer
  */
 
-import { WasmPosixKernel } from "./kernel";
+import { WasmPosixKernel, type KernelPointer } from "./kernel";
 import { SharedLockTable } from "./shared-lock-table";
 import {
   buildRawHttpRequest,
@@ -53,6 +53,8 @@ import {
   CH_SYSCALL,
   CH_TOTAL_SIZE,
   HOST_INTERCEPTED_SYSCALLS,
+  PROCESS_MEMORY_PAGES_PER_THREAD_SLOT,
+  PROCESS_MEMORY_THREAD_SLOT_CHANNEL_PRIMARY_PAGE,
   SYSCALL_ARGS,
   type SyscallArgDesc,
 } from "./generated/abi";
@@ -117,7 +119,7 @@ const SYS_RT_SIGTIMEDWAIT = ABI_SYSCALLS.RtSigtimedwait;
 /**
  * Grace period for signal-mask-swapping ppoll/pselect wakeups after a pipe
  * event. This gives the writer's immediately-following signal syscall a
- * chance to reach the centralized kernel before ppoll restores its mask.
+ * chance to reach the kernel before ppoll restores its mask.
  */
 const SIGNAL_SAFE_POLL_WAKE_DELAY_MS = 50;
 
@@ -446,6 +448,12 @@ interface ProcessRegistration {
   channels: ChannelInfo[];
   /** Pointer width: 4 for wasm32, 8 for wasm64. */
   ptrWidth: 4 | 8;
+  /**
+   * True when the host registered a compact/dynamic process layout with an
+   * explicit address-space ceiling. Legacy high-address thread channels lower
+   * max_addr as channels are added; dynamic pthread control slots must not.
+   */
+  explicitMaxAddr: boolean;
 }
 
 interface RegisterProcessOptions {
@@ -480,11 +488,16 @@ type WaitPollResult =
  *   *thread's* channel — i.e. `thread_channelOffset - FORK_BUF_SIZE`.
  *   In the child's memory copy this offset holds the saved frames and globals
  *   the parent thread wrote during its wpk_fork unwind.
+ * - `slotStart`/`slotLen`: the dynamic pthread control reservation that
+ *   contains the caller's TLS, fork-save buffer, and channel. Fork children
+ *   retain this one slot and discard all other parent pthread reservations.
  */
 export interface ForkFromThreadContext {
   fnPtr: number;
   argPtr: number;
   forkBufAddr: number;
+  slotStart: number;
+  slotLen: number;
 }
 
 export interface ResolvedSpawnProgram {
@@ -492,9 +505,21 @@ export interface ResolvedSpawnProgram {
   argv: string[];
 }
 
-export type SpawnProgramResolution = ArrayBuffer | ResolvedSpawnProgram;
+export interface SpawnResolveError {
+  errno: number;
+}
 
-/** Callbacks for fork/exec/exit handling in centralized mode. */
+export type SpawnProgramResolution = ArrayBuffer | ResolvedSpawnProgram | SpawnResolveError;
+
+function isSpawnResolveError(
+  resolution: SpawnProgramResolution,
+): resolution is SpawnResolveError {
+  return !(resolution instanceof ArrayBuffer) &&
+    "errno" in resolution &&
+    typeof resolution.errno === "number";
+}
+
+/** Callbacks for fork/exec/exit handling. */
 export interface CentralizedKernelCallbacks {
   /**
    * Called when a process forks. The kernel has already cloned the Process
@@ -535,7 +560,8 @@ export interface CentralizedKernelCallbacks {
   /**
    * Pre-flight resolution step for SYS_SPAWN. Returns the program bytes
    * for `path` (or `{ programBytes, argv }` when resolution rewrites argv,
-   * e.g. a shebang script), or `null` for ENOENT. **Must NOT have side effects** —
+   * e.g. a shebang script), `{ errno }` for a located but unlaunchable
+   * program, or `null` for ENOENT. **Must NOT have side effects** —
    * `handleSpawn` calls this BEFORE `kernel_spawn_process` so that file
    * actions never run on a doomed PATH-iteration. POSIX requires
    * file_actions to run "exactly once," and `posix_spawnp`'s PATH-walk
@@ -569,6 +595,14 @@ export interface CentralizedKernelCallbacks {
    * spawn a thread Worker sharing the parent's Memory. Returns the TID.
    */
   onClone?: (pid: number, tid: number, fnPtr: number, argPtr: number, stackPtr: number, tlsPtr: number, ctidPtr: number, memory: WebAssembly.Memory) => Promise<number>;
+
+  /**
+   * Called after a pthread channel reaches SYS_EXIT and the kernel worker has
+   * performed the Linux CLONE_CHILD_CLEARTID wake. Return true when the host
+   * will terminate the backing Worker, so the syscall channel should not be
+   * completed back into guest code.
+   */
+  onThreadExit?: (pid: number, tid: number, channelOffset: number) => boolean;
 
   /**
    * Called when a process exits.
@@ -778,14 +812,49 @@ export class CentralizedKernelWorker {
   /** Virtual MAC address for this kernel instance (locally administered, unicast) */
   private virtualMacAddress: Uint8Array;
 
+  /** KMS presenter: OffscreenCanvas per CRTC for the vblank pump to blit
+   *  the bound framebuffer into. Populated via `attachKmsCanvas`. */
+  private kmsCanvases = new Map<number, OffscreenCanvas>();
+  private kmsContexts = new Map<number, OffscreenCanvasRenderingContext2D>();
+  /** Which context type each CRTC's canvas has been claimed for. Set
+   *  by `attachKmsCanvas` when the embedder declares the mode up-front
+   *  (`"2d"` for legacy CPU-blit demos, `"webgl2"` for libdrm/libgbm/EGL
+   *  apps like modeset.c). Auto-mode leaves this unset so the pump
+   *  never touches the canvas — `host_gl_create_context` later flips
+   *  it to `"webgl2"` via `markKmsCanvasGlOwned` once the GL session
+   *  claims the canvas. Once set, the value is sticky: an OffscreenCanvas
+   *  can only ever hold one context type for its lifetime. */
+  private kmsContextMode = new Map<number, "2d" | "webgl2">();
+  /** KMS stats SAB per CRTC. Slots [0..4] populated by the pump (frame
+   *  count, timestamp, width, height, blit µs); slots [5,6] populated
+   *  from kernel-side `kernel_kms_commit_count` / `kernel_kms_last_frame_us`. */
+  private kmsStatsViews = new Map<number, Int32Array>();
+  /** Cached per-CRTC `Uint8ClampedArray` for `putImageData` so the pump
+   *  doesn't allocate 8 MB/frame at 1080p. Resized on bo geometry change.
+   *  Backed by a plain `ArrayBuffer` so `new ImageData(scratch, …)`
+   *  accepts it (an `ImageDataArray` rejects SAB-backed views). */
+  private kmsScratchBytes = new Map<number, Uint8ClampedArray<ArrayBuffer>>();
+  private vblankTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     private config: KernelConfig,
     private io: PlatformIO,
     private callbacks: CentralizedKernelCallbacks = {},
   ) {
     this.kernel = new WasmPosixKernel(config, io, {
-      // In centralized mode, callbacks like onKill/onFork are handled
-      // differently — the kernel returns EAGAIN and JS handles them.
+      // Process-lifecycle callbacks are handled by the kernel worker: the
+      // kernel returns EAGAIN and JS performs the host-side action.
+      getProcessMemory: (pid: number): WebAssembly.Memory | undefined => {
+        return this.processes.get(pid)?.memory;
+      },
+      // KMS scanout canvas lookup for the GL bridge's auto-attach
+      // path. `host_gl_create_context` calls this when a DRM-master
+      // pid has no canvas bound yet; the kernel-worker's KMS registry
+      // is the single source of truth for `crtc_id → OffscreenCanvas`.
+      getKmsCanvas: (crtcId: number) => this.kmsCanvases.get(crtcId),
+      markKmsCanvasGlOwned: (crtcId: number) => {
+        this.kmsContextMode.set(crtcId, "webgl2");
+      },
       onStdin: (maxLen: number): Uint8Array | null => {
         const pid = this.currentHandlePid;
         const buf = this.stdinBuffers.get(pid);
@@ -927,8 +996,8 @@ export class CentralizedKernelWorker {
   }
 
   /**
-   * Initialize the centralized kernel.
-   * Loads kernel Wasm, sets mode to centralized (1).
+   * Initialize the kernel.
+   * Loads kernel Wasm and validates the host adapter ABI.
    */
   async init(kernelWasmBytes: BufferSource): Promise<void> {
     await this.kernel.init(kernelWasmBytes);
@@ -952,16 +1021,13 @@ export class CentralizedKernelWorker {
     this.kernelAbiVersion = abiVersionFn();
     validateKernelHostAdapterManifest(this.kernelInstance, this.kernelMemory);
 
-    // Set centralized mode (existing call below)
-    const setMode = this.kernelInstance.exports.kernel_set_mode as (mode: number) => void;
-    setMode(1);
-
     // Allocate scratch area from the kernel's own heap allocator.
     // IMPORTANT: Do NOT use this.kernelMemory.grow() — the kernel's
     // allocator (dlmalloc) doesn't know about host-grown pages and will
     // reuse them as heap, causing corruption (overlapping writes between
     // scratch data and kernel heap structures like Vec<MappedRegion>).
-    const allocScratch = this.kernelInstance.exports.kernel_alloc_scratch as (size: number) => bigint;
+    const allocScratch = this.kernelInstance.exports.kernel_alloc_scratch as
+      (size: number) => KernelPointer;
     this.scratchOffset = Number(allocScratch(SCRATCH_SIZE));
     if (this.scratchOffset === 0) {
       throw new Error("Failed to allocate kernel scratch buffer");
@@ -985,7 +1051,7 @@ export class CentralizedKernelWorker {
     }
 
     // Register a SharedLockTable so host_fcntl_lock can handle advisory locks
-    // (including OFD locks) within the centralized kernel.
+    // (including OFD locks) within the kernel.
     this.lockTable = SharedLockTable.create();
     this.kernel.registerSharedLockTable(this.lockTable.getBuffer());
 
@@ -1030,7 +1096,7 @@ export class CentralizedKernelWorker {
     // Set process argv in kernel for /proc/<pid>/cmdline
     if (options?.argv && options.argv.length > 0) {
       const setArgv = this.kernelInstance!.exports.kernel_set_process_argv as
-        ((pid: number, dataPtr: bigint, dataLen: number) => number) | undefined;
+        ((pid: number, dataPtr: KernelPointer, dataLen: number) => number) | undefined;
       if (setArgv) {
         const encoder = new TextEncoder();
         const nullSep = options.argv.join("\0");
@@ -1039,7 +1105,7 @@ export class CentralizedKernelWorker {
         const kernelMem = new Uint8Array(this.kernelMemory!.buffer);
         const scratchOffset = this.scratchOffset!;
         kernelMem.set(encoded, scratchOffset);
-        setArgv(pid, BigInt(scratchOffset), encoded.length);
+        setArgv(pid, this.toKernelPtr(scratchOffset), encoded.length);
       }
     }
 
@@ -1048,13 +1114,13 @@ export class CentralizedKernelWorker {
     // control arena. Legacy callers without maxAddr still cap at the lowest
     // channel offset, preserving the old high-channel layout behavior.
     const setMaxAddr = this.kernelInstance!.exports.kernel_set_max_addr as
-      ((pid: number, maxAddr: bigint) => number) | undefined;
+      ((pid: number, maxAddr: KernelPointer) => number) | undefined;
     if (setMaxAddr) {
       const maxAddr = options?.maxAddr ?? (
         channelOffsets.length > 0 ? Math.min(...channelOffsets) : undefined
       );
       if (maxAddr !== undefined) {
-        setMaxAddr(pid, BigInt(maxAddr));
+        setMaxAddr(pid, this.toKernelPtr(maxAddr));
       }
     }
 
@@ -1082,7 +1148,13 @@ export class CentralizedKernelWorker {
       consecutiveSyscalls: 0,
     }));
 
-    const registration: ProcessRegistration = { pid, memory, channels, ptrWidth: options?.ptrWidth ?? 4 };
+    const registration: ProcessRegistration = {
+      pid,
+      memory,
+      channels,
+      ptrWidth: options?.ptrWidth ?? 4,
+      explicitMaxAddr: options?.maxAddr !== undefined,
+    };
     this.processes.set(pid, registration);
     this.activeChannels.push(...channels);
 
@@ -1168,11 +1240,11 @@ export class CentralizedKernelWorker {
    */
   ptyMasterWrite(ptyIdx: number, data: Uint8Array): void {
     const kernelPtyMasterWrite = this.kernelInstance!.exports.kernel_pty_master_write as
-      ((ptyIdx: number, bufPtr: bigint, bufLen: number) => number) | undefined;
+      ((ptyIdx: number, bufPtr: KernelPointer, bufLen: number) => number) | undefined;
     if (!kernelPtyMasterWrite) return;
     const buf = new Uint8Array(this.kernelMemory!.buffer);
     buf.set(data, this.scratchOffset);
-    kernelPtyMasterWrite(ptyIdx, BigInt(this.scratchOffset), data.length);
+    kernelPtyMasterWrite(ptyIdx, this.toKernelPtr(this.scratchOffset), data.length);
     // Drain echo/output produced by the line discipline
     this.drainPtyOutput(ptyIdx);
     // Wake any process blocked on slave read
@@ -1185,10 +1257,10 @@ export class CentralizedKernelWorker {
    */
   ptyMasterRead(ptyIdx: number): Uint8Array | null {
     const kernelPtyMasterRead = this.kernelInstance!.exports.kernel_pty_master_read as
-      ((ptyIdx: number, bufPtr: bigint, bufLen: number) => number) | undefined;
+      ((ptyIdx: number, bufPtr: KernelPointer, bufLen: number) => number) | undefined;
     if (!kernelPtyMasterRead) return null;
     const SCRATCH_READ_SIZE = 4096;
-    const n = kernelPtyMasterRead(ptyIdx, BigInt(this.scratchOffset), SCRATCH_READ_SIZE);
+    const n = kernelPtyMasterRead(ptyIdx, this.toKernelPtr(this.scratchOffset), SCRATCH_READ_SIZE);
     if (n <= 0) return null;
     const buf = new Uint8Array(this.kernelMemory!.buffer);
     return buf.slice(this.scratchOffset, this.scratchOffset + n);
@@ -1263,13 +1335,13 @@ export class CentralizedKernelWorker {
   setCwd(pid: number, cwd: string): void {
     if (!this.initialized) throw new Error("Kernel not initialized");
     const kernelSetCwd = this.kernelInstance!.exports.kernel_set_cwd as
-      ((pid: number, ptr: bigint, len: number) => number) | undefined;
+      ((pid: number, ptr: KernelPointer, len: number) => number) | undefined;
     if (!kernelSetCwd) return; // older kernel without this export
     const encoded = new TextEncoder().encode(cwd);
     // Use the pre-allocated scratch area in kernel memory
     const buf = new Uint8Array(this.kernelMemory!.buffer);
     buf.set(encoded, this.scratchOffset);
-    kernelSetCwd(pid, BigInt(this.scratchOffset), encoded.length);
+    kernelSetCwd(pid, this.toKernelPtr(this.scratchOffset), encoded.length);
   }
 
   /**
@@ -1365,9 +1437,9 @@ export class CentralizedKernelWorker {
   enumProcs(): ProcessSnapshot[] {
     if (!this.initialized) return [];
     const enumProcs = this.kernelInstance!.exports.kernel_enum_procs as
-      ((ptr: bigint, len: number) => number) | undefined;
+      ((ptr: KernelPointer, len: number) => number) | undefined;
     if (!enumProcs) return [];
-    const n = enumProcs(BigInt(this.scratchOffset), SCRATCH_SIZE);
+    const n = enumProcs(this.toKernelPtr(this.scratchOffset), SCRATCH_SIZE);
     if (n <= 0) return [];
     // The kernel memory is a SharedArrayBuffer; TextDecoder refuses
     // shared views. Copy to a regular ArrayBuffer before parsing.
@@ -1392,9 +1464,9 @@ export class CentralizedKernelWorker {
   readProcMaps(pid: number): string | null {
     if (!this.initialized) return null;
     const readMaps = this.kernelInstance!.exports.kernel_read_proc_maps as
-      ((pid: number, ptr: bigint, len: number) => number) | undefined;
+      ((pid: number, ptr: KernelPointer, len: number) => number) | undefined;
     if (!readMaps) return null;
-    const n = readMaps(pid, BigInt(this.scratchOffset), SCRATCH_SIZE);
+    const n = readMaps(pid, this.toKernelPtr(this.scratchOffset), SCRATCH_SIZE);
     if (n < 0) return null;          // -ESRCH or similar
     if (n === 0) return "";
     // SharedArrayBuffer view → TextDecoder doesn't accept shared views.
@@ -1442,14 +1514,7 @@ export class CentralizedKernelWorker {
       }
     }
 
-    // Release all advisory file locks held by this process.
-    // Force-reset the spinlock first: a terminated worker may have been holding it,
-    // and Atomics.wait is not allowed on the browser main thread.
-    if (this.lockTable) {
-      const lockBuf = this.lockTable.getBuffer();
-      Atomics.store(new Int32Array(lockBuf), 0, 0); // force-release spinlock
-      this.lockTable.removeLocksByPid(pid);
-    }
+    this.releaseAdvisoryLocksForPid(pid);
 
     // Remove from kernel process table
     this.removeFromKernelProcessTable(pid);
@@ -1496,11 +1561,22 @@ export class CentralizedKernelWorker {
     removeProcess(pid);
   }
 
+  private releaseAdvisoryLocksForPid(pid: number): void {
+    if (!this.lockTable) return;
+
+    // Force-reset the spinlock first: a terminated worker may have been
+    // holding it, and Atomics.wait is not allowed on the browser main thread.
+    const lockBuf = this.lockTable.getBuffer();
+    Atomics.store(new Int32Array(lockBuf), 0, 0);
+    this.lockTable.removeLocksByPid(pid);
+  }
+
   deactivateProcess(pid: number): void {
     this.activeChannels = this.activeChannels.filter((ch) => ch.pid !== pid);
     this.processes.delete(pid);
     this.stdinFinite.delete(pid);
     this.stdinBuffers.delete(pid);
+    this.releaseAdvisoryLocksForPid(pid);
     // Cancel any pending alarm timer for this process
     const alarmTimer = this.alarmTimers.get(pid);
     if (alarmTimer) {
@@ -1620,11 +1696,11 @@ export class CentralizedKernelWorker {
     // control pages. Compact process memories reserve thread pages before the
     // process's mmap base when the process is registered.
     const setMaxAddr = this.kernelInstance!.exports.kernel_set_max_addr as
-      ((pid: number, maxAddr: bigint) => number) | undefined;
-    if (setMaxAddr) {
+      ((pid: number, maxAddr: KernelPointer) => number) | undefined;
+    if (setMaxAddr && !registration.explicitMaxAddr) {
       const tlsPageAddr = channelOffset - 2 * WASM_PAGE_SIZE;
       if (tlsPageAddr >= PROCESS_MMAP_BASE) {
-        setMaxAddr(pid, BigInt(tlsPageAddr));
+        setMaxAddr(pid, this.toKernelPtr(tlsPageAddr));
       }
     }
 
@@ -1728,6 +1804,10 @@ export class CentralizedKernelWorker {
     return this.processes.get(pid)?.ptrWidth ?? 4;
   }
 
+  toKernelPtr(value: number | bigint): KernelPointer {
+    return this.kernel.toKernelPtr(value);
+  }
+
   /** Debug: last N syscalls per pid for crash diagnosis */
   private syscallRing = new Map<number, string[]>();
   dumpLastSyscalls(pid: number): string {
@@ -1745,6 +1825,16 @@ export class CentralizedKernelWorker {
     const copy = new Uint8Array(len);
     copy.set(mem.subarray(ptr, ptr + len));
     return new TextDecoder().decode(copy);
+  }
+
+  private readBytesPreview(memory: WebAssembly.Memory, ptr: number, len: number, maxLen = 160): string {
+    if (ptr === 0 || len <= 0) return "";
+    const mem = new Uint8Array(memory.buffer);
+    const capped = Math.max(0, Math.min(len, maxLen, mem.length - ptr));
+    if (capped <= 0) return "";
+    const copy = new Uint8Array(capped);
+    copy.set(mem.subarray(ptr, ptr + capped));
+    return new TextDecoder("utf-8", { fatal: false }).decode(copy);
   }
 
   /** Format a syscall for logging, decoding path/string args from process memory */
@@ -1783,7 +1873,7 @@ export class CentralizedKernelWorker {
       case ABI_SYSCALLS.Read: // read(fd, buf, count)
         return `[${pid}${tidSuffix}] read(${args[0]}, ${args[2]})`;
       case ABI_SYSCALLS.Write: // write(fd, buf, count)
-        return `[${pid}${tidSuffix}] write(${args[0]}, ${args[2]})`;
+        return `[${pid}${tidSuffix}] write(${args[0]}, ${args[2]}, ${JSON.stringify(this.readBytesPreview(channel.memory, args[1], args[2]))})`;
       case ABI_SYSCALLS.Close: // close(fd)
         return `[${pid}${tidSuffix}] close(${args[0]})`;
       case ABI_SYSCALLS.Fstat: // fstat(fd, buf)
@@ -1866,10 +1956,10 @@ export class CentralizedKernelWorker {
     }
 
     // Track last 30 syscalls per channel for crash diagnostics
-    const ringKey = channel.channelOffset;
+    const ringKey = channel.pid;
     let ring = this.syscallRing.get(ringKey);
     if (!ring) { ring = []; this.syscallRing.set(ringKey, ring); }
-    ring.push(`  syscall=${syscallNr} args=[${origArgs.join(',')}]`);
+    ring.push(`  ${this.formatSyscallEntry(channel, syscallNr, origArgs)}`);
     if (ring.length > 30) ring.shift();
 
     // Opt-in live trace ring. enableSyscallTrace() flips the flag; the
@@ -1955,9 +2045,8 @@ export class CentralizedKernelWorker {
     }
 
     // --- Futex: must operate on process memory, not kernel memory ---
-    // The kernel's host_futex_wake/wait imports use kernel memory, but in
-    // centralized mode the futex address is in process memory. Intercept
-    // here and handle directly.
+    // The kernel's host_futex_wake/wait imports use kernel memory, but futex
+    // addresses are in process memory. Intercept here and handle directly.
     if (syscallNr === SYS_FUTEX) {
       if (logging) {
         // Futex args: (uaddr, op, val, timeout, uaddr2, val3). Decode the op
@@ -2107,8 +2196,8 @@ export class CentralizedKernelWorker {
     // (sec, usec) and no sigmask. musl's select.c routes here on wasm64
     // because `__NR_pselect6_time64` isn't defined for that arch (unlike
     // wasm32, which aliases it to __NR_pselect6). Without this intercept,
-    // sys_select returns EAGAIN unconditionally in centralized mode and
-    // the generic blocking-retry has no select-timeout awareness — every
+    // sys_select returns EAGAIN when it needs host-managed waiting, and the
+    // generic blocking-retry has no select-timeout awareness — every
     // `select(0,0,0,0,&tv)` (= my_sleep) becomes an infinite loop. That
     // surfaced as the wasm64 mariadbd boot hang at
     // wait_for_signal_thread_to_end's kill+my_sleep loop.
@@ -2227,7 +2316,7 @@ export class CentralizedKernelWorker {
     }
 
     // Call kernel_handle_channel
-    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: bigint, pid: number) => number;
+    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     // DIAGNOSTIC: globalThis.__sysprof aggregates per-(pid,syscall_nr)
@@ -2256,7 +2345,7 @@ export class CentralizedKernelWorker {
       g.__sysprofLastSeen.set(channel.pid, sysprofStart);
     }
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } catch (err) {
       // If the kernel throws (e.g., invalid memory access), complete the
       // channel with -EIO to unblock the process rather than deadlocking.
@@ -2289,8 +2378,8 @@ export class CentralizedKernelWorker {
     const errVal = kernelView.getUint32(CH_ERRNO, true);
 
     // --- Process memory growth for brk/mmap/mremap ---
-    // In centralized mode, the kernel's ensure_memory_covers() grows the
-    // KERNEL's Wasm memory, not the process's. We must grow the process's
+    // The kernel's ensure_memory_covers() grows the KERNEL's Wasm memory, not
+    // the process's. We must grow the process's
     // WebAssembly.Memory here so the process can access the new addresses.
     if (retVal > 0) {
       this.ensureProcessMemoryCovers(channel.pid, channel.memory, syscallNr, retVal, origArgs);
@@ -2337,6 +2426,17 @@ export class CentralizedKernelWorker {
           });
         }
       }
+      // DRI bo mmap prime: the kernel's sys_mmap on /dev/dri/{render,card}
+      // already called `host_gbm_bo_bind` to record metadata, but the
+      // actual SAB→Memory copy is deferred until here so the
+      // anonymous-mmap zero-fill is in place first. This is what
+      // delivers the parent's writes to a child across PRIME
+      // export → fork → PRIME import. No-op for non-DRI mmaps.
+      const mmapAddr = retVal >>> 0;
+      const boId = this.kernel.bos.findBindingByAddr(channel.pid, mmapAddr);
+      if (boId !== undefined) {
+        this.kernel.bos.primeBindFromSab(channel.pid, boId, channel.memory);
+      }
     }
 
     // --- msync: flush MAP_SHARED regions back to file ---
@@ -2350,7 +2450,7 @@ export class CentralizedKernelWorker {
       this.cleanupSharedMappings(channel.pid, origArgs[0] >>> 0, origArgs[1] >>> 0);
     }
 
-    // --- Signal-death check (centralized mode) ---
+    // --- Signal-death check ---
     // If deliver_pending_signals marked this process as Exited (e.g., abort()
     // raises SIGABRT with default action Terminate), don't complete the channel.
     // Instead, record signal-death wait status and terminate the worker.
@@ -2364,14 +2464,14 @@ export class CentralizedKernelWorker {
       }
     }
 
-    // --- POSIX mqueue notification (centralized mode) ---
+    // --- POSIX mqueue notification ---
     // After mq_timedsend, the kernel may have a pending notification (signal
     // to deliver when a message arrives on a previously empty queue).
     if (syscallNr === SYS_MQ_TIMEDSEND && retVal === 0) {
       this.drainMqueueNotification();
     }
 
-    // --- Signal delivery (centralized mode) ---
+    // --- Signal delivery ---
     // After each syscall, check if the kernel has a pending Handler signal.
     // If so, dequeue it and write delivery info to the process channel.
     // The glue code (channel_syscall.c) will invoke the handler after waking.
@@ -2437,12 +2537,12 @@ export class CentralizedKernelWorker {
    */
   private dequeueSignalForDelivery(channel: ChannelInfo): void {
     const dequeueSignal = this.kernelInstance!.exports
-      .kernel_dequeue_signal as ((pid: number, outPtr: bigint) => number) | undefined;
+      .kernel_dequeue_signal as ((pid: number, outPtr: KernelPointer) => number) | undefined;
     if (!dequeueSignal) return;
 
     // Use the signal area in kernel scratch as the output buffer
     const sigOutOffset = this.scratchOffset + CH_SIG_BASE;
-    const sigResult = dequeueSignal(channel.pid, BigInt(sigOutOffset));
+    const sigResult = dequeueSignal(channel.pid, this.toKernelPtr(sigOutOffset));
     if (sigResult > 0) {
       // Copy 44 bytes of signal delivery info from kernel scratch to process channel
       // Layout: signum(4) + handler(4) + flags(4) + si_value(4) + old_mask(8)
@@ -2715,6 +2815,12 @@ export class CentralizedKernelWorker {
     Atomics.notify(i32View, CH_STATUS / 4, 1);
   }
 
+  private abandonChannel(channel: ChannelInfo): void {
+    channel.handling = false;
+    this.clearSocketTimeout(channel);
+    this.pendingCancels.delete(channel.channelOffset);
+  }
+
   /**
    * Handle EAGAIN retry for blocking syscalls.
    * The process stays blocked while we retry asynchronously.
@@ -2929,14 +3035,14 @@ export class CentralizedKernelWorker {
    */
   private drainAndProcessWakeupEvents(): void {
     const drainFn = this.kernelInstance!.exports.kernel_drain_wakeup_events as
-      ((outPtr: bigint, outLen: number, maxEvents: number) => number) | undefined;
+      ((outPtr: KernelPointer, outLen: number, maxEvents: number) => number) | undefined;
     if (!drainFn) return;
 
     const MAX_EVENTS = 256;
     const BYTES_PER_EVENT = 5;
     const bufSize = MAX_EVENTS * BYTES_PER_EVENT;
 
-    const count = drainFn(BigInt(this.scratchOffset), bufSize, MAX_EVENTS);
+    const count = drainFn(this.toKernelPtr(this.scratchOffset), bufSize, MAX_EVENTS);
     if (count === 0) return;
 
     const kernelMem = new Uint8Array(this.kernelMemory!.buffer);
@@ -2993,7 +3099,7 @@ export class CentralizedKernelWorker {
     // a blocked ppoll in the reader to observe BOTH events atomically.
     // On a real kernel that works because X's two syscalls execute
     // before the scheduler runs the reader. In our retry-based
-    // centralized kernel, the pipe wakeup can fire a ppoll retry BEFORE
+    // shared kernel, the pipe wakeup can fire a ppoll retry BEFORE
     // X's follow-up kill is even sent by X's worker (Atomics.notify →
     // uv_async round-trip takes 1–5ms). If the retry fires first, ppoll
     // returns POLLIN and restores its sigmask; the late signal is then
@@ -3384,7 +3490,7 @@ export class CentralizedKernelWorker {
     if (!conns || conns.length === 0) return;
 
     const pipeRead = this.kernelInstance!.exports.kernel_pipe_read as
-      (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number;
+      (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number;
     const mem = this.getKernelMem();
 
     // Injected-connection pipes live in the global pipe table; pid=0
@@ -3392,7 +3498,7 @@ export class CentralizedKernelWorker {
     for (const conn of conns) {
       // Drain all available data from the send pipe (not just one chunk)
       for (;;) {
-        const readN = pipeRead(0, conn.sendPipeIdx, BigInt(conn.scratchOffset), 65536);
+        const readN = pipeRead(0, conn.sendPipeIdx, this.toKernelPtr(conn.scratchOffset), 65536);
         if (readN <= 0) break;
         const outData = Buffer.from(mem.slice(conn.scratchOffset, conn.scratchOffset + readN));
         if (!conn.clientSocket.destroyed) {
@@ -3541,8 +3647,8 @@ export class CentralizedKernelWorker {
     // (epoll_pwait is now handled entirely on the host side by handleEpollPwait)
 
     // sigtimedwait: kernel returned EAGAIN because no signal is pending.
-    // Instead of retrying (signal won't arrive in single-process mode),
-    // delay for the requested timeout then complete with -1/EAGAIN.
+    // Instead of busy-retrying, delay for the requested timeout then complete
+    // with -1/EAGAIN.
     if (syscallNr === SYS_RT_SIGTIMEDWAIT) {
       const timeoutPtr = origArgs[2]; // pointer to timespec in process memory
       if (timeoutPtr === 0) {
@@ -3880,11 +3986,11 @@ export class CentralizedKernelWorker {
     }
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -3896,6 +4002,16 @@ export class CentralizedKernelWorker {
     if (flockPtr !== 0 && retVal >= 0) {
       const freshProcessMem = new Uint8Array(channel.memory.buffer);
       freshProcessMem.set(kernelMem.subarray(dataStart, dataStart + FLOCK_SIZE), flockPtr);
+    }
+
+    const cmd = origArgs[1];
+    if (
+      retVal === -1 &&
+      errVal === EAGAIN &&
+      (cmd === F_SETLKW || cmd === F_SETLKW64 || cmd === F_OFD_SETLKW)
+    ) {
+      this.handleBlockingRetry(channel, SYS_FCNTL, origArgs);
+      return;
     }
 
     this.completeChannel(channel, SYS_FCNTL, origArgs, undefined, retVal, errVal);
@@ -4013,11 +4129,11 @@ export class CentralizedKernelWorker {
     kernelView.setBigInt64(CH_ARGS + 4 * CH_ARG_SIZE, BigInt(timeoutMs), true);
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -4156,11 +4272,11 @@ export class CentralizedKernelWorker {
     kernelView.setBigInt64(CH_ARGS + 5 * CH_ARG_SIZE, BigInt(kernelMaskPtr), true);
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -4275,11 +4391,11 @@ export class CentralizedKernelWorker {
     }
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -4335,11 +4451,11 @@ export class CentralizedKernelWorker {
     kernelView.setBigInt64(CH_ARGS + 5 * CH_ARG_SIZE, BigInt(0), true);
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -4473,11 +4589,11 @@ export class CentralizedKernelWorker {
     }
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -4719,11 +4835,11 @@ export class CentralizedKernelWorker {
       }
 
       const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-        (offset: bigint, pid: number) => number;
+        (offset: KernelPointer, pid: number) => number;
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } finally {
         this.currentHandlePid = 0;
       }
@@ -4741,7 +4857,7 @@ export class CentralizedKernelWorker {
       // Slow path: total data exceeds scratch buffer. Issue individual SYS_WRITEV
       // calls with one iov entry each, chunked to fit in CH_DATA_SIZE.
       const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-        (offset: bigint, pid: number) => number;
+        (offset: KernelPointer, pid: number) => number;
       const isPwritev = syscallNr === SYS_PWRITEV;
       let fileOffset = isPwritev
         ? (origArgs[3] | 0) + (origArgs[4] | 0) * 0x100000000
@@ -4785,7 +4901,7 @@ export class CentralizedKernelWorker {
           this.currentHandlePid = channel.pid;
           this.bindKernelTidForChannel(channel);
           try {
-            handleChannel(BigInt(this.scratchOffset), channel.pid);
+            handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
           } finally {
             this.currentHandlePid = 0;
           }
@@ -4837,7 +4953,7 @@ export class CentralizedKernelWorker {
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
     const dataStart = this.scratchOffset + CH_DATA;
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
 
     let totalWritten = 0;
 
@@ -4862,7 +4978,7 @@ export class CentralizedKernelWorker {
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } catch (err) {
         console.error(`[handleLargeWrite] kernel threw for pid=${channel.pid}:`, err);
         if (totalWritten > 0) {
@@ -4927,7 +5043,7 @@ export class CentralizedKernelWorker {
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
     const dataStart = this.scratchOffset + CH_DATA;
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
 
     let totalRead = 0;
 
@@ -4949,7 +5065,7 @@ export class CentralizedKernelWorker {
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } catch (err) {
         console.error(`[handleLargeRead] kernel threw for pid=${channel.pid}:`, err);
         if (totalRead > 0) {
@@ -5075,11 +5191,11 @@ export class CentralizedKernelWorker {
       }
 
       const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-        (offset: bigint, pid: number) => number;
+        (offset: KernelPointer, pid: number) => number;
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } finally {
         this.currentHandlePid = 0;
       }
@@ -5110,7 +5226,7 @@ export class CentralizedKernelWorker {
       // Slow path: total data exceeds scratch buffer. Issue one SYS_READ per iov entry,
       // chunked to fit in CH_DATA_SIZE. Use pread to maintain file offset for preadv.
       const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-        (offset: bigint, pid: number) => number;
+        (offset: KernelPointer, pid: number) => number;
       const isPreadv = syscallNr === SYS_PREADV;
       let fileOffset = isPreadv
         ? (origArgs[3] | 0) + (origArgs[4] | 0) * 0x100000000
@@ -5151,7 +5267,7 @@ export class CentralizedKernelWorker {
           this.currentHandlePid = channel.pid;
           this.bindKernelTidForChannel(channel);
           try {
-            handleChannel(BigInt(this.scratchOffset), channel.pid);
+            handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
           } finally {
             this.currentHandlePid = 0;
           }
@@ -5306,11 +5422,11 @@ export class CentralizedKernelWorker {
     kernelView.setBigInt64(CH_ARGS + 2 * CH_ARG_SIZE, BigInt(flags), true);
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -5438,11 +5554,11 @@ export class CentralizedKernelWorker {
     kernelView.setBigInt64(CH_ARGS + 2 * CH_ARG_SIZE, BigInt(flags), true);
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -5557,13 +5673,30 @@ export class CentralizedKernelWorker {
     // correctly.
     const threadKey = `${parentPid}:${channel.channelOffset}`;
     const threadCtx = this.threadForkContexts.get(threadKey);
+    const callerSlotStart =
+      channel.channelOffset - PROCESS_MEMORY_THREAD_SLOT_CHANNEL_PRIMARY_PAGE * WASM_PAGE_SIZE;
+    const callerSlotLen = PROCESS_MEMORY_PAGES_PER_THREAD_SLOT * WASM_PAGE_SIZE;
     const threadFork: ForkFromThreadContext | undefined = threadCtx
       ? {
           fnPtr: threadCtx.fnPtr,
           argPtr: threadCtx.argPtr,
           forkBufAddr: channel.channelOffset - FORK_BUF_SIZE,
+          slotStart: callerSlotStart,
+          slotLen: callerSlotLen,
         }
       : undefined;
+
+    if (threadFork) {
+      try {
+        this.reserveHostRegionAt(childPid, threadFork.slotStart, threadFork.slotLen);
+      } catch (err) {
+        this.removeFromKernelProcessTable(childPid);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[kernel-worker] fork child slot reservation failed: ${message}`);
+        this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, 12);
+        return;
+      }
+    }
 
     // Call the async fork handler to spawn child Worker
     this.callbacks.onFork(parentPid, childPid, channel.memory, threadFork).then((childChannelOffsets) => {
@@ -5697,6 +5830,10 @@ export class CentralizedKernelWorker {
         this.completeChannel(channel, SYS_SPAWN, origArgs, undefined, -1, 2); // ENOENT
         return;
       }
+      if (isSpawnResolveError(resolved)) {
+        this.completeChannel(channel, SYS_SPAWN, origArgs, undefined, -1, resolved.errno >>> 0);
+        return;
+      }
       const programBytes = resolved instanceof ArrayBuffer ? resolved : resolved.programBytes;
       const launchArgv = resolved instanceof ArrayBuffer ? argv : resolved.argv;
       this.handleSpawnAfterResolve(
@@ -5734,8 +5871,12 @@ export class CentralizedKernelWorker {
 
     // ── Ask the kernel to build the child descriptor ──
     const kernelSpawn = this.kernelInstance!.exports.kernel_spawn_process as
-      (parentPid: number, blobPtr: bigint, blobLen: bigint) => number;
-    const result = kernelSpawn(parentPid, BigInt(this.scratchOffset), BigInt(blobLen));
+      (parentPid: number, blobPtr: KernelPointer, blobLen: KernelPointer) => number;
+    const result = kernelSpawn(
+      parentPid,
+      this.toKernelPtr(this.scratchOffset),
+      this.toKernelPtr(blobLen),
+    );
     if (result < 0) {
       this.completeChannel(channel, SYS_SPAWN, origArgs, undefined, -1, (-result) >>> 0);
       return;
@@ -5854,9 +5995,9 @@ export class CentralizedKernelWorker {
    */
   private resolveExecPathAgainstCwd(pid: number, path: string): string {
     const getCwd = this.kernelInstance!.exports.kernel_get_cwd as
-      ((pid: number, bufPtr: bigint, bufLen: number) => number) | undefined;
+      ((pid: number, bufPtr: KernelPointer, bufLen: number) => number) | undefined;
     if (!getCwd) return path;
-    const cwdLen = getCwd(pid, BigInt(this.scratchOffset), 4096);
+    const cwdLen = getCwd(pid, this.toKernelPtr(this.scratchOffset), 4096);
     if (cwdLen <= 0) return path;
     const kernelBuf = new Uint8Array(this.kernelMemory!.buffer);
     const cwd = new TextDecoder().decode(kernelBuf.slice(this.scratchOffset, this.scratchOffset + cwdLen));
@@ -5895,12 +6036,12 @@ export class CentralizedKernelWorker {
     if ((flags & AT_EMPTY_PATH) !== 0 && pathStr === "") {
       // fexecve path: resolve fd to file path via kernel
       const getFdPath = this.kernelInstance!.exports.kernel_get_fd_path as
-        ((pid: number, fd: number, bufPtr: bigint, bufLen: number) => number) | undefined;
+        ((pid: number, fd: number, bufPtr: KernelPointer, bufLen: number) => number) | undefined;
       if (!getFdPath) {
         this.completeChannel(channel, SYS_EXECVEAT, origArgs, undefined, -1, 38); // ENOSYS
         return;
       }
-      const result = getFdPath(channel.pid, dirfd, BigInt(this.scratchOffset), 4096);
+      const result = getFdPath(channel.pid, dirfd, this.toKernelPtr(this.scratchOffset), 4096);
       if (result <= 0) {
         const errno = result < 0 ? (-result) >>> 0 : 2; // ENOENT
         this.completeChannel(channel, SYS_EXECVEAT, origArgs, undefined, -1, errno);
@@ -5953,8 +6094,8 @@ export class CentralizedKernelWorker {
   private handleClone(channel: ChannelInfo, origArgs: number[]): void {
     // Channel args from musl's __clone override which calls kernel_clone directly:
     //   kernel_clone(fn_ptr, stack_ptr, flags, arg, ptid_ptr, tls_ptr, ctid_ptr)
-    // But in centralized mode, __clone goes through channel_syscall which
-    // dispatches SYS_CLONE with Linux syscall convention:
+    // The channel syscall path dispatches SYS_CLONE with Linux syscall
+    // convention:
     //   a1=flags, a2=stack, a3=ptid, a4=tls, a5=ctid
     // The kernel dispatch remaps: kernel_clone(0, a2, a1, 0, a3, a4, a5)
     //
@@ -5979,11 +6120,11 @@ export class CentralizedKernelWorker {
     }
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } finally {
       this.currentHandlePid = 0;
     }
@@ -5999,8 +6140,8 @@ export class CentralizedKernelWorker {
     const tid = retVal;
 
     // CLONE_PARENT_SETTID: write TID to ptid_ptr in process memory.
-    // The kernel skips this in centralized mode since ptid_ptr is in
-    // process memory, not kernel memory.
+    // The host writes this because ptid_ptr is in process memory, not kernel
+    // memory.
     const CLONE_PARENT_SETTID = 0x00100000;
     const flags = origArgs[0];
     const ptidPtr = origArgs[2];
@@ -6018,16 +6159,30 @@ export class CentralizedKernelWorker {
     const tlsPtr = origArgs[3];
     const ctidPtr = origArgs[4];
 
+    // Register the clear-TID pointer before starting the host Worker. A very
+    // short-lived pthread can reach SYS_EXIT before onClone resolves.
+    if (ctidPtr !== 0) {
+      this.threadCtidPtrs.set(`${channel.pid}:${tid}`, ctidPtr);
+    }
+
     this.callbacks.onClone(
       channel.pid, tid, fnPtr, argPtr, stackPtr, tlsPtr, ctidPtr, channel.memory,
     ).then((assignedTid) => {
-      if (!this.processes.has(channel.pid)) return;
-      // Store ctidPtr for CLONE_CHILD_CLEARTID on thread exit
-      if (ctidPtr !== 0) {
+      if (!this.processes.has(channel.pid)) {
+        if (ctidPtr !== 0) {
+          this.threadCtidPtrs.delete(`${channel.pid}:${tid}`);
+        }
+        return;
+      }
+      if (assignedTid !== tid && ctidPtr !== 0) {
+        this.threadCtidPtrs.delete(`${channel.pid}:${tid}`);
         this.threadCtidPtrs.set(`${channel.pid}:${assignedTid}`, ctidPtr);
       }
       this.completeChannel(channel, SYS_CLONE, origArgs, undefined, assignedTid, 0);
     }).catch((err) => {
+      if (ctidPtr !== 0) {
+        this.threadCtidPtrs.delete(`${channel.pid}:${tid}`);
+      }
       console.error(`[kernel-worker] onClone failed: ${err}`);
       this.completeChannel(channel, SYS_CLONE, origArgs, undefined, -1, 12); // ENOMEM
     });
@@ -6037,7 +6192,9 @@ export class CentralizedKernelWorker {
    * Handle SYS_EXIT/SYS_EXIT_GROUP: notify the kernel and clean up.
    *
    * For SYS_EXIT from a non-main channel (thread exit): notify kernel,
-   * remove channel, complete channel to unblock thread worker.
+   * remove channel, and let the host terminate the backing Worker. If an
+   * older host entry has no thread-exit callback, fall back to completing the
+   * channel for compatibility.
    * For SYS_EXIT from main channel or SYS_EXIT_GROUP: current behavior.
    */
   private handleExit(channel: ChannelInfo, syscallNr: number, origArgs: number[]): void {
@@ -6077,8 +6234,14 @@ export class CentralizedKernelWorker {
         this.notifyThreadExit(channel.pid, tid);
       }
       this.removeChannel(channel.pid, channel.channelOffset);
-      // Complete channel to unblock the thread worker so it can exit cleanly
-      this.completeChannelRaw(channel, 0, 0);
+      const hostWillTerminateThread = tid > 0 &&
+        this.callbacks.onThreadExit?.(channel.pid, tid, channel.channelOffset) === true;
+      if (hostWillTerminateThread) {
+        this.abandonChannel(channel);
+      } else {
+        // Back-compatibility for embedders that have not wired onThreadExit.
+        this.completeChannelRaw(channel, 0, 0);
+      }
       return;
     }
 
@@ -6089,11 +6252,11 @@ export class CentralizedKernelWorker {
       kernelView.setUint32(CH_SYSCALL, syscallNr, true);
       kernelView.setBigInt64(CH_ARGS, BigInt(exitStatus), true);
       const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-        (offset: bigint, pid: number) => number;
+        (offset: KernelPointer, pid: number) => number;
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } catch {
         // Expected: kernel_exit traps with unreachable after closing FDs
       } finally {
@@ -6281,8 +6444,8 @@ export class CentralizedKernelWorker {
 
   private pollWaitableChild(parentPid: number, targetPid: number): WaitPollResult {
     const waitPoll = this.kernelInstance!.exports.kernel_wait4_poll as
-      (parentPid: number, targetPid: number, statusPtr: bigint) => number;
-    const result = waitPoll(parentPid, targetPid, BigInt(this.scratchOffset!));
+      (parentPid: number, targetPid: number, statusPtr: KernelPointer) => number;
+    const result = waitPoll(parentPid, targetPid, this.toKernelPtr(this.scratchOffset!));
     if (result > 0) {
       const waitStatus = new DataView(this.kernelMemory!.buffer)
         .getInt32(this.scratchOffset!, true);
@@ -6488,9 +6651,9 @@ export class CentralizedKernelWorker {
   /**
    * Handle SYS_FUTEX directly on process memory.
    *
-   * In centralized mode, the kernel's host_futex_wake/wait imports operate on
-   * kernel memory, but futex addresses are in process memory. We bypass the
-   * kernel entirely and implement the futex ops here.
+   * The kernel's host_futex_wake/wait imports operate on kernel memory, but
+   * futex addresses are in process memory. We bypass the kernel entirely and
+   * implement the futex ops here.
    *
    * FUTEX_WAIT: compare-and-block. If the value at addr matches expected,
    * use Atomics.waitAsync to wait for a change, then return 0. If it doesn't
@@ -6673,7 +6836,7 @@ export class CentralizedKernelWorker {
     }
 
     const handleChannel = this.kernelInstance.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = targetPid;
     // Host-originated signal (SIGCHLD, SIGALRM, timer, etc.) is always a
     // "shared" delivery — it lands on the process's pending queue, not a
@@ -6683,7 +6846,7 @@ export class CentralizedKernelWorker {
       ((tid: number) => void) | undefined;
     if (setTid) setTid(0);
     try {
-      handleChannel(BigInt(this.scratchOffset), targetPid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), targetPid);
     } catch (err) {
       // Non-fatal — signal delivery is best-effort from the host side
       console.error(`[sendSignalToProcess] kernel threw for pid=${targetPid} sig=${signum}: ${err}`);
@@ -6737,8 +6900,8 @@ export class CentralizedKernelWorker {
   // -----------------------------------------------------------------------
   // Process memory management
   //
-  // In centralized mode, the kernel's ensure_memory_covers() grows the
-  // KERNEL's Wasm memory (memory index 0 in the kernel module). But the
+  // The kernel's ensure_memory_covers() grows the KERNEL's Wasm memory
+  // (memory index 0 in the kernel module). But the
   // process runs in a different WebAssembly.Memory. After brk/mmap/mremap
   // syscalls, we must grow the process's memory to cover the returned
   // addresses — otherwise the process gets "memory access out of bounds".
@@ -6882,7 +7045,7 @@ export class CentralizedKernelWorker {
     let fileOffset = pageOffset * 4096;
 
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
     const kernelMem = new Uint8Array(this.kernelMemory!.buffer);
     const dataStart = this.scratchOffset + CH_DATA;
@@ -6904,7 +7067,7 @@ export class CentralizedKernelWorker {
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } catch {
         break; // pread failed, leave rest as zeros
       }
@@ -6974,7 +7137,7 @@ export class CentralizedKernelWorker {
     fileOffset: number,
   ): void {
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
-      (offset: bigint, pid: number) => number;
+      (offset: KernelPointer, pid: number) => number;
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
     const kernelMem = new Uint8Array(this.kernelMemory!.buffer);
     const dataStart = this.scratchOffset + CH_DATA;
@@ -7004,7 +7167,7 @@ export class CentralizedKernelWorker {
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
       try {
-        handleChannel(BigInt(this.scratchOffset), channel.pid);
+        handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
       } catch {
         break;
       }
@@ -7051,9 +7214,9 @@ export class CentralizedKernelWorker {
    */
   setMaxAddr(pid: number, maxAddr: number): void {
     const setMaxAddrFn = this.kernelInstance!.exports.kernel_set_max_addr as
-      ((pid: number, maxAddr: bigint) => number) | undefined;
+      ((pid: number, maxAddr: KernelPointer) => number) | undefined;
     if (setMaxAddrFn) {
-      setMaxAddrFn(pid, BigInt(maxAddr));
+      setMaxAddrFn(pid, this.toKernelPtr(maxAddr));
     }
   }
 
@@ -7064,11 +7227,11 @@ export class CentralizedKernelWorker {
    */
   setBrkLimit(pid: number, brkLimit: number): boolean {
     const setBrkLimitFn = this.kernelInstance!.exports.kernel_set_brk_limit as
-      ((pid: number, brkLimit: bigint) => number) | undefined;
+      ((pid: number, brkLimit: KernelPointer) => number) | undefined;
     if (!setBrkLimitFn) {
       return false;
     }
-    return setBrkLimitFn(pid, BigInt(brkLimit)) >= 0;
+    return setBrkLimitFn(pid, this.toKernelPtr(brkLimit)) >= 0;
   }
 
   /**
@@ -7077,16 +7240,56 @@ export class CentralizedKernelWorker {
    */
   setMmapBase(pid: number, mmapBase: number): boolean {
     const setMmapBaseFn = this.kernelInstance!.exports.kernel_set_mmap_base as
-      ((pid: number, mmapBase: bigint) => number) | undefined;
+      ((pid: number, mmapBase: KernelPointer) => number) | undefined;
     if (!setMmapBaseFn) {
       return false;
     }
-    return setMmapBaseFn(pid, BigInt(mmapBase)) >= 0;
+    return setMmapBaseFn(pid, this.toKernelPtr(mmapBase)) >= 0;
+  }
+
+  reserveHostRegion(pid: number, len: number): number {
+    const reserveHostRegionFn = this.kernelInstance!.exports.kernel_reserve_host_region as
+      ((pid: number, len: KernelPointer) => KernelPointer) | undefined;
+    if (!reserveHostRegionFn) {
+      throw new Error(
+        "Kernel export kernel_reserve_host_region is required for dynamic pthread control slots",
+      );
+    }
+    const addr = reserveHostRegionFn(pid, this.toKernelPtr(len));
+    const n = typeof addr === "bigint" ? Number(addr) : addr;
+    if (!Number.isSafeInteger(n) || n < 0 || (n >>> 0) === 0xffffffff) {
+      throw new Error(`failed to reserve ${len} bytes of pthread control memory for pid=${pid}`);
+    }
+    return n;
+  }
+
+  reserveHostRegionAt(pid: number, addr: number, len: number): number {
+    const reserveHostRegionAtFn = this.kernelInstance!.exports.kernel_reserve_host_region_at as
+      ((pid: number, addr: KernelPointer, len: KernelPointer) => KernelPointer) | undefined;
+    if (!reserveHostRegionAtFn) {
+      throw new Error(
+        "Kernel export kernel_reserve_host_region_at is required for fork-from-pthread control slots",
+      );
+    }
+    const reserved = reserveHostRegionAtFn(
+      pid,
+      this.toKernelPtr(addr),
+      this.toKernelPtr(len),
+    );
+    const n = typeof reserved === "bigint" ? Number(reserved) : reserved;
+    if (!Number.isSafeInteger(n) || n < 0 || (n >>> 0) === 0xffffffff || n !== addr) {
+      throw new Error(
+        `failed to reserve pthread control memory at 0x${addr.toString(16)} ` +
+          `for pid=${pid}`,
+      );
+    }
+    return n;
   }
 
   private highControlFloorForProcess(pid: number): number | null {
     const registration = this.processes.get(pid);
     if (!registration) return null;
+    if (registration.explicitMaxAddr) return null;
     let floor: number | null = null;
     for (const ch of registration.channels) {
       const tlsPageAddr = ch.channelOffset - 2 * WASM_PAGE_SIZE;
@@ -7104,16 +7307,16 @@ export class CentralizedKernelWorker {
    * worker can issue its first syscall.
    *
    * Accepts `bigint` (preferred — what `extractHeapBase` returns) or
-   * `number`. The kernel runs in wasm64 so the export takes a `usize`,
-   * which is `bigint` on the JS side.
+   * `number`. The kernel export takes a `usize`, whose JS representation
+   * depends on the kernel wasm pointer width.
    */
   setBrkBase(pid: number, addr: bigint | number): boolean {
     const setBrkBaseFn = this.kernelInstance!.exports.kernel_set_brk_base as
-      ((pid: number, addr: bigint) => number) | undefined;
+      ((pid: number, addr: KernelPointer) => number) | undefined;
     if (!setBrkBaseFn) {
       return false;
     }
-    return setBrkBaseFn(pid, typeof addr === "bigint" ? addr : BigInt(addr)) >= 0;
+    return setBrkBaseFn(pid, this.toKernelPtr(addr)) >= 0;
   }
 
   /** Get the underlying kernel instance for direct access. */
@@ -7356,10 +7559,10 @@ export class CentralizedKernelWorker {
       pid: number, fd: number, a: number, b: number, c: number, d: number, port: number,
     ) => number;
     const pipeWrite = exports.kernel_pipe_write as (
-      pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number,
+      pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number,
     ) => number;
     const pipeRead = exports.kernel_pipe_read as (
-      pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number,
+      pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number,
     ) => number;
     const pipeIsWriteOpen = exports.kernel_pipe_is_write_open as (
       pid: number, pipeIdx: number,
@@ -7457,7 +7660,7 @@ export class CentralizedKernelWorker {
    * written.
    */
   private writePipeChunked(
-    pipeWrite: (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number,
+    pipeWrite: (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number,
     pid: number,
     pipeIdx: number,
     data: Uint8Array,
@@ -7470,7 +7673,7 @@ export class CentralizedKernelWorker {
       // Re-acquire view each iteration — memory.grow can detach the buffer.
       const mem = this.getKernelMem();
       mem.set(data.subarray(written, written + chunk), scratchOffset);
-      const n = pipeWrite(pid, pipeIdx, BigInt(scratchOffset), chunk);
+      const n = pipeWrite(pid, pipeIdx, this.toKernelPtr(scratchOffset), chunk);
       if (n <= 0) break;
       written += n;
     }
@@ -7486,7 +7689,7 @@ export class CentralizedKernelWorker {
     pid: number,
     sendPipeIdx: number,
     recvPipeIdx: number,
-    pipeRead: (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number,
+    pipeRead: (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number,
     pipeIsWriteOpen: (pid: number, pipeIdx: number) => number,
     pipeCloseRead: (pid: number, pipeIdx: number) => number,
     pipeCloseWrite: (pid: number, pipeIdx: number) => number,
@@ -7517,7 +7720,7 @@ export class CentralizedKernelWorker {
         // Drain whatever is currently in the pipe.
         let gotData = false;
         for (;;) {
-          const n = pipeRead(pid, sendPipeIdx, BigInt(scratchOffset), PAGE);
+          const n = pipeRead(pid, sendPipeIdx, this.toKernelPtr(scratchOffset), PAGE);
           if (n <= 0) break;
           gotData = true;
           const mem = this.getKernelMem();
@@ -7588,15 +7791,14 @@ export class CentralizedKernelWorker {
 
     // The injected pipes live in the global pipe table (see
     // kernel_inject_connection in crates/kernel/src/wasm_api.rs). Pass
-    // pid=0 to the kernel pipe APIs as a sentinel meaning "use the
-    // global pipe table" — needed because any process sharing the
-    // listener can accept this connection, so the pipes can't live in
-    // a single process's per-pid pipe table.
+    // pid=0 to the legacy kernel pipe APIs as a compatibility sentinel.
+    // The APIs now always resolve pipe indexes through the global pipe table,
+    // which lets any process sharing the listener accept this connection.
     const GLOBAL_PIPE_PID = 0;
     const pipeWrite = this.kernelInstance!.exports.kernel_pipe_write as
-      (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number;
+      (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number;
     const pipeRead = this.kernelInstance!.exports.kernel_pipe_read as
-      (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number;
+      (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number;
     const pipeCloseWrite = this.kernelInstance!.exports.kernel_pipe_close_write as
       (pid: number, pipeIdx: number) => number;
     const pipeCloseRead = this.kernelInstance!.exports.kernel_pipe_close_read as
@@ -7622,7 +7824,7 @@ export class CentralizedKernelWorker {
         const chunk = inboundQueue[0]!;
         const toWrite = Math.min(chunk.length, 65536);
         mem.set(chunk.subarray(0, toWrite), scratchOffset);
-        const written = pipeWrite(GLOBAL_PIPE_PID, recvPipeIdx, BigInt(scratchOffset), toWrite);
+        const written = pipeWrite(GLOBAL_PIPE_PID, recvPipeIdx, this.toKernelPtr(scratchOffset), toWrite);
         if (written <= 0) break; // Pipe full, retry next pump
         if (written >= chunk.length) {
           inboundQueue.shift();
@@ -7643,7 +7845,7 @@ export class CentralizedKernelWorker {
       // Responses larger than 65KB (e.g. 662KB site-editor.php) need
       // multiple reads to fully transfer.
       for (;;) {
-        const readN = pipeRead(GLOBAL_PIPE_PID, sendPipeIdx, BigInt(scratchOffset), 65536);
+        const readN = pipeRead(GLOBAL_PIPE_PID, sendPipeIdx, this.toKernelPtr(scratchOffset), 65536);
         if (readN <= 0) break;
         totalRead += readN;
         const outData = Buffer.from(mem.slice(scratchOffset, scratchOffset + readN));
@@ -7782,9 +7984,9 @@ export class CentralizedKernelWorker {
     const sendPipeIdx = recvPipeIdx + 1;
     const GLOBAL_PIPE_PID = 0;
     const pipeWrite = this.kernelInstance.exports.kernel_pipe_write as
-      (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number;
+      (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number;
     const pipeRead = this.kernelInstance.exports.kernel_pipe_read as
-      (pid: number, pipeIdx: number, bufPtr: bigint, bufLen: number) => number;
+      (pid: number, pipeIdx: number, bufPtr: KernelPointer, bufLen: number) => number;
     const pipeCloseWrite = this.kernelInstance.exports.kernel_pipe_close_write as
       (pid: number, pipeIdx: number) => number;
     const pipeCloseRead = this.kernelInstance.exports.kernel_pipe_close_read as
@@ -7834,7 +8036,7 @@ export class CentralizedKernelWorker {
     const drainOutbound = () => {
       const mem = this.getKernelMem();
       for (;;) {
-        const n = pipeRead(GLOBAL_PIPE_PID, sendPipeIdx, BigInt(scratchOffset), 65536);
+        const n = pipeRead(GLOBAL_PIPE_PID, sendPipeIdx, this.toKernelPtr(scratchOffset), 65536);
         if (n <= 0) break;
         try {
           peer.send(mem.slice(scratchOffset, scratchOffset + n), 0);
@@ -7890,7 +8092,7 @@ export class CentralizedKernelWorker {
       ((pid: number,
         dstA: number, dstB: number, dstC: number, dstD: number, dstPort: number,
         srcA: number, srcB: number, srcC: number, srcD: number, srcPort: number,
-        dataPtr: bigint, dataLen: number) => number) | undefined;
+        dataPtr: KernelPointer, dataLen: number) => number) | undefined;
     if (!injectDatagram) return 38; // ENOSYS
 
     const scratchOffset = this.tcpScratchOffset;
@@ -7908,7 +8110,7 @@ export class CentralizedKernelWorker {
       datagram.srcAddr[2] ?? 0,
       datagram.srcAddr[3] ?? 0,
       datagram.srcPort,
-      BigInt(scratchOffset),
+      this.toKernelPtr(scratchOffset),
       datagram.data.length,
     );
     if (result < 0) return -result;
@@ -7979,7 +8181,7 @@ export class CentralizedKernelWorker {
     const SETALL = 17;
 
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
-    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: bigint, pid: number) => number;
+    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: KernelPointer, pid: number) => number;
     const kernelMem = this.getKernelMem();
     const dataStart = this.scratchOffset + CH_DATA;
 
@@ -7996,7 +8198,7 @@ export class CentralizedKernelWorker {
 
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
-      try { handleChannel(BigInt(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
+      try { handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
 
       const retVal = Number(kernelView.getBigInt64(CH_RETURN, true));
       if (retVal >= 0) {
@@ -8023,7 +8225,7 @@ export class CentralizedKernelWorker {
 
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
-      try { handleChannel(BigInt(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
+      try { handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
 
       const retVal = Number(kernelView.getBigInt64(CH_RETURN, true));
       if (retVal >= 0) {
@@ -8052,7 +8254,7 @@ export class CentralizedKernelWorker {
 
       this.currentHandlePid = channel.pid;
       this.bindKernelTidForChannel(channel);
-      try { handleChannel(BigInt(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
+      try { handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
 
       const retVal = Number(kernelView.getBigInt64(CH_RETURN, true));
       this.completeChannelRaw(channel, retVal, retVal < 0 ? -retVal : 0);
@@ -8072,7 +8274,7 @@ export class CentralizedKernelWorker {
 
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
-    try { handleChannel(BigInt(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
+    try { handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid); } finally { this.currentHandlePid = 0; }
 
     const retVal = Number(kernelView.getBigInt64(CH_RETURN, true));
     this.completeChannelRaw(channel, retVal, retVal < 0 ? -retVal : 0);
@@ -8106,11 +8308,11 @@ export class CentralizedKernelWorker {
     kernelView.setBigInt64(CH_ARGS + 4 * CH_ARG_SIZE, BigInt(-1), true);         // fd = -1
     kernelView.setBigInt64(CH_ARGS + 5 * CH_ARG_SIZE, BigInt(0), true);          // offset = 0
 
-    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: bigint, pid: number) => number;
+    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: KernelPointer, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
     try {
-      handleChannel(BigInt(this.scratchOffset), channel.pid);
+      handleChannel(this.toKernelPtr(this.scratchOffset), channel.pid);
     } catch (err) {
       console.error(`[handleIpcShmat] mmap failed for pid=${channel.pid}:`, err);
       this.completeChannelRaw(channel, -12, 12); // ENOMEM
@@ -8131,7 +8333,8 @@ export class CentralizedKernelWorker {
     this.ensureProcessMemoryCovers(channel.pid, channel.memory, SYS_MMAP, addr, [0, size, 3, 0x22, -1, 0]);
 
     // Transfer segment data from kernel to process memory via read_chunk
-    const readChunk = this.kernelInstance!.exports.kernel_ipc_shm_read_chunk as (shmid: number, offset: number, outPtr: bigint, maxLen: number) => number;
+    const readChunk = this.kernelInstance!.exports.kernel_ipc_shm_read_chunk as
+      (shmid: number, offset: number, outPtr: KernelPointer, maxLen: number) => number;
     const processMem = new Uint8Array(channel.memory.buffer);
     const kernelMem = this.getKernelMem();
     const chunkSize = CH_DATA_SIZE;
@@ -8140,7 +8343,7 @@ export class CentralizedKernelWorker {
     while (transferred < size) {
       const remaining = size - transferred;
       const toRead = Math.min(remaining, chunkSize);
-      const nRead = readChunk(shmid, transferred, BigInt(chunkPtr), toRead);
+      const nRead = readChunk(shmid, transferred, this.toKernelPtr(chunkPtr), toRead);
       if (nRead <= 0) break;
       processMem.set(kernelMem.subarray(chunkPtr, chunkPtr + nRead), (addr >>> 0) + transferred);
       transferred += nRead;
@@ -8179,7 +8382,8 @@ export class CentralizedKernelWorker {
     if (setCurrentPid) setCurrentPid(channel.pid);
 
     // Sync process memory back to kernel segment via write_chunk
-    const writeChunk = this.kernelInstance!.exports.kernel_ipc_shm_write_chunk as (shmid: number, offset: number, dataPtr: bigint, dataLen: number) => number;
+    const writeChunk = this.kernelInstance!.exports.kernel_ipc_shm_write_chunk as
+      (shmid: number, offset: number, dataPtr: KernelPointer, dataLen: number) => number;
     const processMem = new Uint8Array(channel.memory.buffer);
     const kernelMem = this.getKernelMem();
     const chunkSize = CH_DATA_SIZE;
@@ -8189,7 +8393,7 @@ export class CentralizedKernelWorker {
       const remaining = mapping.size - transferred;
       const toWrite = Math.min(remaining, chunkSize);
       kernelMem.set(processMem.subarray(addr + transferred, addr + transferred + toWrite), chunkPtr);
-      const nWritten = writeChunk(mapping.segId, transferred, BigInt(chunkPtr), toWrite);
+      const nWritten = writeChunk(mapping.segId, transferred, this.toKernelPtr(chunkPtr), toWrite);
       if (nWritten <= 0) break;
       transferred += nWritten;
     }
@@ -8219,18 +8423,162 @@ export class CentralizedKernelWorker {
    */
   private drainMqueueNotification(): void {
     const drain = this.kernelInstance!.exports
-      .kernel_mq_drain_notification as ((outPtr: bigint) => number) | undefined;
+      .kernel_mq_drain_notification as ((outPtr: KernelPointer) => number) | undefined;
     if (!drain) return;
 
     // Use kernel scratch as output buffer for (pid: u32, signo: u32)
     const outOffset = this.scratchOffset;
-    const hasPending = drain(BigInt(outOffset));
+    const hasPending = drain(this.toKernelPtr(outOffset));
     if (hasPending) {
       const dv = new DataView(this.kernelMemory!.buffer, outOffset);
       const pid = dv.getUint32(0, true);
       const signo = dv.getUint32(4, true);
       if (signo > 0) {
         this.sendSignalToProcess(pid, signo);
+      }
+    }
+  }
+
+  // ---- DRI/KMS presenter wiring ------------------------------------------
+
+  /** Live `/dev/dri/renderD128` GBM bos. Pixel storage for a bound bo
+   *  lives in the owning process's wasm Memory at the binding range;
+   *  consumers read pixels by projecting `[addr, addr+len)` onto the
+   *  SAB returned by `getProcessMemory(pid)`. */
+  get bos() {
+    return this.kernel.bos;
+  }
+
+  get gl() {
+    return this.kernel.gl;
+  }
+
+  get kms() {
+    return this.kernel.kms;
+  }
+
+  /** Register an `OffscreenCanvas` (and optional stats SAB) as the
+   *  scanout target for a CRTC. Starts the vblank pump on first
+   *  attach.
+   *
+   *  `opts.mode` selects how the canvas is painted:
+   *  - `"auto"` (default): the pump never grabs a 2D context. If the
+   *    DRM-master pid later calls `eglCreateContext`, the GL bridge's
+   *    auto-attach path claims the canvas for WebGL2 and the user
+   *    program paints directly. Slots 5/6 (commit count, last µs)
+   *    still tick from kernel-side PAGE_FLIP state.
+   *  - `"2d"`: legacy CPU-blit path. The pump eagerly grabs 2D here
+   *    and copies the kernel's scanout BO into the canvas each frame.
+   *    Used by demos that render into the FB via memcpy rather than GL.
+   *  - `"webgl2"`: marks the canvas as GL-owned up front. Pump never
+   *    blits. Same effect as auto + a later `markKmsCanvasGlOwned`,
+   *    but spares the GL bridge from racing the pump's 2D acquisition. */
+  attachKmsCanvas(
+    crtc_id: number,
+    canvas: OffscreenCanvas,
+    statsSab?: SharedArrayBuffer,
+    opts?: { mode?: "auto" | "2d" | "webgl2" },
+  ): void {
+    this.kmsCanvases.set(crtc_id, canvas);
+    if (statsSab) this.kmsStatsViews.set(crtc_id, new Int32Array(statsSab));
+    const mode = opts?.mode ?? "auto";
+    if (mode === "2d") {
+      // Eagerly acquire 2D so the first tickVblank can blit without a
+      // round-trip. If acquisition fails (some other path already
+      // claimed the canvas), the pump will skip the blit branch and
+      // slots 0/1/4 stay 0 — better than throwing.
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        this.kmsContexts.set(crtc_id, ctx);
+        this.kmsContextMode.set(crtc_id, "2d");
+      }
+    } else if (mode === "webgl2") {
+      this.kmsContextMode.set(crtc_id, "webgl2");
+    }
+    this.startVblankPump();
+  }
+
+  /** Attach a stats SAB for a CRTC without registering a scanout canvas.
+   *  Slots 5/6 (kernel commit count + last-frame µs) are populated by
+   *  the vblank pump regardless of whether the same crtc owns a blit
+   *  target. Used by demos that render through the GL bridge while
+   *  still driving real `drmModePageFlip` ioctls. */
+  attachKmsStats(crtc_id: number, statsSab: SharedArrayBuffer): void {
+    this.kmsStatsViews.set(crtc_id, new Int32Array(statsSab));
+    this.startVblankPump();
+  }
+
+  private startVblankPump(): void {
+    if (this.vblankTimer) return;
+    this.vblankTimer = setInterval(() => this.tickVblank(), 1000 / 60);
+    // Node only: prevent the pump from blocking process exit.
+    (this.vblankTimer as { unref?: () => void }).unref?.();
+  }
+
+  private tickVblank(): void {
+    const vblankFn = this.kernelInstance?.exports.kernel_vblank as
+      (() => void) | undefined;
+    vblankFn?.();
+    // 2D-blit path. Runs only for CRTCs the embedder explicitly opted
+    // into `mode: "2d"`. The pump never touches the canvas in "auto"
+    // or "webgl2" mode — touching it with `getContext("2d")` would
+    // claim the canvas for life and break the later WebGL2 attach
+    // (an OffscreenCanvas can only hold one context type ever).
+    for (const [crtc_id, canvas] of this.kmsCanvases) {
+      if (this.kmsContextMode.get(crtc_id) !== "2d") continue;
+      const fb = this.kernel.kms.currentFb(crtc_id);
+      if (!fb) continue;
+      const pixels = this.kernel.kms.scanoutBytes(crtc_id);
+      if (!pixels) continue;
+      const ctx = this.kmsContexts.get(crtc_id);
+      if (!ctx) continue;
+      if (canvas.width !== fb.width || canvas.height !== fb.height) {
+        canvas.width = fb.width;
+        canvas.height = fb.height;
+      }
+      // bo bytes are opaque RGBA8888 — one memcpy into a cached
+      // Uint8ClampedArray is all the pump owes the canvas.
+      const blitStart = performance.now();
+      const need = fb.width * fb.height * 4;
+      let scratch = this.kmsScratchBytes.get(crtc_id);
+      if (!scratch || scratch.byteLength !== need) {
+        scratch = new Uint8ClampedArray(new ArrayBuffer(need)) as Uint8ClampedArray<ArrayBuffer>;
+        this.kmsScratchBytes.set(crtc_id, scratch);
+      }
+      scratch.set(pixels);
+      ctx.putImageData(new ImageData(scratch, fb.width, fb.height), 0, 0);
+      const blitUs = ((performance.now() - blitStart) * 1000) | 0;
+      const stats = this.kmsStatsViews.get(crtc_id);
+      if (stats) {
+        Atomics.add(stats, 0, 1);
+        Atomics.store(stats, 1, performance.now() | 0);
+        Atomics.store(stats, 4, blitUs);
+      }
+    }
+
+    // Slots 2/3 (scanout width/height) and 5/6 (kernel-side PAGE_FLIP
+    // commit count, last frame µs) are populated for every CRTC with
+    // a stats SAB, regardless of the canvas-owner mode. Slots 2/3
+    // sourced from the kernel's current FB so embedders (e.g. the
+    // Modeset React pane) can detect "scanout active" without
+    // depending on the 2D-blit path. Slots 5/6 reflect kernel-side
+    // ioctls — independent of the 60 Hz blit loop above.
+    if (this.kmsStatsViews.size > 0) {
+      const exports = this.kernelInstance?.exports as
+        | { kernel_kms_commit_count?: (id: number) => bigint;
+            kernel_kms_last_frame_us?: (id: number) => bigint }
+        | undefined;
+      for (const [crtc_id, stats] of this.kmsStatsViews) {
+        const fb = this.kernel.kms.currentFb(crtc_id);
+        if (fb) {
+          Atomics.store(stats, 2, fb.width);
+          Atomics.store(stats, 3, fb.height);
+        }
+        if (stats.length < 7) continue;
+        const commits = exports?.kernel_kms_commit_count?.(crtc_id) ?? 0n;
+        const lastUs = exports?.kernel_kms_last_frame_us?.(crtc_id) ?? 0n;
+        Atomics.store(stats, 5, Number(commits & 0x7fffffffn));
+        Atomics.store(stats, 6, Number(lastUs & 0x7fffffffn));
       }
     }
   }

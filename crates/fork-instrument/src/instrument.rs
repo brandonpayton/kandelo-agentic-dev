@@ -22,8 +22,8 @@
 //!   ;; --- PREAMBLE (runs only when state == REWINDING) ---
 //!   (if (i32.eq (global.get $_wpk_fork_state) (i32.const 2))
 //!     (then
-//!       ;; pop frame from save buffer, restore locals, call_idx,
-//!       ;; catch_region_id, exnref_slot, arg-spill locals
+//!       ;; pop frame from save buffer, then restore catch_region_id,
+//!       ;; exnref_slot, scalar locals, and arg-spill locals
 //!     ))
 //!
 //!   ;; --- DISPATCH + WRAPPER + NESTED POST LABELS ---
@@ -34,7 +34,7 @@
 //!           (block $dispatch_normal
 //!             (if (i32.eq (global.get $_wpk_fork_state) (i32.const 2))
 //!               (then
-//!                 (local.get $call_idx_local)
+//!                 ;; load frame.call_index from *(buf + 0)
 //!                 (br_table $POST_0 $POST_1 ... $POST_{N-1} $unwind_save)))
 //!             ;; NORMAL: fall through out of $dispatch_normal
 //!           )
@@ -44,9 +44,10 @@
 //!         <reload args for call 0>
 //!         (call $callee_0)           ;; or call_indirect
 //!         <Phase 6e: set catch_region_id_local / exnref_slot_local>
-//!         (local.set $call_idx_local (i32.const 0))
 //!         (global.get $_wpk_fork_state) (i32.const 1) (i32.eq)
-//!         (br_if $unwind_save)        ;; propagate UNWINDING
+//!         (if (then
+//!           ;; frame.call_index = 0
+//!           (br $unwind_save)))       ;; propagate UNWINDING
 //!         <chunk 1>
 //!         <spill args for call 1>
 //!       )  ;; end $POST_1
@@ -55,17 +56,17 @@
 //!     <reload args for call N-1>
 //!     (call $callee_{N-1})
 //!     <Phase 6e>
-//!     (local.set $call_idx_local (i32.const N-1))
-//!     (br_if $unwind_save if UNWINDING)
+//!     (if state == UNWINDING:
+//!       frame.call_index = N-1
+//!       br $unwind_save)
 //!     <chunk N: tail>
 //!     (return)                       ;; normal-path exit
 //!   )  ;; end $unwind_save — br target for UNWINDING propagation
 //!
 //!   ;; --- POSTAMBLE (runs only when branched-to via br $unwind_save) ---
-//!   ;; push frame header (func_index, call_index, catch_region_id,
-//!   ;; exnref_slot), save scalar user locals, save arg-spill locals,
-//!   ;; spill ref-typed user locals to aux tables, advance current_pos,
-//!   ;; push defaults for the function's result types
+//!   ;; push frame header fields except call_index, save scalar user locals,
+//!   ;; save arg-spill locals, spill ref-typed user locals to aux tables,
+//!   ;; advance current_pos, push defaults for the function's result types
 //! )
 //! ```
 //!
@@ -113,10 +114,10 @@
 use std::collections::{HashMap, HashSet};
 
 use walrus::{
-    AbstractHeapType, FunctionId, FunctionKind, GlobalId, HeapType, LocalFunction, LocalId,
-    MemoryId, Module, RefType, TableId, TagId, TypeId, ValType,
+    AbstractHeapType, FunctionId, FunctionKind, HeapType, LocalFunction, LocalId, MemoryId,
+    Module, RefType, TableId, TagId, TypeId, ValType,
     ir::{
-        AtomicWidth, BinaryOp, Binop, Block, Br, BrIf, BrTable, Call, CallIndirect, Const,
+        AtomicWidth, BinaryOp, Binop, Block, Br, BrTable, Call, CallIndirect, Const,
         GlobalGet, IfElse, Instr, InstrLocId, InstrSeqId, InstrSeqType, LegacyCatch, LoadKind,
         LocalGet, LocalSet, LocalTee, Loop, MemArg, RefAsNonNull, RefIsNull, RefNull, Return,
         StoreKind, TableGet, TableSet, Throw, ThrowRef, TryTable, TryTableCatch, UnaryOp,
@@ -207,6 +208,12 @@ struct CallSiteInfo {
     target: CallTarget,
     sig_ty: TypeId,
     loc: InstrLocId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CatchStateLocals {
+    catch_region_id: LocalId,
+    exnref_slot: LocalId,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -408,10 +415,14 @@ fn instrument_one_function_switch(
     let n_calls = call_sites.len();
 
     // Allocate per-function synthetic locals.
-    let call_idx_local = module.locals.add(ValType::I32);
-    let frame_ptr_local = module.locals.add(runtime.buf_type);
-    let catch_region_id_local = module.locals.add(ValType::I32);
-    let exnref_slot_local = module.locals.add(ValType::I32);
+    let catch_state_locals = if catch_plan.is_empty() && b1_slots.is_empty() {
+        None
+    } else {
+        Some(CatchStateLocals {
+            catch_region_id: module.locals.add(ValType::I32),
+            exnref_slot: module.locals.add(ValType::I32),
+        })
+    };
 
     // Per-call arg-spill locals. Allocating them up front — before any
     // IR mutation — lets the frame layout see them as user-visible
@@ -491,12 +502,14 @@ fn instrument_one_function_switch(
     // try_table body. Phase 6 covers catch_ref / catch_all_ref.
     // B1 Stage 2 (Task 2.3) extends the same stub with a plain-catch
     // dispatch when `b1_slots` lists arms for the region.
-    if aux_tables.exnref.is_some() {
+    if !catch_plan.is_empty() && aux_tables.exnref.is_some() {
+        let catch_state =
+            catch_state_locals.expect("exnref catch plan requires catch-state locals");
         inject_rewind_throw_stubs(
             module,
             func_id,
             runtime,
-            catch_region_id_local,
+            catch_state.catch_region_id,
             aux_tables,
             catch_plan,
             b1_slots,
@@ -522,21 +535,13 @@ fn instrument_one_function_switch(
         .dangling_instr_seq(InstrSeqType::Simple(None))
         .id();
 
-    // Build POST_K blocks (one per call) and the dispatch block.
+    // POST_K + function-level `$unwind_save`. Dispatch-tree
+    // `$dispatch_normal` / `$node_dispatch` are allocated by
+    // `populate_dispatch_structure`.
     let unwind_save = local
         .builder_mut()
         .dangling_instr_seq(InstrSeqType::Simple(None))
         .id();
-    let dispatch_normal = if n_calls > 0 {
-        Some(
-            local
-                .builder_mut()
-                .dangling_instr_seq(InstrSeqType::Simple(None))
-                .id(),
-        )
-    } else {
-        None
-    };
     let post_seqs: Vec<InstrSeqId> = (0..n_calls)
         .map(|_| {
             local
@@ -553,44 +558,26 @@ fn instrument_one_function_switch(
         runtime,
         memory,
         ptr_ty,
-        frame_ptr_local,
-        call_idx_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         &locals_with_offsets,
         ref_plan,
         aux_tables,
         frame_size,
     );
 
-    // Populate $dispatch_normal: state==REWIND → br_table to POST_K.
-    if let Some(dn) = dispatch_normal {
-        populate_dispatch_normal(
-            local,
-            dn,
-            runtime,
-            call_idx_local,
-            &post_seqs,
-            unwind_save,
-        );
-    }
-
-    // Populate POST_K blocks and the chain of "post-call" sequences
-    // that follow their closes.
     populate_dispatch_structure(
         local,
         unwind_save,
-        dispatch_normal,
         &post_seqs,
         &chunks,
         &call_sites,
         &arg_spills,
         &carryover_spills,
         &catch_handlers,
-        runtime.state_global,
-        call_idx_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        runtime,
+        memory,
+        ptr_ty,
+        catch_state_locals,
     );
 
     // Postamble lives outside $unwind_save, in the entry block, right
@@ -602,10 +589,7 @@ fn instrument_one_function_switch(
         runtime,
         memory,
         ptr_ty,
-        frame_ptr_local,
-        call_idx_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         &locals_with_offsets,
         ref_plan,
         aux_tables,
@@ -651,15 +635,19 @@ fn instrument_one_function_switch(
     // captures intercept plain catch dispatch so the operand tuple
     // can be saved at unwind time. Runs AFTER Phase 6 so it finds
     // try_tables at their post-Phase-6 locations.
-    apply_plain_catch_handlers(
-        module,
-        func_id,
-        runtime,
-        catch_region_id_local,
-        b1_slots,
-        catch_plan,
-        &catch_handlers,
-    );
+    if let Some(catch_state) = catch_state_locals {
+        apply_plain_catch_handlers(
+            module,
+            func_id,
+            runtime,
+            catch_state.catch_region_id,
+            b1_slots,
+            catch_plan,
+            &catch_handlers,
+        );
+    } else {
+        debug_assert!(b1_slots.is_empty());
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1723,15 +1711,182 @@ fn call_arg_types(module: &Module, cs: &CallSiteInfo) -> Vec<ValType> {
 // Dispatch-structure emission
 // ----------------------------------------------------------------------
 
+/// Leaf size for the recursive bucketed dispatch. Each leaf handles at
+/// most this many fork-path call sites; deeper levels recurse with the
+/// same bucket size. With `BUCKET_SIZE = 32`, depth stays bounded for
+/// production binaries with thousands of fork-path calls per dispatcher (see
+/// `docs/plans/2026-06-05-fork-instrument-recursive-bucketing-plan.md`).
+pub const BUCKET_SIZE: usize = 32;
+
+/// Static partition of `[0, n_calls)` into buckets handled by the
+/// recursive dispatch. Built before any IR emission so the topology
+/// (depths, span constants, child counts) is known up front and the
+/// emit step can recurse without surprises.
+///
+/// Invariants:
+/// - `Leaf { start, end }` covers `end - start` consecutive call sites,
+///   with `1 <= end - start <= BUCKET_SIZE`. The leaf inherits the
+///   single-leaf emission shape from `emit_leaf_dispatch`.
+/// - `Internal { children, span_per_child }` partitions a contiguous
+///   call-site range into `children.len()` consecutive sub-ranges, each
+///   of length `span_per_child` except possibly the last (which may be
+///   smaller). `span_per_child` is a power of `BUCKET_SIZE` baked into
+///   the dispatch wat as an i32 divisor at emit time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchTree {
+    Leaf {
+        start: usize,
+        end: usize,
+    },
+    Internal {
+        children: Vec<DispatchTree>,
+        span_per_child: usize,
+    },
+}
+
+impl DispatchTree {
+    /// Maximum walker depth this subtree contributes, measured the same
+    /// way as `tests/large_dispatcher.rs::max_nesting_depth`: every
+    /// `Block`/`Loop`/`IfElse`/`TryTable` walked into adds one level.
+    ///
+    /// For a leaf placed at the function root (its outermost block is
+    /// the function-level `$unwind_save`), this yields the absolute
+    /// walker depth at the deepest IfElse consequent inside the
+    /// dispatch. For a subtree nested inside an internal node's
+    /// `$child_K` slot, the same value still bounds the subtree's
+    /// internal depth — the surrounding `$child_K` blocks of the
+    /// parent are accounted for in the parent's own `max_depth`.
+    ///
+    /// Recurrence:
+    /// - Leaf with `n` calls: `n + 3` (one block per `$POST_K`, plus
+    ///   `$unwind_save`, `$dispatch_normal`, and the REWIND IfElse
+    ///   consequent).
+    /// - Internal with `B` children: the deepest path runs either
+    ///   through the dispatch IfElse (`$node_exit` → `$child_*` chain
+    ///   → `$node_dispatch` → IfElse, depth `B + 3`) or through a
+    ///   child. Child K sits at `$child_K` which is opened at walker
+    ///   depth `B - K + 1` from `$node_exit`; the child's own
+    ///   emission shares that block as its outermost, contributing
+    ///   `max_depth(C_K) - 1` further levels on top. So child K's
+    ///   contribution is `B - K + max_depth(C_K)`. Because
+    ///   `$child_0` sits at the deepest slot (depth `B + 1`), child 0
+    ///   typically dominates for balanced subtrees; the max formula
+    ///   stays safe for any partition.
+    ///
+    /// Used by `tests/dispatch_tree.rs` to verify the
+    /// `O(M · log_M(N))` depth invariant.
+    pub fn max_depth(&self) -> usize {
+        match self {
+            DispatchTree::Leaf { start, end } => (end - start) + 3,
+            DispatchTree::Internal { children, .. } => {
+                let b = children.len();
+                let deepest_child_path = children
+                    .iter()
+                    .enumerate()
+                    .map(|(k, c)| (b - k) + c.max_depth())
+                    .max()
+                    .expect("Internal node must have at least one child");
+                deepest_child_path.max(b + 3)
+            }
+        }
+    }
+
+    /// First call-site index covered by this subtree.
+    pub fn start(&self) -> usize {
+        match self {
+            DispatchTree::Leaf { start, .. } => *start,
+            DispatchTree::Internal { children, .. } => {
+                children.first().expect("non-empty Internal").start()
+            }
+        }
+    }
+
+    /// One past the last call-site index covered by this subtree.
+    pub fn end(&self) -> usize {
+        match self {
+            DispatchTree::Leaf { end, .. } => *end,
+            DispatchTree::Internal { children, .. } => {
+                children.last().expect("non-empty Internal").end()
+            }
+        }
+    }
+}
+
+/// Partition `[0, n_calls)` into a balanced dispatch tree with leaf
+/// bucket size `bucket_size`.
+///
+/// - `n_calls == 0` → returns the degenerate empty leaf `Leaf { 0, 0 }`.
+///   The caller (`populate_dispatch_structure`) handles the zero-call
+///   case directly and never asks for the tree, but the constructor
+///   stays total to keep property tests simple.
+/// - `n_calls <= bucket_size` → a single `Leaf { 0, n_calls }`. **No
+///   diff from the pre-bucketing single-leaf code path**: existing
+///   binaries (almost all real cases) emit the exact same IR.
+/// - Otherwise → an `Internal` whose `span_per_child` is the largest
+///   power of `bucket_size` that is strictly less than `n_calls`, with
+///   children built recursively over each sub-range.
+pub fn build_dispatch_tree(n_calls: usize, bucket_size: usize) -> DispatchTree {
+    assert!(bucket_size >= 2, "bucket_size must be >= 2");
+
+    if n_calls <= bucket_size {
+        return DispatchTree::Leaf {
+            start: 0,
+            end: n_calls,
+        };
+    }
+    build_dispatch_tree_range(0, n_calls, bucket_size)
+}
+
+/// Recursive workhorse for `build_dispatch_tree`. Partitions
+/// `[start, end)` with `start < end` into a tree node, choosing the
+/// largest power-of-`bucket_size` span that still yields at least two
+/// children.
+fn build_dispatch_tree_range(start: usize, end: usize, bucket_size: usize) -> DispatchTree {
+    debug_assert!(start < end);
+    let n = end - start;
+    if n <= bucket_size {
+        return DispatchTree::Leaf { start, end };
+    }
+
+    // Find the largest power of `bucket_size` that is < n. This is the
+    // span of each child except possibly the last. For n in (M, M^2],
+    // span = M; for n in (M^2, M^3], span = M^2; etc.
+    let mut span: usize = bucket_size;
+    while span
+        .checked_mul(bucket_size)
+        .map(|next| next < n)
+        .unwrap_or(false)
+    {
+        span *= bucket_size;
+    }
+
+    let mut children = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let child_end = (cursor + span).min(end);
+        children.push(build_dispatch_tree_range(cursor, child_end, bucket_size));
+        cursor = child_end;
+    }
+
+    DispatchTree::Internal {
+        children,
+        span_per_child: span,
+    }
+}
+
+/// On REWIND, br_table to `post_seqs_slice[call_idx - range_start]`.
+/// `range_start == 0` elides the subtraction so a single-leaf
+/// tree emits byte-identical IR to the pre-bucketing code.
 fn populate_dispatch_normal(
     local: &mut LocalFunction,
     dispatch_normal: InstrSeqId,
     runtime: &Runtime,
-    call_idx_local: LocalId,
-    post_seqs: &[InstrSeqId],
-    unwind_save: InstrSeqId,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    post_seqs_slice: &[InstrSeqId],
+    range_start: usize,
+    default_target: InstrSeqId,
 ) {
-    // Inner "if REWINDING then br_table" block.
     let if_then = local
         .builder_mut()
         .dangling_instr_seq(InstrSeqType::Simple(None))
@@ -1743,12 +1898,21 @@ fn populate_dispatch_normal(
 
     {
         let s = &mut local.block_mut(if_then).instrs;
-        push_instr(s, Instr::LocalGet(LocalGet { local: call_idx_local }));
+        push_current_call_index(s, runtime, memory, ptr_ty);
+        if range_start != 0 {
+            push_instr(
+                s,
+                Instr::Const(Const {
+                    value: Value::I32(range_start as i32),
+                }),
+            );
+            push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Sub }));
+        }
         push_instr(
             s,
             Instr::BrTable(BrTable {
-                blocks: post_seqs.to_vec().into_boxed_slice(),
-                default: unwind_save,
+                blocks: post_seqs_slice.to_vec().into_boxed_slice(),
+                default: default_target,
             }),
         );
     }
@@ -1776,25 +1940,98 @@ fn populate_dispatch_normal(
     );
 }
 
-/// Populate the nested `$POST_K` blocks and the "post-call tail" that
-/// follows each one. The structure is built innermost-outward so that
-/// each outer block can reference its inner-block id via
-/// `Instr::Block { seq: inner }`.
+/// On REWIND, br_table to `child_seqs[(call_idx - range_start) /
+/// span_per_child]`. `span_per_child` is always a power of
+/// `BUCKET_SIZE` by construction, so the division is exact at every
+/// bucket boundary.
+fn populate_internal_dispatch(
+    local: &mut LocalFunction,
+    node_dispatch: InstrSeqId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    child_seqs: &[InstrSeqId],
+    range_start: usize,
+    span_per_child: usize,
+    default_target: InstrSeqId,
+) {
+    let if_then = local
+        .builder_mut()
+        .dangling_instr_seq(InstrSeqType::Simple(None))
+        .id();
+    let if_else = local
+        .builder_mut()
+        .dangling_instr_seq(InstrSeqType::Simple(None))
+        .id();
+
+    {
+        let s = &mut local.block_mut(if_then).instrs;
+        push_current_call_index(s, runtime, memory, ptr_ty);
+        if range_start != 0 {
+            push_instr(
+                s,
+                Instr::Const(Const {
+                    value: Value::I32(range_start as i32),
+                }),
+            );
+            push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Sub }));
+        }
+        push_instr(
+            s,
+            Instr::Const(Const {
+                value: Value::I32(span_per_child as i32),
+            }),
+        );
+        push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32DivU }));
+        push_instr(
+            s,
+            Instr::BrTable(BrTable {
+                blocks: child_seqs.to_vec().into_boxed_slice(),
+                default: default_target,
+            }),
+        );
+    }
+
+    let s = &mut local.block_mut(node_dispatch).instrs;
+    push_instr(
+        s,
+        Instr::GlobalGet(GlobalGet {
+            global: runtime.state_global,
+        }),
+    );
+    push_instr(
+        s,
+        Instr::Const(Const {
+            value: Value::I32(runtime::STATE_REWINDING),
+        }),
+    );
+    push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Eq }));
+    push_instr(
+        s,
+        Instr::IfElse(IfElse {
+            consequent: if_then,
+            alternative: if_else,
+        }),
+    );
+}
+
+/// Walks a `DispatchTree` built over `n_calls` and emits the bucketed
+/// dispatch IR into `unwind_save`. For `n_calls <= BUCKET_SIZE` this
+/// degenerates to a single leaf matching the pre-bucketing shape.
 #[allow(clippy::too_many_arguments)]
 fn populate_dispatch_structure(
     local: &mut LocalFunction,
     unwind_save: InstrSeqId,
-    dispatch_normal: Option<InstrSeqId>,
     post_seqs: &[InstrSeqId],
     chunks: &[Vec<(Instr, InstrLocId)>],
     call_sites: &[CallSiteInfo],
     arg_spills: &[Vec<LocalId>],
     carryover_spills: &[Vec<LocalId>],
     catch_handlers: &[CatchHandlerInfo],
-    state_global: GlobalId,
-    call_idx_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    catch_state_locals: Option<CatchStateLocals>,
 ) {
     let n_calls = call_sites.len();
 
@@ -1810,25 +2047,272 @@ fn populate_dispatch_structure(
         return;
     }
 
-    // $POST_0 body: [Block($dispatch_normal), chunk 0, spill 0].
+    let tree = build_dispatch_tree(n_calls, BUCKET_SIZE);
+    emit_dispatch_node(
+        local,
+        &tree,
+        unwind_save,
+        unwind_save,
+        true,
+        post_seqs,
+        chunks,
+        call_sites,
+        arg_spills,
+        carryover_spills,
+        catch_handlers,
+        runtime,
+        memory,
+        ptr_ty,
+        catch_state_locals,
+    );
+}
+
+/// Recursive dispatcher over a `DispatchTree` node. Routes leaves to
+/// `emit_leaf_dispatch` and internal nodes to `emit_internal_dispatch`,
+/// threading the function-level `$unwind_save` through every level so
+/// UNWIND propagations always escape the entire tree in a single `br`.
+#[allow(clippy::too_many_arguments)]
+fn emit_dispatch_node(
+    local: &mut LocalFunction,
+    node: &DispatchTree,
+    exit_seq: InstrSeqId,
+    function_unwind_save: InstrSeqId,
+    is_last_overall: bool,
+    post_seqs: &[InstrSeqId],
+    chunks: &[Vec<(Instr, InstrLocId)>],
+    call_sites: &[CallSiteInfo],
+    arg_spills: &[Vec<LocalId>],
+    carryover_spills: &[Vec<LocalId>],
+    catch_handlers: &[CatchHandlerInfo],
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    catch_state_locals: Option<CatchStateLocals>,
+) {
+    match node {
+        DispatchTree::Leaf { start, end } => emit_leaf_dispatch(
+            local,
+            exit_seq,
+            function_unwind_save,
+            *start,
+            *end,
+            is_last_overall,
+            post_seqs,
+            chunks,
+            call_sites,
+            arg_spills,
+            carryover_spills,
+            catch_handlers,
+            runtime,
+            memory,
+            ptr_ty,
+            catch_state_locals,
+        ),
+        DispatchTree::Internal {
+            children,
+            span_per_child,
+        } => emit_internal_dispatch(
+            local,
+            exit_seq,
+            function_unwind_save,
+            is_last_overall,
+            children,
+            *span_per_child,
+            post_seqs,
+            chunks,
+            call_sites,
+            arg_spills,
+            carryover_spills,
+            catch_handlers,
+            runtime,
+            memory,
+            ptr_ty,
+            catch_state_locals,
+        ),
+    }
+}
+
+/// Emit one internal node, `B = children.len()`:
+///
+/// ```text
+/// (block $exit_seq
+///   (block $child_{B-1} ... (block $child_0
+///     (block $node_dispatch ;; REWIND: br_table $child_0..$child_{B-1}
+///     ))
+///     <child 0's emission>     ;; appended into $child_1
+///   ) <child 1's emission> ...
+///   <child B-1's emission>     ;; appended into $exit_seq
+/// )
+/// ```
+///
+/// Each child K's emission is appended into its immediate enclosing
+/// block (`$child_{K+1}`, or `$exit_seq` for K = B-1) after the
+/// `Block($child_K)` opening, so REWIND `br $child_K` lands exactly
+/// where child K's recursive emission begins. `is_last_overall`
+/// flows only to the rightmost child.
+#[allow(clippy::too_many_arguments)]
+fn emit_internal_dispatch(
+    local: &mut LocalFunction,
+    exit_seq: InstrSeqId,
+    function_unwind_save: InstrSeqId,
+    is_last_overall: bool,
+    children: &[DispatchTree],
+    span_per_child: usize,
+    post_seqs: &[InstrSeqId],
+    chunks: &[Vec<(Instr, InstrLocId)>],
+    call_sites: &[CallSiteInfo],
+    arg_spills: &[Vec<LocalId>],
+    carryover_spills: &[Vec<LocalId>],
+    catch_handlers: &[CatchHandlerInfo],
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    catch_state_locals: Option<CatchStateLocals>,
+) {
+    let b = children.len();
+    debug_assert!(b >= 2, "internal dispatch node must have >= 2 children");
+
+    let range_start = children[0].start();
+
+    let node_dispatch = local
+        .builder_mut()
+        .dangling_instr_seq(InstrSeqType::Simple(None))
+        .id();
+    let child_seqs: Vec<InstrSeqId> = (0..b)
+        .map(|_| {
+            local
+                .builder_mut()
+                .dangling_instr_seq(InstrSeqType::Simple(None))
+                .id()
+        })
+        .collect();
+
+    populate_internal_dispatch(
+        local,
+        node_dispatch,
+        runtime,
+        memory,
+        ptr_ty,
+        &child_seqs,
+        range_start,
+        span_per_child,
+        exit_seq,
+    );
+
     {
-        let s = &mut local.block_mut(post_seqs[0]).instrs;
-        if let Some(dn) = dispatch_normal {
-            push_instr(s, Instr::Block(Block { seq: dn }));
-        }
-        for (instr, loc) in &chunks[0] {
-            s.push((instr.clone(), *loc));
-        }
-        emit_spill_args(s, &arg_spills[0], &carryover_spills[0]);
+        let s = &mut local.block_mut(child_seqs[0]).instrs;
+        push_instr(s, Instr::Block(Block { seq: node_dispatch }));
     }
 
-    // $POST_K body for K in 1..n_calls:
-    //   [Block($POST_{K-1}), <post-call sequence for K-1>, chunk K, spill K]
-    for k in 1..n_calls {
-        // Open the nested POST block. Then emit the post-call
-        // sequence for call K-1 via the LocalFunction builder (needed
-        // for Phase 6e's IfElse/dangling seq allocation). Finally
-        // append chunk K and spill K directly.
+    for k in 1..b {
+        {
+            let s = &mut local.block_mut(child_seqs[k]).instrs;
+            push_instr(s, Instr::Block(Block { seq: child_seqs[k - 1] }));
+        }
+        emit_dispatch_node(
+            local,
+            &children[k - 1],
+            child_seqs[k],
+            function_unwind_save,
+            false,
+            post_seqs,
+            chunks,
+            call_sites,
+            arg_spills,
+            carryover_spills,
+            catch_handlers,
+            runtime,
+            memory,
+            ptr_ty,
+            catch_state_locals,
+        );
+    }
+
+    {
+        let s = &mut local.block_mut(exit_seq).instrs;
+        push_instr(s, Instr::Block(Block { seq: child_seqs[b - 1] }));
+    }
+    emit_dispatch_node(
+        local,
+        &children[b - 1],
+        exit_seq,
+        function_unwind_save,
+        is_last_overall,
+        post_seqs,
+        chunks,
+        call_sites,
+        arg_spills,
+        carryover_spills,
+        catch_handlers,
+        runtime,
+        memory,
+        ptr_ty,
+        catch_state_locals,
+    );
+}
+
+/// Emit the `$POST_K` chain for one leaf covering
+/// `call_sites[leaf_start..leaf_end]`. Per-call UNWIND `br_if`s target
+/// `function_unwind_save` so an unwind escapes the whole tree in one
+/// `br`. `is_last_leaf` appends `chunks[n_calls] + Return` to
+/// `exit_seq`; otherwise the leaf hands off the boundary chunk to the
+/// next sibling (see body).
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf_dispatch(
+    local: &mut LocalFunction,
+    exit_seq: InstrSeqId,
+    function_unwind_save: InstrSeqId,
+    leaf_start: usize,
+    leaf_end: usize,
+    is_last_leaf: bool,
+    post_seqs: &[InstrSeqId],
+    chunks: &[Vec<(Instr, InstrLocId)>],
+    call_sites: &[CallSiteInfo],
+    arg_spills: &[Vec<LocalId>],
+    carryover_spills: &[Vec<LocalId>],
+    catch_handlers: &[CatchHandlerInfo],
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    catch_state_locals: Option<CatchStateLocals>,
+) {
+    debug_assert!(
+        leaf_end > leaf_start,
+        "emit_leaf_dispatch must not be called with an empty leaf",
+    );
+    let n_calls_total = call_sites.len();
+
+    let dispatch_normal = local
+        .builder_mut()
+        .dangling_instr_seq(InstrSeqType::Simple(None))
+        .id();
+    populate_dispatch_normal(
+        local,
+        dispatch_normal,
+        runtime,
+        memory,
+        ptr_ty,
+        &post_seqs[leaf_start..leaf_end],
+        leaf_start,
+        function_unwind_save,
+    );
+
+    // Non-first leaves skip chunks[leaf_start] + spills[leaf_start]:
+    // the previous leaf's exit_seq already emitted them as boundary
+    // tail (see end of this function), so re-emitting here would run
+    // the chunk's side effects twice on NORMAL fall-through.
+    {
+        let s = &mut local.block_mut(post_seqs[leaf_start]).instrs;
+        push_instr(s, Instr::Block(Block { seq: dispatch_normal }));
+        if leaf_start == 0 {
+            for (instr, loc) in &chunks[leaf_start] {
+                s.push((instr.clone(), *loc));
+            }
+            emit_spill_args(s, &arg_spills[leaf_start], &carryover_spills[leaf_start]);
+        }
+    }
+
+    for k in (leaf_start + 1)..leaf_end {
         {
             let s = &mut local.block_mut(post_seqs[k]).instrs;
             push_instr(s, Instr::Block(Block { seq: post_seqs[k - 1] }));
@@ -1841,11 +2325,11 @@ fn populate_dispatch_structure(
             &arg_spills[k - 1],
             &carryover_spills[k - 1],
             catch_handlers,
-            state_global,
-            call_idx_local,
-            catch_region_id_local,
-            exnref_slot_local,
-            unwind_save,
+            runtime,
+            memory,
+            ptr_ty,
+            catch_state_locals,
+            function_unwind_save,
         );
         {
             let s = &mut local.block_mut(post_seqs[k]).instrs;
@@ -1856,32 +2340,40 @@ fn populate_dispatch_structure(
         }
     }
 
-    // $unwind_save body:
-    //   [Block($POST_{n-1}), <post-call sequence for n-1>, chunk n, return]
+    // Non-last leaves emit chunks[leaf_end] + spills[leaf_end] here so
+    // the boundary chunk drains the previous call's return off the
+    // operand stack before exit_seq closes — `$child_K` blocks have
+    // sig `()->()` and would otherwise fail wasm validation.
     {
-        let s = &mut local.block_mut(unwind_save).instrs;
-        push_instr(s, Instr::Block(Block { seq: post_seqs[n_calls - 1] }));
+        let s = &mut local.block_mut(exit_seq).instrs;
+        push_instr(s, Instr::Block(Block { seq: post_seqs[leaf_end - 1] }));
     }
     emit_post_call_via_local(
         local,
-        unwind_save,
-        &call_sites[n_calls - 1],
-        n_calls - 1,
-        &arg_spills[n_calls - 1],
-        &carryover_spills[n_calls - 1],
+        exit_seq,
+        &call_sites[leaf_end - 1],
+        leaf_end - 1,
+        &arg_spills[leaf_end - 1],
+        &carryover_spills[leaf_end - 1],
         catch_handlers,
-        state_global,
-        call_idx_local,
-        catch_region_id_local,
-        exnref_slot_local,
-        unwind_save,
+        runtime,
+        memory,
+        ptr_ty,
+        catch_state_locals,
+        function_unwind_save,
     );
-    {
-        let s = &mut local.block_mut(unwind_save).instrs;
-        for (instr, loc) in &chunks[n_calls] {
+    if is_last_leaf {
+        let s = &mut local.block_mut(exit_seq).instrs;
+        for (instr, loc) in &chunks[n_calls_total] {
             s.push((instr.clone(), *loc));
         }
         push_instr(s, Instr::Return(Return {}));
+    } else {
+        let s = &mut local.block_mut(exit_seq).instrs;
+        for (instr, loc) in &chunks[leaf_end] {
+            s.push((instr.clone(), *loc));
+        }
+        emit_spill_args(s, &arg_spills[leaf_end], &carryover_spills[leaf_end]);
     }
 }
 
@@ -1914,26 +2406,27 @@ fn emit_phase_6e_writes(
     local: &mut LocalFunction,
     seq_id: InstrSeqId,
     catch_handlers: &[CatchHandlerInfo],
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
 ) {
     if catch_handlers.is_empty() {
         return;
     }
+    let catch_state =
+        catch_state_locals.expect("catch handlers require catch-state locals");
     {
         let s = &mut local.block_mut(seq_id).instrs;
         push_instr(s, Instr::Const(Const { value: Value::I32(0) }));
         push_instr(
             s,
             Instr::LocalSet(LocalSet {
-                local: catch_region_id_local,
+                local: catch_state.catch_region_id,
             }),
         );
         push_instr(s, Instr::Const(Const { value: Value::I32(0) }));
         push_instr(
             s,
             Instr::LocalSet(LocalSet {
-                local: exnref_slot_local,
+                local: catch_state.exnref_slot,
             }),
         );
     }
@@ -1952,7 +2445,7 @@ fn emit_phase_6e_writes(
             push_instr(
                 s,
                 Instr::LocalSet(LocalSet {
-                    local: catch_region_id_local,
+                    local: catch_state.catch_region_id,
                 }),
             );
             push_instr(
@@ -1964,7 +2457,7 @@ fn emit_phase_6e_writes(
             push_instr(
                 s,
                 Instr::LocalSet(LocalSet {
-                    local: exnref_slot_local,
+                    local: catch_state.exnref_slot,
                 }),
             );
         }
@@ -1985,6 +2478,60 @@ fn emit_phase_6e_writes(
     }
 }
 
+fn emit_call_index_store_and_unwind_branch(
+    local: &mut LocalFunction,
+    seq_id: InstrSeqId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    call_idx: u32,
+    unwind_save: InstrSeqId,
+) {
+    let if_then = local
+        .builder_mut()
+        .dangling_instr_seq(InstrSeqType::Simple(None))
+        .id();
+    let if_else = local
+        .builder_mut()
+        .dangling_instr_seq(InstrSeqType::Simple(None))
+        .id();
+
+    {
+        let s = &mut local.block_mut(if_then).instrs;
+        push_current_frame_ptr(s, runtime, memory, ptr_ty);
+        push_instr(
+            s,
+            Instr::Const(Const {
+                value: Value::I32(call_idx as i32),
+            }),
+        );
+        push_instr(s, store_i32(memory, CALL_INDEX_OFFSET));
+        push_instr(s, Instr::Br(Br { block: unwind_save }));
+    }
+
+    let s = &mut local.block_mut(seq_id).instrs;
+    push_instr(
+        s,
+        Instr::GlobalGet(GlobalGet {
+            global: runtime.state_global,
+        }),
+    );
+    push_instr(
+        s,
+        Instr::Const(Const {
+            value: Value::I32(runtime::STATE_UNWINDING),
+        }),
+    );
+    push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Eq }));
+    push_instr(
+        s,
+        Instr::IfElse(IfElse {
+            consequent: if_then,
+            alternative: if_else,
+        }),
+    );
+}
+
 // ----------------------------------------------------------------------
 // Preamble / postamble
 // ----------------------------------------------------------------------
@@ -1996,10 +2543,7 @@ fn populate_preamble_then(
     runtime: &Runtime,
     memory: MemoryId,
     ptr_ty: ValType,
-    frame_ptr_local: LocalId,
-    call_idx_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
     locals_with_offsets: &[(LocalId, ValType, u32)],
     ref_plan: &[RefLocalSlot],
     aux_tables: &AuxTables,
@@ -2007,7 +2551,14 @@ fn populate_preamble_then(
 ) {
     let s = &mut local.block_mut(preamble_then).instrs;
 
-    // frame_ptr = *(buf + 0) - frame_size
+    // *(buf + 0) = *(buf + 0) - frame_size. After this, the buffer
+    // cursor itself is the current frame pointer for all frame reads.
+    push_instr(
+        s,
+        Instr::GlobalGet(GlobalGet {
+            global: runtime.buf_global,
+        }),
+    );
     push_instr(
         s,
         Instr::GlobalGet(GlobalGet {
@@ -2017,45 +2568,32 @@ fn populate_preamble_then(
     push_instr(s, load_ptr(memory, ptr_ty, 0));
     push_instr(s, ptr_const(ptr_ty, frame_size as i64));
     push_instr(s, Instr::Binop(Binop { op: ptr_sub(ptr_ty) }));
-    push_instr(s, Instr::LocalSet(LocalSet { local: frame_ptr_local }));
-
-    // *(buf + 0) = frame_ptr
-    push_instr(
-        s,
-        Instr::GlobalGet(GlobalGet {
-            global: runtime.buf_global,
-        }),
-    );
-    push_instr(s, Instr::LocalGet(LocalGet { local: frame_ptr_local }));
     push_instr(s, store_ptr(memory, ptr_ty, 0));
 
-    // call_idx_local = *(frame_ptr + CALL_INDEX_OFFSET)
-    push_instr(s, Instr::LocalGet(LocalGet { local: frame_ptr_local }));
-    push_instr(s, load_i32(memory, CALL_INDEX_OFFSET));
-    push_instr(s, Instr::LocalSet(LocalSet { local: call_idx_local }));
+    if let Some(catch_state) = catch_state_locals {
+        // catch_region_id_local / exnref_slot_local
+        push_current_frame_ptr(s, runtime, memory, ptr_ty);
+        push_instr(s, load_i32(memory, CATCH_REGION_OFFSET));
+        push_instr(
+            s,
+            Instr::LocalSet(LocalSet {
+                local: catch_state.catch_region_id,
+            }),
+        );
 
-    // catch_region_id_local / exnref_slot_local
-    push_instr(s, Instr::LocalGet(LocalGet { local: frame_ptr_local }));
-    push_instr(s, load_i32(memory, CATCH_REGION_OFFSET));
-    push_instr(
-        s,
-        Instr::LocalSet(LocalSet {
-            local: catch_region_id_local,
-        }),
-    );
-
-    push_instr(s, Instr::LocalGet(LocalGet { local: frame_ptr_local }));
-    push_instr(s, load_i32(memory, EXNREF_SLOT_OFFSET));
-    push_instr(
-        s,
-        Instr::LocalSet(LocalSet {
-            local: exnref_slot_local,
-        }),
-    );
+        push_current_frame_ptr(s, runtime, memory, ptr_ty);
+        push_instr(s, load_i32(memory, EXNREF_SLOT_OFFSET));
+        push_instr(
+            s,
+            Instr::LocalSet(LocalSet {
+                local: catch_state.exnref_slot,
+            }),
+        );
+    }
 
     // Restore scalar user locals (includes arg-spill locals).
     for &(lid, ty, off) in locals_with_offsets {
-        push_instr(s, Instr::LocalGet(LocalGet { local: frame_ptr_local }));
+        push_current_frame_ptr(s, runtime, memory, ptr_ty);
         push_instr(s, load_scalar(memory, ty, off as u64));
         push_instr(s, Instr::LocalSet(LocalSet { local: lid }));
     }
@@ -2082,10 +2620,7 @@ fn populate_postamble(
     runtime: &Runtime,
     memory: MemoryId,
     ptr_ty: ValType,
-    frame_ptr_local: LocalId,
-    call_idx_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
     locals_with_offsets: &[(LocalId, ValType, u32)],
     ref_plan: &[RefLocalSlot],
     aux_tables: &AuxTables,
@@ -2093,28 +2628,8 @@ fn populate_postamble(
     func_ordinal: u32,
     result_types: &[ValType],
 ) {
-    // frame_ptr = *(buf + 0)
-    push_instr(
-        out,
-        Instr::GlobalGet(GlobalGet {
-            global: runtime.buf_global,
-        }),
-    );
-    push_instr(out, load_ptr(memory, ptr_ty, 0));
-    push_instr(
-        out,
-        Instr::LocalSet(LocalSet {
-            local: frame_ptr_local,
-        }),
-    );
-
     // frame[0] = func_ordinal
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: frame_ptr_local,
-        }),
-    );
+    push_current_frame_ptr(out, runtime, memory, ptr_ty);
     push_instr(
         out,
         Instr::Const(Const {
@@ -2123,59 +2638,37 @@ fn populate_postamble(
     );
     push_instr(out, store_i32(memory, FUNC_INDEX_OFFSET));
 
-    // frame[4] = call_idx_local
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: frame_ptr_local,
-        }),
-    );
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: call_idx_local,
-        }),
-    );
-    push_instr(out, store_i32(memory, CALL_INDEX_OFFSET));
-
-    // frame[8] = catch_region_id_local
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: frame_ptr_local,
-        }),
-    );
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: catch_region_id_local,
-        }),
-    );
+    // frame[8] = catch_region_id (or 0 for functions without catch-state).
+    push_current_frame_ptr(out, runtime, memory, ptr_ty);
+    if let Some(catch_state) = catch_state_locals {
+        push_instr(
+            out,
+            Instr::LocalGet(LocalGet {
+                local: catch_state.catch_region_id,
+            }),
+        );
+    } else {
+        push_instr(out, Instr::Const(Const { value: Value::I32(0) }));
+    }
     push_instr(out, store_i32(memory, CATCH_REGION_OFFSET));
 
-    // frame[12] = exnref_slot_local
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: frame_ptr_local,
-        }),
-    );
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: exnref_slot_local,
-        }),
-    );
+    // frame[12] = exnref_slot (or 0 for functions without catch-state).
+    push_current_frame_ptr(out, runtime, memory, ptr_ty);
+    if let Some(catch_state) = catch_state_locals {
+        push_instr(
+            out,
+            Instr::LocalGet(LocalGet {
+                local: catch_state.exnref_slot,
+            }),
+        );
+    } else {
+        push_instr(out, Instr::Const(Const { value: Value::I32(0) }));
+    }
     push_instr(out, store_i32(memory, EXNREF_SLOT_OFFSET));
 
     // Save scalar user + arg-spill locals
     for &(lid, ty, off) in locals_with_offsets {
-        push_instr(
-            out,
-            Instr::LocalGet(LocalGet {
-                local: frame_ptr_local,
-            }),
-        );
+        push_current_frame_ptr(out, runtime, memory, ptr_ty);
         push_instr(out, Instr::LocalGet(LocalGet { local: lid }));
         push_instr(out, store_scalar(memory, ty, off as u64));
     }
@@ -2202,12 +2695,7 @@ fn populate_postamble(
             global: runtime.buf_global,
         }),
     );
-    push_instr(
-        out,
-        Instr::LocalGet(LocalGet {
-            local: frame_ptr_local,
-        }),
-    );
+    push_current_frame_ptr(out, runtime, memory, ptr_ty);
     push_instr(out, ptr_const(ptr_ty, frame_size as i64));
     push_instr(out, Instr::Binop(Binop { op: ptr_add(ptr_ty) }));
     push_instr(out, store_ptr(memory, ptr_ty, 0));
@@ -2234,8 +2722,8 @@ fn populate_postamble(
 /// - emit the call instruction
 /// - Phase 6e writes (compute catch_region_id / exnref_slot from active
 ///   in_catch flags)
-/// - tag `call_idx_local` with K
-/// - UNWINDING propagation: `br_if $unwind_save` if state == UNWINDING
+/// - if state == UNWINDING, write K to frame.call_index and branch to
+///   `$unwind_save`
 ///
 /// Takes `&mut LocalFunction` so Phase 6e can allocate dangling
 /// IfElse branches for each handler check.
@@ -2248,10 +2736,10 @@ fn emit_post_call_via_local(
     spills: &[LocalId],
     carryovers: &[LocalId],
     catch_handlers: &[CatchHandlerInfo],
-    state_global: GlobalId,
-    call_idx_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+    catch_state_locals: Option<CatchStateLocals>,
     unwind_save: InstrSeqId,
 ) {
     // Reload carryovers (deepest first), then args (deepest first).
@@ -2279,36 +2767,17 @@ fn emit_post_call_via_local(
         local,
         seq_id,
         catch_handlers,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
     );
 
-    let s = &mut local.block_mut(seq_id).instrs;
-    push_instr(
-        s,
-        Instr::Const(Const {
-            value: Value::I32(call_idx as i32),
-        }),
-    );
-    push_instr(
-        s,
-        Instr::LocalSet(LocalSet {
-            local: call_idx_local,
-        }),
-    );
-    push_instr(s, Instr::GlobalGet(GlobalGet { global: state_global }));
-    push_instr(
-        s,
-        Instr::Const(Const {
-            value: Value::I32(runtime::STATE_UNWINDING),
-        }),
-    );
-    push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Eq }));
-    push_instr(
-        s,
-        Instr::BrIf(BrIf {
-            block: unwind_save,
-        }),
+    emit_call_index_store_and_unwind_branch(
+        local,
+        seq_id,
+        runtime,
+        memory,
+        ptr_ty,
+        call_idx as u32,
+        unwind_save,
     );
 }
 
@@ -2572,6 +3041,31 @@ fn local_mut(module: &mut Module, func_id: FunctionId) -> &mut LocalFunction {
 
 fn push_instr(out: &mut Vec<(Instr, InstrLocId)>, instr: Instr) {
     out.push((instr, InstrLocId::default()));
+}
+
+fn push_current_frame_ptr(
+    out: &mut Vec<(Instr, InstrLocId)>,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+) {
+    push_instr(
+        out,
+        Instr::GlobalGet(GlobalGet {
+            global: runtime.buf_global,
+        }),
+    );
+    push_instr(out, load_ptr(memory, ptr_ty, 0));
+}
+
+fn push_current_call_index(
+    out: &mut Vec<(Instr, InstrLocId)>,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
+) {
+    push_current_frame_ptr(out, runtime, memory, ptr_ty);
+    push_instr(out, load_i32(memory, CALL_INDEX_OFFSET));
 }
 
 // ----------------------------------------------------------------------
@@ -5066,10 +5560,14 @@ fn instrument_one_function_nested_switch(
     }
 
     // Synthetic locals.
-    let call_idx_local = module.locals.add(ValType::I32);
-    let frame_ptr_local = module.locals.add(runtime.buf_type);
-    let catch_region_id_local = module.locals.add(ValType::I32);
-    let exnref_slot_local = module.locals.add(ValType::I32);
+    let catch_state_locals = if catch_plan.is_empty() && b1_slots.is_empty() {
+        None
+    } else {
+        Some(CatchStateLocals {
+            catch_region_id: module.locals.add(ValType::I32),
+            exnref_slot: module.locals.add(ValType::I32),
+        })
+    };
     // Tmp i32 used by the IfElse cond rewrite to swap stack order
     // (preserve original cond while computing force_flag and
     // is_rewind without touching the operand stack).
@@ -5238,12 +5736,14 @@ fn instrument_one_function_nested_switch(
     // without fork-path calls — preserves the exnref serialization
     // path). Extended by B1 Stage 2 Task 2.3 with plain-catch arm
     // dispatch when `b1_slots` lists arms for the region.
-    if aux_tables.exnref.is_some() {
+    if !catch_plan.is_empty() && aux_tables.exnref.is_some() {
+        let catch_state =
+            catch_state_locals.expect("exnref catch plan requires catch-state locals");
         inject_rewind_throw_stubs(
             module,
             func_id,
             runtime,
-            catch_region_id_local,
+            catch_state.catch_region_id,
             aux_tables,
             catch_plan,
             b1_slots,
@@ -5271,10 +5771,7 @@ fn instrument_one_function_nested_switch(
         runtime,
         memory,
         ptr_ty,
-        frame_ptr_local,
-        call_idx_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         &locals_with_offsets,
         ref_plan,
         aux_tables,
@@ -5329,11 +5826,11 @@ fn instrument_one_function_nested_switch(
             &carryover_spills,
             &carryover_plans,
             &catch_handlers,
-            runtime.state_global,
-            call_idx_local,
+            runtime,
+            memory,
+            ptr_ty,
             cond_swap_local,
-            catch_region_id_local,
-            exnref_slot_local,
+            catch_state_locals,
             unwind_save,
             body_params,
         );
@@ -5357,11 +5854,11 @@ fn instrument_one_function_nested_switch(
         &carryover_spills,
         &carryover_plans,
         &catch_handlers,
-        runtime.state_global,
-        call_idx_local,
+        runtime,
+        memory,
+        ptr_ty,
         cond_swap_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         unwind_save,
         &result_types,
     );
@@ -5373,10 +5870,7 @@ fn instrument_one_function_nested_switch(
         runtime,
         memory,
         ptr_ty,
-        frame_ptr_local,
-        call_idx_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         &locals_with_offsets,
         ref_plan,
         aux_tables,
@@ -5420,15 +5914,19 @@ fn instrument_one_function_nested_switch(
 
     // Stage 2 (B1) plain-catch capture-block emission. Runs AFTER
     // Phase 6 so it sees post-Phase-6 try_table locations.
-    apply_plain_catch_handlers(
-        module,
-        func_id,
-        runtime,
-        catch_region_id_local,
-        b1_slots,
-        catch_plan,
-        &catch_handlers,
-    );
+    if let Some(catch_state) = catch_state_locals {
+        apply_plain_catch_handlers(
+            module,
+            func_id,
+            runtime,
+            catch_state.catch_region_id,
+            b1_slots,
+            catch_plan,
+            &catch_handlers,
+        );
+    } else {
+        debug_assert!(b1_slots.is_empty());
+    }
 }
 
 /// At the end of a chunk that precedes a landing (inside the POST_K
@@ -5532,11 +6030,11 @@ fn transform_region_seq(
     carryover_spills: &HashMap<u32, Vec<LocalId>>,
     carryover_plans: &HashMap<(InstrSeqId, usize), CarryoverPlan>,
     catch_handlers: &[CatchHandlerInfo],
-    state_global: GlobalId,
-    call_idx_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
     cond_swap_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
     unwind_save: InstrSeqId,
     // Sub-commit 2.6c: this seq's declared type-params (only set for
     // multi-value Block/Loop/TryTable bodies). Pre-spilled at body
@@ -5593,8 +6091,9 @@ fn transform_region_seq(
     populate_region_dispatch(
         local,
         dispatch_seq,
-        state_global,
-        call_idx_local,
+        runtime,
+        memory,
+        ptr_ty,
         region_info,
         &landings,
         &post_seqs,
@@ -5613,11 +6112,11 @@ fn transform_region_seq(
         arg_spills,
         carryover_spills,
         catch_handlers,
-        state_global,
-        call_idx_local,
+        runtime,
+        memory,
+        ptr_ty,
         cond_swap_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         unwind_save,
         false, // don't append `return` at end
     );
@@ -5650,11 +6149,11 @@ fn transform_entry_region(
     carryover_spills: &HashMap<u32, Vec<LocalId>>,
     carryover_plans: &HashMap<(InstrSeqId, usize), CarryoverPlan>,
     catch_handlers: &[CatchHandlerInfo],
-    state_global: GlobalId,
-    call_idx_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
     cond_swap_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
     unwind_save: InstrSeqId,
     _result_types: &[ValType],
 ) {
@@ -5684,8 +6183,9 @@ fn transform_entry_region(
         populate_region_dispatch(
             local,
             d,
-            state_global,
-            call_idx_local,
+            runtime,
+            memory,
+            ptr_ty,
             region_info,
             &landings,
             &post_seqs,
@@ -5706,11 +6206,11 @@ fn transform_entry_region(
         arg_spills,
         carryover_spills,
         catch_handlers,
-        state_global,
-        call_idx_local,
+        runtime,
+        memory,
+        ptr_ty,
         cond_swap_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         unwind_save,
         true, // append `return` for normal-path exit
     );
@@ -5900,8 +6400,9 @@ fn partition_region_instrs(
 fn populate_region_dispatch(
     local: &mut LocalFunction,
     dispatch_seq: InstrSeqId,
-    state_global: GlobalId,
-    call_idx_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
     region_info: &RegionInfo,
     landings: &[LandingInfo],
     post_seqs: &[InstrSeqId],
@@ -5944,7 +6445,7 @@ fn populate_region_dispatch(
 
     {
         let s = &mut local.block_mut(if_then).instrs;
-        push_instr(s, Instr::LocalGet(LocalGet { local: call_idx_local }));
+        push_current_call_index(s, runtime, memory, ptr_ty);
         if lo != 0 {
             push_instr(s, Instr::Const(Const { value: Value::I32(lo as i32) }));
             push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Sub }));
@@ -5959,7 +6460,7 @@ fn populate_region_dispatch(
     }
 
     let s = &mut local.block_mut(dispatch_seq).instrs;
-    push_instr(s, Instr::GlobalGet(GlobalGet { global: state_global }));
+    push_instr(s, Instr::GlobalGet(GlobalGet { global: runtime.state_global }));
     push_instr(
         s,
         Instr::Const(Const { value: Value::I32(runtime::STATE_REWINDING) }),
@@ -5983,11 +6484,11 @@ fn populate_region_dispatch_structure(
     arg_spills: &HashMap<u32, Vec<LocalId>>,
     carryover_spills: &HashMap<u32, Vec<LocalId>>,
     catch_handlers: &[CatchHandlerInfo],
-    state_global: GlobalId,
-    call_idx_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
     cond_swap_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
     unwind_save: InstrSeqId,
     append_return: bool,
 ) {
@@ -6039,11 +6540,11 @@ fn populate_region_dispatch_structure(
             arg_spills,
             carryover_spills,
             catch_handlers,
-            state_global,
-            call_idx_local,
+            runtime,
+            memory,
+            ptr_ty,
             cond_swap_local,
-            catch_region_id_local,
-            exnref_slot_local,
+            catch_state_locals,
             unwind_save,
         );
         {
@@ -6075,11 +6576,11 @@ fn populate_region_dispatch_structure(
         arg_spills,
         carryover_spills,
         catch_handlers,
-        state_global,
-        call_idx_local,
+        runtime,
+        memory,
+        ptr_ty,
         cond_swap_local,
-        catch_region_id_local,
-        exnref_slot_local,
+        catch_state_locals,
         unwind_save,
     );
     {
@@ -6102,11 +6603,11 @@ fn emit_post_landing(
     arg_spills: &HashMap<u32, Vec<LocalId>>,
     carryover_spills: &HashMap<u32, Vec<LocalId>>,
     catch_handlers: &[CatchHandlerInfo],
-    state_global: GlobalId,
-    call_idx_local: LocalId,
+    runtime: &Runtime,
+    memory: MemoryId,
+    ptr_ty: ValType,
     cond_swap_local: LocalId,
-    catch_region_id_local: LocalId,
-    exnref_slot_local: LocalId,
+    catch_state_locals: Option<CatchStateLocals>,
     unwind_save: InstrSeqId,
 ) {
     match &landing.kind {
@@ -6137,24 +6638,22 @@ fn emit_post_landing(
                 };
                 s.push((call_instr, site.loc));
             }
-            // Phase 6e + tag call_idx + br_if UNWIND
+            // Phase 6e + call_idx frame write + UNWIND branch.
             emit_phase_6e_writes(
                 local,
                 seq_id,
                 catch_handlers,
-                catch_region_id_local,
-                exnref_slot_local,
+                catch_state_locals,
             );
-            let s = &mut local.block_mut(seq_id).instrs;
-            push_instr(s, Instr::Const(Const { value: Value::I32(*call_idx as i32) }));
-            push_instr(s, Instr::LocalSet(LocalSet { local: call_idx_local }));
-            push_instr(s, Instr::GlobalGet(GlobalGet { global: state_global }));
-            push_instr(
-                s,
-                Instr::Const(Const { value: Value::I32(runtime::STATE_UNWINDING) }),
+            emit_call_index_store_and_unwind_branch(
+                local,
+                seq_id,
+                runtime,
+                memory,
+                ptr_ty,
+                *call_idx,
+                unwind_save,
             );
-            push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32Eq }));
-            push_instr(s, Instr::BrIf(BrIf { block: unwind_save }));
         }
         LandingKind::SubRegion { .. } => {
             // Block/Loop/TryTable: preserve the enclosing instr
@@ -6237,10 +6736,10 @@ fn emit_post_landing(
                 (Some((tlo, thi)), Some(_)) => {
                     // Both branches have fork calls. Use range
                     // membership on THEN's range.
-                    push_instr(s, Instr::LocalGet(LocalGet { local: call_idx_local }));
+                    push_current_call_index(s, runtime, memory, ptr_ty);
                     push_instr(s, Instr::Const(Const { value: Value::I32(*tlo as i32) }));
                     push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32GeS }));
-                    push_instr(s, Instr::LocalGet(LocalGet { local: call_idx_local }));
+                    push_current_call_index(s, runtime, memory, ptr_ty);
                     push_instr(s, Instr::Const(Const { value: Value::I32(*thi as i32) }));
                     push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32LeS }));
                     push_instr(s, Instr::Binop(Binop { op: BinaryOp::I32And }));
@@ -6252,7 +6751,7 @@ fn emit_post_landing(
             // Push orig_cond from the spill local.
             push_instr(s, Instr::LocalGet(LocalGet { local: cond_local }));
             // Push is_rewind.
-            push_instr(s, Instr::GlobalGet(GlobalGet { global: state_global }));
+            push_instr(s, Instr::GlobalGet(GlobalGet { global: runtime.state_global }));
             push_instr(
                 s,
                 Instr::Const(Const { value: Value::I32(runtime::STATE_REWINDING) }),

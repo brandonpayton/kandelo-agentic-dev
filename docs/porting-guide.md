@@ -56,7 +56,12 @@ for the full transform and ABI.
 
 **Thread support**: Programs that create threads (MariaDB, Redis) work via the kernel's `clone()` syscall. No special compilation flags needed, but the host runner must implement the `onClone` callback.
 
-**C++ and libc++**: For C++ programs, include libc++ headers from your LLVM installation. Set `_LIBCPP_HAS_MUSL_LIBC=1` and `_LIBCPP_HAS_THREAD_API_PTHREAD=1` in a `__config_site` header. See `packages/registry/mariadb/build-mariadb.sh` for a complete example.
+**C++ and libc++**: For C++ programs, depend on the `libcxx` package and
+compile against its resolved headers and libraries, normally symlinked into
+the Kandelo sysroot by the consuming package build script. Do not copy libc++
+headers from an arbitrary host LLVM install; the libcxx package generates and
+ships a version-matched header tree with its `libc++.a` and `libc++abi.a`.
+See `packages/registry/mariadb/build-mariadb.sh` for a complete example.
 
 ### Step 3: Test it
 
@@ -379,7 +384,7 @@ const [kernelBuf, vfsImageBuf] = await Promise.all([
 // Restore filesystem from image (single buffer copy — fast)
 const memfs = MemoryFileSystem.fromImage(
   new Uint8Array(vfsImageBuf),
-  { maxByteLength: 512 * 1024 * 1024 },  // allow growth
+  { maxByteLength: 512 * 1024 * 1024 },  // allow growth up to the image's filesystem max
 );
 
 // Create kernel with pre-populated filesystem
@@ -722,9 +727,42 @@ All build scripts are in `packages/registry/`. They serve as reference implement
 | libxml2 | `packages/registry/libxml2/build-libxml2.sh` | CMake | Dependency for PHP |
 | OpenSSL | `packages/registry/openssl/build-openssl.sh` | custom Configure | Dependency for PHP |
 
+## SQLite Official Project Tests
+
+SQLite's upstream `test/testrunner.tcl` permutations can be run through
+Kandelo with `scripts/run-sqlite-project-unit-tests.sh`. The wrapper runs the
+existing official test runner on the Node host, the browser host, or both, and
+writes per-host artifacts plus `combined-summary.md` under `test-runs/`.
+
+Build the Tcl and SQLite testfixture prerequisites first:
+
+```bash
+bash packages/registry/tcl/build-tcl.sh
+bash packages/registry/sqlite/build-testfixture.sh
+```
+
+Then run the harness:
+
+```bash
+scripts/run-sqlite-project-unit-tests.sh --host both --permutation full
+```
+
+Use `--explain` to ask SQLite's testrunner to print the planned jobs without
+starting a full permutation run. Browser runs launch the SQLite-only demo page
+through Vite with `KANDELO_BROWSER_DEMO_INPUTS=sqlite-test` and disable HMR
+with `KANDELO_BROWSER_TEST_NO_HMR=1` so long test runs do not churn on
+artifact writes.
+
 ## Troubleshooting
 
 **"sysroot not found"**: Run `bash scripts/build-musl.sh` first.
+
+**Graphics shim libraries missing**: Programs using DRM/KMS/GBM/EGL/GLES link
+against sysroot libraries built by `scripts/build-musl.sh`. Rebuild the sysroot
+with `scripts/dev-shell.sh bash scripts/build-musl.sh`, then use
+`wasm32posix-pkg-config --cflags --libs libdrm gbm egl glesv2` from the package
+build script. Do not vendor these libraries into the package archive; package
+the resulting program or VFS image instead.
 
 **"kandelo-kernel.wasm not found"**: Run `bash build.sh` first.
 
