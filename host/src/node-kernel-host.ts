@@ -12,7 +12,7 @@
  *   const exitCode = await host.spawn(programBytes, ["hello"], { env: [...] });
  *   await host.destroy();
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
@@ -112,7 +112,8 @@ export class NodeKernelHost {
   private worker!: NodeThreadWorker;
   private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   private exitResolvers = new Map<number, (status: number) => void>();
-  private unclaimedExitStatuses = new Map<number, number>();
+  private unclaimedExitStatuses = new Map<number, { status: number; sequence: number }>();
+  private exitSequence = 0;
   private _nextRequestId = 1;
   private options: NodeKernelHostOptions;
 
@@ -195,6 +196,7 @@ export class NodeKernelHost {
     options?: SpawnOptions,
   ): Promise<number> {
     const requestId = this._nextRequestId++;
+    const spawnStartedBeforeExitSequence = this.exitSequence;
 
     const pid = await this.request(requestId, {
       type: "spawn",
@@ -219,11 +221,20 @@ export class NodeKernelHost {
     }) as number;
 
     const unclaimedExitStatus = this.unclaimedExitStatuses.get(pid);
-    if (unclaimedExitStatus !== undefined) {
+    if (
+      unclaimedExitStatus !== undefined &&
+      unclaimedExitStatus.sequence > spawnStartedBeforeExitSequence
+    ) {
+      this.unclaimedExitStatuses.delete(pid);
+    } else if (unclaimedExitStatus !== undefined) {
+      // PIDs can be reused. An older unclaimed exit for the same numeric PID
+      // must not satisfy this new spawn, or callers observe an immediate
+      // success while the new process is still running.
       this.unclaimedExitStatuses.delete(pid);
     }
-    const exitPromise = unclaimedExitStatus !== undefined
-      ? Promise.resolve(unclaimedExitStatus)
+    const exitPromise = unclaimedExitStatus !== undefined &&
+      unclaimedExitStatus.sequence > spawnStartedBeforeExitSequence
+      ? Promise.resolve(unclaimedExitStatus.status)
       : new Promise<number>((resolve) => {
           this.exitResolvers.set(pid, resolve);
         });
@@ -256,6 +267,32 @@ export class NodeKernelHost {
   /** Resize the PTY for a process */
   ptyResize(pid: number, rows: number, cols: number): void {
     this.sendToWorker({ type: "pty_resize", pid, rows, cols });
+  }
+
+  /**
+   * Hand an `OffscreenCanvas` to the kernel worker as the scanout
+   * target for KMS CRTC `crtcId`. Mirrors `BrowserKernel.kmsAttachCanvas`.
+   *
+   * Under Node, `OffscreenCanvas` is only available when the host wires
+   * a polyfill (none ships with kandelo). Without one, the worker's
+   * `attachKmsCanvas` is a no-op and only `kmsAttachStats` is useful.
+   */
+  kmsAttachCanvas(
+    crtcId: number,
+    canvas: OffscreenCanvas,
+    stats?: SharedArrayBuffer,
+    opts?: { mode?: "auto" | "2d" | "webgl2" },
+  ): void {
+    this.sendToWorker({ type: "kms_attach_canvas", crtcId, canvas, stats, opts });
+  }
+
+  /**
+   * Register a stats SAB for KMS CRTC `crtcId` without binding a
+   * scanout canvas. The worker still writes `commit_count` and
+   * `last_frame_us` into slots 5/6 each vblank tick.
+   */
+  kmsAttachStats(crtcId: number, stats: SharedArrayBuffer): void {
+    this.sendToWorker({ type: "kms_attach_stats", crtcId, stats });
   }
 
   /**
@@ -451,7 +488,10 @@ export class NodeKernelHost {
           this.exitResolvers.delete(msg.pid);
           resolver(msg.status);
         } else {
-          this.unclaimedExitStatuses.set(msg.pid, msg.status);
+          this.unclaimedExitStatuses.set(msg.pid, {
+            status: msg.status,
+            sequence: ++this.exitSequence,
+          });
           while (this.unclaimedExitStatuses.size > 256) {
             const oldest = this.unclaimedExitStatuses.keys().next().value;
             if (oldest === undefined) break;
@@ -553,10 +593,10 @@ function spawnKernelWorkerThread(): NodeThreadWorker {
   const distJs = entryTs.replace(/\/src\/([^/]+)\.ts$/, "/dist/$1.js");
 
   // Check for compiled .js version first (much faster startup)
-  if (existsSync(distJs)) {
+  if (compiledEntryIsCurrent(entryTs, distJs)) {
     return new NodeThreadWorker(distJs);
   }
-  if (existsSync(entryJs)) {
+  if (compiledEntryIsCurrent(entryTs, entryJs)) {
     return new NodeThreadWorker(entryJs);
   }
 
@@ -571,4 +611,10 @@ function spawnKernelWorkerThread(): NodeThreadWorker {
     `await import('${entryUrl}');`,
   ].join("\n");
   return new NodeThreadWorker(bootstrap, { eval: true });
+}
+
+function compiledEntryIsCurrent(sourcePath: string, compiledPath: string): boolean {
+  if (!existsSync(compiledPath)) return false;
+  if (!existsSync(sourcePath)) return true;
+  return statSync(compiledPath).mtimeMs >= statSync(sourcePath).mtimeMs;
 }

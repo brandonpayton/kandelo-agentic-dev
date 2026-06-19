@@ -9,8 +9,9 @@ The wasm-posix-sdk provides a cross-compilation toolchain for building C/C++ pro
 1. **LLVM 21+** with clang and wasm-ld:
    - macOS: `brew install llvm`
    - Ubuntu: `apt install llvm clang lld`
-   - Or use the Nix dev shell (`nix develop` from the repo root) — provides
-     LLVM 21 plus the rest of the toolchain, no per-tool install needed.
+   - Or use the Nix dev shell wrapper (`scripts/dev-shell.sh bash` from the
+     repo root) — provides LLVM 21 plus the rest of the toolchain, no per-tool
+     install needed.
      See the README's "Using Nix" section.
 2. **musl sysroot**. If you installed `wasm-posix-sdk` from npm, the
    package already contains the published sysroot and glue files. If
@@ -177,13 +178,44 @@ When linking an executable (not compile-only), the SDK adds:
 - `sysroot/lib/crt1.o` — C runtime startup
 - `sysroot/lib/libc.a` — musl libc
 
-### Pthread slot reservation
+### Sysroot platform libraries
 
-Executable builds also declare the process's pthread slot reservation through the exported `__wasm_posix_thread_slots` function:
+`scripts/build-musl.sh` also builds Kandelo's platform graphics shims into the
+wasm32 sysroot:
 
-- `--kandelo-thread-slots=N` or `--wasm-posix-thread-slots=N` emits an explicit declaration. `N` may be `-1` to use the host default, `0` to reserve no pthread slots, or a positive exact slot count.
+| Library | pkg-config name | Purpose |
+|---------|-----------------|---------|
+| `sysroot/lib/libdrm.a` | `libdrm` | DRM/KMS wrapper entry points and ioctl packing |
+| `sysroot/lib/libgbm.a` | `gbm` | GBM device and buffer-object helpers |
+| `sysroot/lib/libEGL.a` | `egl` | EGL setup over `/dev/dri/renderD128` |
+| `sysroot/lib/libGLESv2.a` | `glesv2` | GLES2/3 command-buffer encoder |
+
+Programs should reference these through `wasm32posix-pkg-config`, for example:
+
+```bash
+wasm32posix-cc -D_DEFAULT_SOURCE \
+  $(wasm32posix-pkg-config --cflags libdrm gbm egl glesv2) \
+  app.c \
+  $(wasm32posix-pkg-config --libs gbm libdrm egl glesv2) \
+  -lm -o app.wasm
+```
+
+These libraries are part of the sysroot contract. They are not standalone
+package dependencies and they are not outputs of the kernel package. A package
+that links against them should declare the package's resulting executable or
+VFS image as its output, and include the relevant sysroot/glue sources and
+build scripts in `build.toml.inputs` so binary cache keys change when the
+library ABI or implementation changes.
+
+### Pthread slot limit
+
+Executable builds also declare the process's pthread concurrency limit through the exported `__wasm_posix_thread_slots` function:
+
+- `--kandelo-thread-slots=N` or `--wasm-posix-thread-slots=N` emits an explicit declaration. `N` may be `-1` to use the host default, `0` to allow no pthreads, or a positive exact concurrent pthread count.
 - If the flag is omitted, the SDK emits `0` only when it can conservatively prove the link has no thread creation, dynamic libraries, `dlopen`, or uncertain runtime pthread use.
-- Otherwise the SDK emits `-1`, so the host reserves its configured default. The default is 16 unless the kernel worker is created with `defaultThreadSlots`.
+- Otherwise the SDK emits `-1`, so the host uses its configured default. The built-in default is 1024, an intentionally arbitrary high limit meant to avoid pthread availability problems for most programs now that slots are reserved on demand. Hosts can lower or raise it by creating the kernel worker with `defaultThreadSlots`.
+
+The count is a resource limit, not a static memory slab reservation. The host dynamically reserves each four-page pthread control slot when `pthread_create()` succeeds and reuses exited slots within the same process.
 
 ### Flags silently ignored
 
@@ -337,4 +369,8 @@ See the [Porting Guide](porting-guide.md) for preparing browser-facing package i
 - **For fork support**: Run `scripts/run-wasm-fork-instrument.sh` as the final
   post-link step. Without complete `wpk_fork_*` exports, fork-using programs
   are invalid.
+- **For DRM/KMS/EGL/GLES programs**: Rebuild the wasm32 sysroot with
+  `scripts/dev-shell.sh bash scripts/build-musl.sh` if `libdrm`, `libgbm`,
+  `libEGL`, or `libGLESv2` is missing. `build.sh` does not rebuild musl or
+  these sysroot libraries.
 - **Memory limit**: Default max memory is 1GB (16384 pages). Processes start with a smaller computed shared memory and grow on demand up to `maxMemoryPages`.
